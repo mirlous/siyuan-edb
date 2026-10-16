@@ -50,6 +50,7 @@
   "newVault": "New vault",
   "panelNote": "The vault is an AES-256 encrypted SQLite database. It can only be read/written after unlocking with the password.",
   "changePassword": "Change password",
+  "setPwdNow": "Set password",
   "changePasswordDone": "Password changed",
   "close": "Close",
   "openPanel": "Open Secret Database panel",

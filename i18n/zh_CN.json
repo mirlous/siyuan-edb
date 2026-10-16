@@ -50,6 +50,7 @@
   "newVault": "新建密库",
   "panelNote": "密库文件是 AES-256 加密的 SQLite 数据库，只有用密码解锁后才能读写。",
   "changePassword": "修改密码",
+  "setPwdNow": "设置密码",
   "changePasswordDone": "密码已修改",
   "close": "关闭",
   "openPanel": "打开密库面板",

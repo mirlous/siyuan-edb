@@ -2,7 +2,7 @@
     "name":  "siyuan-edb",
     "author":  "mirlous",
     "url":  "https://github.com/mirlous/siyuan-edb",
-    "version":  "1.5.0",
+    "version":  "1.5.2",
     "minAppVersion":  "3.0.0",
     "backends":  [
                      "all"
@@ -10,10 +10,6 @@
     "frontends":  [
                       "desktop"
                   ],
-    "i18n":  {
-                 "en_US":  "i18n/en_US.json",
-                 "zh_CN":  "i18n/zh_CN.json"
-             },
     "displayName":  {
                         "default":  "Secret Database",
                         "zh_CN":  "密库"

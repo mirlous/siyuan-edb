@@ -9393,6 +9393,9 @@ var EdbPlugin = class extends Plugin {
       const stats = core.dbStats(this.state.db);
       const size = fs.existsSync(this.cfg.dbPath) ? fs.statSync(this.cfg.dbPath).size : 0;
       info = "<b>" + this.t("unlocked") + "</b>" + (this.noPwd ? "\u3000<span style='color:#8590a6;'>" + this.t("noPwdMode") + "</span>" : "") + "<br>" + this.t("dbPath") + "\uFF1A" + this.esc(this.cfg.dbPath) + "<br>" + this.t("docCount") + "\uFF1A" + stats.count + "\u3000" + this.t("size") + "\uFF1A" + this.fmtSize(size) + "<br>" + this.t("assetCount") + "\uFF1A" + stats.assetCount + "\u3000" + this.t("assetSize") + "\uFF1A" + this.fmtSize(stats.assetBytes) + "<br>" + this.t("lastSync") + "\uFF1A" + (this.cfg.lastSyncAt ? new Date(this.cfg.lastSyncAt).toLocaleString() : "\u2014");
+      if (!/\.sydb$/i.test(this.cfg.dbPath)) {
+        info = "<span style='color:#e6a23c;font-weight:bold;'>\u26A0 \u5F53\u524D\u5E93\u6587\u4EF6\u6269\u5C55\u540D\u4E0D\u662F .sydb\uFF0C\u5907\u4EFD/\u4E91\u540C\u6B65/\u5BFC\u51FA\u5C06\u65E0\u6CD5\u8BC6\u522B\u6B64\u5E93\u3002\u8BF7\u5728\u300C\u5BC6\u5E93\u8BBE\u7F6E\u300D\u4E2D\u628A\u8DEF\u5F84\u6539\u4E3A .sydb \u7ED3\u5C3E</span><br>" + info;
+      }
       try {
         const waste = core.estimateWaste(this.cfg.dbPath, this.state);
         if (waste > 64 * 1024) {
@@ -9475,8 +9478,8 @@ var EdbPlugin = class extends Plugin {
     } else {
       secGrid.appendChild(btn(this.t("unlock"), () => this.ensureUnlocked()));
     }
-    if (unlocked && !this.noPwd) {
-      secGrid.appendChild(btn(this.t("changePassword"), async () => {
+    if (unlocked) {
+      secGrid.appendChild(btn(this.noPwd ? this.t("setPwdNow") || "\u8BBE\u7F6E\u5BC6\u7801" : this.t("changePassword"), async () => {
         const r = await this.promptNewPassword(core.readVaultHint(this.cfg.dbPath));
         if (r === null)
           return;
@@ -10664,6 +10667,10 @@ var EdbPlugin = class extends Plugin {
       const newPath = pathInput.value.trim();
       if (!newPath) {
         showMessage(this.t("pwdEmpty"));
+        return;
+      }
+      if (!/\.sydb$/i.test(newPath)) {
+        showMessage(this.t("dbPathExtWarn") || "\u5BC6\u5E93\u6587\u4EF6\u5E94\u4F7F\u7528 .sydb \u6269\u5C55\u540D\uFF08\u5F53\u524D " + (path.extname(newPath) || "\u65E0") + "\uFF09\uFF0C\u5907\u4EFD/\u4E91\u540C\u6B65/\u5BFC\u51FA\u529F\u80FD\u5C06\u65E0\u6CD5\u6B63\u5E38\u8BC6\u522B\u8BE5\u5E93\uFF0C\u8BF7\u6539\u4E3A .sydb \u7ED3\u5C3E");
         return;
       }
       const oldPath = this.cfg.dbPath;

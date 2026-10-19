@@ -4566,12 +4566,15 @@ var require_core = __commonJS({
       return hits;
     }
     function upsertAssetMeta(db, a) {
+      // v1.6.12: 重新入库时把回收站（trashed=1）记录复活为存活——否则移出→再加入的资产
+      // 记录永远躺在回收站（getAsset 存活查询查不到），cleanPlainAssets 判定"未入库"→明文永不清理
       db.run(
         `INSERT INTO assets (asset_path, doc_id, size, mtime, updated_at, chunks, hash)
      VALUES (?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(asset_path) DO UPDATE SET
        doc_id=excluded.doc_id, size=excluded.size, mtime=excluded.mtime,
-       updated_at=excluded.updated_at, chunks=excluded.chunks, hash=excluded.hash`,
+       updated_at=excluded.updated_at, chunks=excluded.chunks, hash=excluded.hash,
+       trashed=0, trashed_at=NULL`,
         [
           a.asset_path,
           a.doc_id || "",
@@ -4620,18 +4623,27 @@ var require_core = __commonJS({
     function findAssetByHash(db, hash, size) {
       if (!hash)
         return null;
-      const rows = queryAll(db, "SELECT asset_path, chunks, trashed FROM assets WHERE hash = ? AND size = ? LIMIT 1", [hash, Number(size) || 0]);
+      // v1.6.18: 必须排除回收站记录（trashed=1）。v1.6.12 曾允许复用回收站块实现"移出→再加入不重复加密"，
+      // 但自动压缩（compactVault）重建库时只保留存活资产密文、回收站密文块被丢弃，而回收站记录仍在表里
+      // （指向旧偏移）→ 再加入命中该记录 → 复用已不存在的密文块 → 打开文档"数据区读取不完整"。
+      // 改为：回收站记录一律不复用，再加入走重新加密（新密文块必在库中）；旧块成孤儿由压缩清理。
+      const rows = queryAll(db, "SELECT asset_path, chunks, trashed FROM assets WHERE (trashed IS NULL OR trashed = 0) AND hash = ? AND size = ? LIMIT 1", [hash, Number(size) || 0]);
       return rows.length ? rows[0] : null;
     }
     function gcAssets(db, keepPaths) {
-      if (!keepPaths || !keepPaths.length) {
-        db.run("DELETE FROM assets");
+      // v1.6.2: keepPaths 为空 = 本次同步未解析到资产引用（文档导出为空/API 异常）。
+      // 绝不能据此清空 assets 表——旧实现 DELETE 全部记录会导致：
+      // ① 后续同步 findAssetByHash 找不到 dup → 重复追加数据块 → 库文件膨胀（曾膨胀到 6.2GB）
+      // ② cleanPlainAssets 的 getAsset 查不到 → 明文永不清理
+      // 空 keepPaths 时保守跳过（资产保留，等待下一次有引用的同步再核对）
+      if (!keepPaths || !keepPaths.length)
         return;
-      }
-      const rows = queryAll(db, "SELECT asset_path FROM assets");
+      // v1.6.30: 只清理「未回收」资产记录——回收站（trashed=1）资产是移出文档的
+      // 可恢复副本，绝不能因同步被物理删除（否则移出→回收站→恢复链路失效）
+      const rows = queryAll(db, "SELECT asset_path FROM assets WHERE (trashed IS NULL OR trashed = 0)");
       for (const r of rows) {
         if (keepPaths.indexOf(r.asset_path) < 0) {
-          db.run("DELETE FROM assets WHERE asset_path = ?", [r.asset_path]);
+          db.run("DELETE FROM assets WHERE asset_path = ? AND (trashed IS NULL OR trashed = 0)", [r.asset_path]);
         }
       }
     }
@@ -5061,6 +5073,26 @@ var require_core = __commonJS({
         return null;
       }
     }
+    async function reloadVaultState(dbPath2, oldState) {
+      // v1.6.13: 压缩/重建库后按旧 state 的 mk 直接重新加载新库（无需密码）——
+      // 否则 state.db 句柄仍指向被改名/删除的旧库 inode，后续记录写旧库、密文写新库，错位导致注入解密失败
+      const h = readHeader(dbPath2);
+      const fd = fs2.openSync(dbPath2, "r");
+      let idxBuf;
+      try {
+        idxBuf = Buffer.alloc(h.idxLen);
+        const n = fs2.readSync(fd, idxBuf, 0, h.idxLen, h.idxOffset);
+        if (n < h.idxLen)
+          throw new Error("\u7D22\u5F15\u533A\u8BFB\u53D6\u4E0D\u5B8C\u6574");
+      } finally {
+        fs2.closeSync(fd);
+      }
+      const mk = (oldState && oldState.mk) || oldState.key;
+      const plain = decryptIndex({ key: mk }, idxBuf);
+      const db = new SQL.Database(plain);
+      createSchema(db);
+      return { password: oldState.password, key: mk, mk, salt: h.salt, iters: h.iters, kdf: h.kdf, db, dbPath: dbPath2, hint: h.hint || "", rec: h.rec || null };
+    }
     async function unlockVault(dbPath2, password, wasmPath, wasmBase64) {
       await ensureSql(wasmPath, wasmBase64);
       if (!vaultExists(dbPath2))
@@ -5465,6 +5497,13 @@ var require_core = __commonJS({
     }
     function compactVault(dbPath2, state) {
       const assets = listAllAssets(state.db);
+      // v1.6.18: 压缩只保留存活资产密文，回收站密文块被丢弃。回收站记录若残留（指向旧偏移），
+      // 之后的"移出→再加入"会命中它并重置 trashed=0 → 复用已不存在的密文块 → 打开文档"数据区读取不完整"。
+      // 因此压缩时必须同步删除回收站记录（连同其旧偏移一起清掉）。
+      try {
+        state.db.run("DELETE FROM assets WHERE trashed = 1");
+      } catch (e) {
+      }
       const oldHint = readHeader(dbPath2).hint || state.hint || "";
       const tmp = dbPath2 + "." + process.pid + "." + Date.now() + ".compact.tmp";
       const fdR = fs2.openSync(dbPath2, "r");
@@ -5706,6 +5745,7 @@ var require_core = __commonJS({
       vaultExists,
       createVault,
       unlockVault,
+      reloadVaultState,
       unlockWithRecovery,
       saveVault,
       flushVault,
@@ -5746,10 +5786,26 @@ var require_license = __commonJS({
   "src/license.js"(exports2, module2) {
     "use strict";
     var crypto3 = require("crypto");
-    var PUB_KEY = Buffer.from(
-      "LS0tLS1CRUdJTiBQVUJMSUMgS0VZLS0tLS0KTUNvd0JRWURLMlZ3QXlFQVVtdUxIaThZMDUya2NqVFRjVlZjNmJsamMzTFFWSG4yZ3RlZThBMUNoZlE9Ci0tLS0tRU5EIFBVQkxJQyBLRVktLS0tLQo=",
-      "base64"
-    );
+    /* v1.6.35 公钥防明文替换：XOR 混淆存储，运行时还原（防"搜 PEM 直接换公钥自造码"） */
+    var PUB_KEY = (function () {
+      var _b = [22,9,106,46,22,9,107,25,8,15,62,16,14,51,24,11,12,15,16,23,9,15,23,61,9,106,12,0,22,9,106,46,22,9,106,17,14,15,20,44,62,106,16,8,13,15,8,22,23,54,0,105,11,2,54,28,11,12,12,46,62,15,34,19,59,14,50,0,23,30,15,35,59,104,20,43,12,28,8,48,12,54,0,48,20,55,16,41,59,55,23,32,14,28,28,13,9,29,110,35,0,105,8,54,0,14,50,24,23,15,20,53,0,54,31,99,25,51,106,46,22,9,106,46,8,15,111,31,19,28,24,12,11,49,34,16,11,35,24,22,8,12,49,46,22,9,106,46,22,11,53,103];
+      var _s = "";
+      for (var _i = 0; _i < _b.length; _i++) _s += String.fromCharCode(_b[_i] ^ 0x5a);
+      return Buffer.from(_s, "base64");
+    })();
+    /* v1.6.36 授权状态完整性盐（XOR 混淆，运行时还原）：用于 expAt/activatedAt/trialStart 的 HMAC 指纹 */
+    var AUTH_SALT = (function () {
+      var _a = [41,51,35,47,59,52,119,63,62,56,119,44,107,105,108,119,59,47,46,50,96,98,109,63,98,107,63,106,62,98,110,98,60,106,56,111,59,56,110,60,98,106,59,110,108,57,63,57,111,108,59,107,63,99,109,106,99,104,57,63,108,63,106,57,62,107,57,99,56];
+      var _s = "";
+      for (var _i = 0; _i < _a.length; _i++) _s += String.fromCharCode(_a[_i] ^ 0x5a);
+      return _s;
+    })();
+    /* v1.6.36 授权状态 HMAC 指纹：防篡改 license.json / config.json 的到期与试用字段 */
+    function authHmac() {
+      var parts = [];
+      for (var i = 0; i < arguments.length; i++) parts.push(String(arguments[i]));
+      return crypto3.createHmac("sha256", AUTH_SALT).update(parts.join("|")).digest("hex");
+    }
     var B32_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
     function b32Encode(buf) {
       let bits = 0, value = 0, out = "";
@@ -5893,7 +5949,7 @@ var require_license = __commonJS({
       const body = code.replace(/^EDBB/, "");
       return "EDBB-" + body.replace(/(.{4})(?=.)/g, "$1-");
     }
-    module2.exports = { PUB_KEY, b32Encode, b32Decode, makeCode, prettyCode, verifyCode, typeLabel, typePrice, deviceFingerprint, makeBindCode, verifyBindCode, prettyBindCode };
+    module2.exports = { PUB_KEY, b32Encode, b32Decode, makeCode, prettyCode, verifyCode, typeLabel, typePrice, deviceFingerprint, makeBindCode, verifyBindCode, prettyBindCode, authHmac };
   }
 });
 
@@ -6423,6 +6479,14 @@ var VIEWER_HTML = `<!DOCTYPE html>
 var FALLBACK = {
   menuAdd: "\u52A0\u5165\u5BC6\u5E93",
   menuRemove: "\u79FB\u51FA\u5BC6\u5E93",
+  nbAdd: "\u6574\u672C\u52A0\u5165\u5BC6\u5E93",
+  nbRemove: "\u6574\u672C\u79FB\u51FA\u5BC6\u5E93",
+  nbAddOk: "\u5DF2\u52A0\u5165 {0} \u7BC7\u6587\u6863\u5230\u5BC6\u5E93",
+  nbRemoveOk: "\u5DF2\u79FB\u51FA {0} \u7BC7\u6587\u6863\uFF08\u9644\u4EF6\u5DF2\u8FD8\u539F\uFF0C\u5E93\u5185\u8BB0\u5F55\u8FDB\u56DE\u6536\u7AD9\uFF09",
+  nbEmpty: "\u8BE5\u7B14\u8BB0\u672C\u4E0B\u6CA1\u6709\u53EF\u52A0\u5165\u7684\u6587\u6863\uFF08\u53EF\u80FD\u5DF2\u5168\u90E8\u5728\u5E93\u5185\uFF09",
+  nbNotWatched: "\u8BE5\u7B14\u8BB0\u672C\u4E0B\u6CA1\u6709\u5DF2\u5165\u5E93\u7684\u6587\u6863",
+  nbRemoveConfirm: "\u5C06\u628A\u8BE5\u7B14\u8BB0\u672C\u4E0B\u5DF2\u5165\u5E93\u7684 {0} \u7BC7\u6587\u6863\u79FB\u51FA\uFF1A\u2460 \u6587\u6863\u4E0D\u518D\u81EA\u52A8\u52A0\u5BC6\u540C\u6B65 \u2461 \u9644\u4EF6\u8FD8\u539F\u56DE\u601D\u6E90 assets \u2462 \u5E93\u5185\u8BB0\u5F55\u8FDB\u5165\u56DE\u6536\u7AD9\uFF08\u53EF\u6062\u590D\uFF09\u3002\u786E\u5B9A\u79FB\u51FA\uFF1F",
+  nbRemoveFail: "\u79FB\u51FA\u5931\u8D25",
   panelTitle: "\u5BC6\u5E93",
   locked: "\u672A\u89E3\u9501",
   unlocked: "\u5DF2\u89E3\u9501",
@@ -6431,6 +6495,10 @@ var FALLBACK = {
   syncNow: "\u7ACB\u5373\u540C\u6B65",
   syncOk: "\u540C\u6B65\u5B8C\u6210",
   syncNone: "\u65E0\u9700\u540C\u6B65",
+  syncing: "\u6B63\u5728\u540C\u6B65\u5BC6\u5E93...",
+  nbAddBusy: "\u6B63\u5728\u6574\u672C\u52A0\u5165\u5BC6\u5E93...",
+  nbRemoveBusy: "\u6B63\u5728\u6574\u672C\u79FB\u51FA...",
+  removeBusy: "\u6B63\u5728\u79FB\u51FA\u6587\u6863...",
   noVault: "\u8FD8\u6CA1\u6709\u5BC6\u5E93\u6587\u4EF6\uFF0C\u8BF7\u5148\u521B\u5EFA",
   setPasswordTitle: "\u5BC6\u5E93 \xB7 \u5BC6\u7801",
   setPasswordHint: "\u7559\u7A7A=\u65E0\u5BC6\u7801\u6A21\u5F0F\uFF08\u6587\u4EF6\u4E0D\u8BBE\u8BBF\u95EE\u5BC6\u7801\uFF09\uFF1B\u586B\u5199\u5BC6\u7801\u5219 AES \u52A0\u5BC6\uFF0C\u5FD8\u8BB0\u5BC6\u7801\u65E0\u6CD5\u627E\u56DE\u6570\u636E",
@@ -6647,9 +6715,15 @@ var EdbPlugin = class extends Plugin {
       viewerPinExp: 0,
       vaultsDir: "",
       trialStart: 0,
+      trialH: "",
+      trialTampered: false,
+      authTampered: false,
       lastSeen: 0,
       idleLockMin: 15,
-      clockRollback: false
+      clockRollback: false,
+      /* v1.6.35 云端授权：onlineUrl 为空 = 纯离线（默认）；非空 = 激活联网登记 + 启动校验 */
+      onlineUrl: "",
+      onlineLastCheck: 0
     };
     this.state = null;
     this.syncTimer = null;
@@ -6747,7 +6821,7 @@ var EdbPlugin = class extends Plugin {
       this.eventBus.on("ws-main", bump);
     }
     this.topBarElement = this.addTopBar({
-      icon: "iconKey",
+      icon: '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16"><image href="data:image/png;base64,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" width="16" height="16" x="0" y="0"/></svg>',
       title: this.t("panelTitle"),
       position: "right",
       callback: () => this.openPanelDialog()
@@ -6798,7 +6872,7 @@ var EdbPlugin = class extends Plugin {
       config: {
         position: "RightTop",
         size: { width: 320, height: 0 },
-        icon: "iconKey",
+        icon: '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16"><image href="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAAAAXNSR0IArs4c6QAAAARnQU1BAACxjwv8YQUAAAAJcEhZcwAADsMAAA7DAcdvqGQAABE0SURBVHhe7VsJVFRnli6VRbZ6/3uIBqNtxy2iRKPivptEDaIIiogRiUSEWoECXJNO1HQWE9vEBUyMJumOsu8Frp3OJNNtZtLJTItsrhEExMxk5sycmTl9zpz55tz/f6X4EKkqUTNzcs+551H1Hu/933fvf+/97/9Kp/tZfpZHJR4DBgzwCwwMDKAjfdZe8P9FesmyPIaxwHjGlHclSalkTP6WMeUyY3IrY/INceSf/yxJSjldR9fLshyq0+l6a2/4f0IkSZorSfL7jCnnGVMgy4GdlLHbqj0nzitgTK6TpMB9khQ4n8jUPucnJbIsS4wpFsaUf+gMxD3teB9JUv7CmJIqSZKsffajFk9JUtIZU5p6AnRXKu7dj7ziuiQFZup0Om/tQB666PXKAllW/kIDe1DAtXqbCOW8LMvh2jE9LPGSJPm9B2nx7vT29FD263S6vtoBPjCRJOkJxgLPKgq3wiNXdRzfBAT0G6Eda49LQIAyhTGl9VFZvStVx9Muy/IM7Zh7TBhjsxlT/q2nwAf4M3j08kNfrwCK8J3Ou6rquP5DkiRKmT0rer0ymTHl33sCvG9fPXrrfBHUvz8WrpyA8dNGwssjgJMREMA6Xe+KOkiQZXm6FoPbwhgbItzLffBkbc/efvDs5Y+hTw5GvG0ODn2ViFM/pKP8shU7P12JZyIn8OhO5Ph4k1fIne7jjKrj/EGv1w/TYnFHvBhT/uwOeALt1ccffXR+CAwMwpzFY7ElJxIFdSk4eTMd5d9bUFBvQHGDCcdb0nCiNQMffv4S1m18BiHjhqKvpx59dL7cY1wlg8YrSco/Dhky5P6ygyTJe9Wce0+lARJgms8EmCxNLj59QSjMbzyPQ1+uQ3VLKqrb0lBy0ciB59UZkE9aS5rCiSm/mopT7ZkobUzFW7lxWLF+BoaHDIGPt8Q9w8vDH/5+klOE0LglSTmoxeS0UP19L8vTOd++Ejx0/vD1Yej/2ACEhg1H5Lqp2HRgCT7623WwN6fi5A0byq5YUOAAy49G5NYakHvraEBerRH5dSYU1BpR0mjG8evpONOeiZJ6C94tXIOEjPmYPHcMBg4eCD8fxon285XuWYfQOb1eXqjF5ox4MiY33Ovmvj4SRo8fio37IrCreBWO/OkllF4242R7Oo63pqP0kgmFdQYU1KZwwASQAz5PakJenRH5DeQNJg48r9aMvDozCoiEOvF9UYMZZRfNqCYybmbheFMmjn1rxPvla7FpbyT3DiJBO7aOBDAmX9LpXJwKkqSk3Qs8qWdvf2z7YAn++NcsVDVbUXbFjOILJhTWGwWAWqH554Xlc2tNyK0xofiSFfaWdBRftuIYnas3oaI5FfaWVBReMCO/lggxoqDBjMJ6MyehUP27uNGKyiupONlqwzf//TKMOxbxqaEdm5YESZI3ajF2KdSkoKgvlqqdb+hQSl2vfLQUx1utHDQHXq9aj1uR3Fm4NFm/oN6M6pZ0ZP8hCStt4Rg1cyqCnpyA4NAwTF4yF5Y9KzjoyqZUTgr3jHqVBH60oLDBguIGK0obLThzMxPm1xfxqaAd2130nyRJYlqsdxVa0nZnfU5AnwDuAdVtRICBz/FCDp7mOVnRIo61ZhQ0mGBvtiLp15HwChwDne4J9FbGIDh0IgKHj4euz0jodEMxNGwKflOdyKcQEVbQYEFhPd2fjpQ1xOeiBitO3cyEccdCeDhBgOoFGVqsd5PekiTXOUvAViKglQKc6vbc8jSPKaCZVQJMqG5NRfzLERxkHzYaL/5qCQ6fXY/iRgOK6ozYXZGAGVHzoNONgF//p7DbnoiqFhvyudXJG+iegoAi1RNOtGfC4AIBjMkXu229McZmOQOelAjYcnApqlqsYr5zqwvA5PpiLptQec2KNwvXoJfvk/BiY7AjNw6f/5iKsismTkDxBSOqr1tx+oYNkYbF0OmGYfC4SRwwxQs+reoptlAssPCYUNRgwfEbGUjZ7hwBpMILeGepa5EkeZ+zBHirBNiJAG5x1fq1ZuRTlK+lLGCC/ZoVU5bO4sBWbQzHmR+tPBXSVOH/x2OHEWWXzSi/nIYnJk3lnmB5dzlOtKWhkBOgBkIVPCegLQPJ2xe4RABjygdazB2lD2PyBWcJoCC49WAEqq4T6NtTgCxPQY8IKLlowZGzSdD/Yhw8ladw4PMElH8vAiORw63KrSv0zA8ZeGHLUk7AjOVzePFE13AC1EAoCDCjuo08wGUCrlCK1wLnoijKaMaU/9H+Y1fKPSAnApXXKX+n8MjN3Z7yOVcTr+z2VK1DLzYGyvCJ+N23ySi+SKlOWJ27dwMFOwJpwYlWG6x7YqDTjUTI7GkovyIAk+tz9+cB0MKvP3Ejw+kYcKeycVrsXBhT1jprfVIiYFP2ElRep2gvIj8vbtTITySUXU7F/tPr0Ud5CgFDJuCz7wwou2ThBPApwyO9yBIF9Vacas+C8Z3lnICnF8yE/Rp5AJ0jAqwo5vWAFQUNVk5Ayg7nPYBUzQbrtdi5MKbsdoUACoKbs5eispkAOVKfmv/Vyq6o3oSSRgtGTJsOnW4U1u+MwvG2NJ4Siy5YUNFkRdElM8qvWVHRlIrCRivGzJvBp8DabUtwgtKhI6NQGuSeIGLBiRs2dwnYp8XOhTYtXCWAyuCq61aVADFQit4OLyisM6OqOR07c9fCm4XCb9A45HyxDls/WY1DZ5Ow+Ugc9n2RiO0Fa5Dzxw3Y8GYUt/6wKVOQdz4FJRcsIqPQ/fh0saCw8f4IYEw+qcXOhTHlO1cIoFLYticcVS1pt6aAIEDNBKR1InhR6TruuVnQ/3Is9lTHY0L4HLxRuhYzY57Blk9iEWFaiNQDMdjwliAgbV80TrRbkXdeXSeoqdARKwQBGVj/yrMuEyBJSo0WO4knRUhXCKBVoPnNhahqozRIy9kOlqoTMYC8gUfspnRMDJ8N/S+exttlq/F80nN4qyIeSyyL8WpBHOK2Lcbmj2MRaQ2HrlcIsg6u4ME1t87AwefxTECFkFodNpj5KnNtxlxnS2Gu6hRo7rQ4CgoK8hf7dM4TQA9emzUXx9vJA1JuBUBRCYo6wEFA5VUrQmZPx5CJk7HneDzCNyzA2/Y1iLQsxmv5qxG3ZTG2HInB+teXoU/f0UjZtQz2VitfPdIKkdYEwvIiA9A9iYDopOkueYCqndcF6rbWTVcIoAeHvzAJ1Tdo8WLk1uKpkC9vxQKIBl7UaOGRf8S0aQgKmYwd+XGYHDkHrxWswsyV85F1KAbhyc/C8n40omwR6OUZghdfW8o9K49nFnVq0ZqAwNebUNxgQXVLBuYvG89bbdqxdaM/BgQEBN5BgDse0NczABNmPokyam010EAN3EX5gNXARZ+LL4jV3ONjJyNk3gzkfJmAVZvC8d7vE5DwahTerliD5HeisLNoDSx7V8LDLwSxWeG8e0TuT+D5PTu4f/EFK8oupWPslJG8C6UdWzfa2QPUGHDVlRjg78cQPCgYn/x9EoovWVRLOdYDIgCS21I1mFdjQHDoZCgjJ2HrJyswev40bPo4FmMXzkHq/mjMipuHxNeX4XlDOHQeoxBlWYjqtlQ+rei+uZwIsRgiEsoup+G33yRj4ODHeItMO7auVI0B1+/aK6QmoisEUC+fGpc7fhsDe3Oa2uOjOGDsUOiIcviz71LAhk7ExIhZOPSnBCTuWIp9XyRgw9tR+M2ptUjdvwK7KuLx8sdx8GGhWLDuWT4FaGrRlKI4ILpFYllc1ZyBX+eugo83NUw7j60rVQmo1WLnIklKtSsEkFLXdqVhJk6229SCRTQ7Hf098gIqfY98vR5s6Hiw4WHIyI7G0KnTkPVhDELmzoJhdxSmLp+DhFcXIzx5EXp7hWJu3HzYWy3I481T8gIRDHkWqBcpMD5jnksZgFStA85osXOhFxpcJYBa1tSXoyxQdNGMPLKY6gGUBSgVFl+04OCXifAa8BSmRs3FR2cTeL7P/modrHuX470za5H5wQrssq/Gtk9j4dtvHMIiZqOiSaTBXAKvBle+KGq0oPRKGsZNHcnjkHZM91K1DsjWYuciSUqiqwSQUkG0NWcZqtpS1S6vsBj1AMkTKD7sPfUivAeMBRs2CbbsaAyeMA2ZH8Zg2PRpSHk3ChMWz8GabRF4NnERevcdi9D5M1B6he5zmwBRC5hR2WzDO6XxvDMs6btvj3dUdQps0GLnQu/kaP/BGaVefdjsEF7PE/BjagPU4QGlVyx4/+Q66LxDEJ68EJ/VJOG1gtU4+HUidpbEI/urDXij9EUc+Jv12Pv7lzBwdBivF8quqgQQoWosEO6/EYtfmMKnn3Ys3SsRII3XYneIB7WQXfUCCkJevak/GA17axqOnjfgGHkCRW8KhA0mFDWaMTVyPl8VBo2ZhMfHT0K/0WEIfnoSgkZPRvC4KRgQOgWBo8LQRz8GxneixRQ47yBApMGKa+k4cDqRA3F1H1F1/2u026UFfkskSclxlQBSysUjRv+SW6nwool7gfAEURAVNpqQX2PCy0fiYNsfg8yDK5F1MFZoTiwyc1Yi40AM0vauwK6yeJRfpVRq4Aui3NpkkWEaTKhqzcL8qImi+pM7j+NeqgbAw1rMd4gkSfPcIYAGQ/35FckzcbzdxoPXsdoUvgHCN0JqqEgywn7NjKqm22pvssDeZEblNRMqm0yoajah4ipNHYOwPhGgelT1DRs256zgq1Bntsa0Sric2SWitlijOyTo9TK8PQKw+UAUJ+GWF/CdILEblFuTgtyaZLEdxgEacIxA1iSrRwKc3AE8fWdE+fdpOPJ1Mi+8KPNon92dqni6bod1FHrjyx0CSP18aHD9sLtsLarabDhGwB17gAS2JkUA5d8b+eej58R3R+nvGgM/0o7RsRpBUMklC0oupSFsVgh/h0B20fVJVetv0mK9q1CdTPWyK+uC2w8S8SB4YDD2n1rHgyKBcUwFAYyAq3pOJYADv62O87RVVn7NhmeiJ4qo7wZ4Vf9Fr9crWqxdiiTJWe56AZHg7eHP3XWPPUF4Qo0RRwmUalnyDAfQjoCPnhMecPQc1Q9WlF3NwMLYyd3u/91LVRwvazF2I8O93UmJtx+qwNvTH4H9+mP7p7E8JlCN4HBzDvi8anHygHMC/Geqln5PCyEr5iwZz8G7Uu/fOQ6R+oKDg321CLsVipjuEiAeLkpl374MSb9aiIpmG4ovWzq4umrxcym3gBMp9tYMZH+ehNCwEW4WOx3HQONnS7TYnBa9XvnAmTdEulRZvCpDQGZHPI3Df5eMqhs2HgAFaDE1iAhaS1S22JC5LwpB/QeIRof7c97xWu3HWkwuCa2bJUk5dz+e4FAPnS+CHw+GdVcESq6moqwpDUdrRI1vb7Ph8NkNWBA7iVeVvj56t6K9Q9Wip079LcL9iV4fNJwx5Z/vlwQ+JXz0vIqbMHMUduaugr1V7ABv2L4Ijz0ezD3FnSLnzufwef+v/v6Bo7RY3BZZlmcypvzX/ZLgUHp7jN4vomkROnE4B+7nQ+/7dL7WFVXH91eqaLUY7lv0euU5xpT/7CkSaClLRFBXR3vOHXWAf6BvkKuvy/7QUyT0lKrj+bHb/f+eEJpb4lch95EdelDVcZyj3yZpx/rAhKIrvWxAzD8qb7j9bPkwtfW1Y3wowhiLZExpEFZ4WETc+sXIRUlSorVjeuhCZSZjylbxQvWD++mMsDgHfpMx5ZVHZvWuxN/fP0iWAzcyJtc73PN+ydDch/oUm/38+g/QPvunJh6yLC9iTDnEmHJJC+RuxGjPdThPP6j8SE1tXffyfsLiJUn9JlIrmjElmzH5NO3MSJLcQtUlpS460naVJNGPLOXTdJ0sy8l6fWDYT+KncQ9CBg0a5EM/gKRdWjrSZ+01P8tDkP8FS0CJHcww/iYAAAAASUVORK5CYII=" width="16" height="16" x="0" y="0"/></svg>',
         title: this.t("panelTitle"),
         hotkey: "",
         show: false
@@ -6845,11 +6919,27 @@ var EdbPlugin = class extends Plugin {
     return FALLBACK[key] || key;
   }
   async loadConfig() {
-    const raw = await this.loadData("config.json");
+    let raw = await this.loadData("config.json");
+    if (!raw || typeof raw !== "object") {
+      /* v1.6.35 备份恢复：config.json 被删/损坏时从 backup 恢复 */
+      try {
+        raw = await this.loadData("config.backup.json");
+      } catch (e) {
+        raw = null;
+      }
+    }
     if (raw && typeof raw === "object") {
       this.cfg = Object.assign(this.cfg, raw);
       if (!Array.isArray(this.cfg.watchlist))
         this.cfg.watchlist = [];
+      /* v1.6.36 试用时间完整性：trialStart 存在但指纹缺失/不匹配 = 试用状态被篡改 → 试用失效（不重置，防无限重置白嫖） */
+      if (this.cfg.trialStart) {
+        if (!this.cfg.trialH) {
+          this.cfg.trialH = lic.authHmac("trial", this.cfg.trialStart);
+        } else if (this.cfg.trialH !== lic.authHmac("trial", this.cfg.trialStart)) {
+          this.cfg.trialTampered = true;
+        }
+      }
     }
     if (!this.cfg.dbPath || this.cfg.dbPath === "__AUTO__" || this.cfg.dbPath === DEFAULT_DB_PATH) {
       try {
@@ -6865,6 +6955,15 @@ var EdbPlugin = class extends Plugin {
     if (typeof this.cfg.activeVault !== "number" || !this.cfg.vaults[this.cfg.activeVault]) {
       this.cfg.activeVault = 0;
     }
+    // v1.5.6：自动移除「库文件已不存在」的残留条目
+    // （用户手动删除 .sydb 后，面板不再残留失效库标签；同名同路径的重复库也会因文件缺失被清掉）
+    if (Array.isArray(this.cfg.vaults) && this.cfg.vaults.length) {
+      const alive = this.cfg.vaults.filter((v) => v && v.path && fs.existsSync(v.path));
+      if (alive.length !== this.cfg.vaults.length) {
+        this.cfg.vaults = alive;
+        this.cfg.activeVault = 0;
+      }
+    }
     this.applyActiveAliases();
   }
   /** 活动库别名同步：cfg.dbPath / cfg.watchlist 始终指向当前活动库 */
@@ -6877,8 +6976,43 @@ var EdbPlugin = class extends Plugin {
     if (this.cfg.watchlist !== v.watchlist)
       this.cfg.watchlist = v.watchlist;
   }
+  /** v1.6.20：库索引即权威 —— 解锁/新建/切换/压缩后把 watchlist 与库内 docs 对齐。
+   *  解决「已入库但打开不被承认」（副本 id 笔记本重入后 watchlist 仍是旧 id，注入被 includes 门挡掉）。
+   *  只增不减：config 里刚加入未同步的 id 保留，docs 里的 id 全部承认。 */
+  async syncWatchlistFromDb() {
+    if (!this.isUnlocked())
+      return 0;
+    try {
+      const dbIds = (core.listDocs(this.state.db) || []).map((d) => d.doc_id).filter(Boolean);
+      const cur = Array.isArray(this.cfg.watchlist) ? this.cfg.watchlist : [];
+      const merged = Array.from(new Set([...cur, ...dbIds]));
+      if (merged.length !== cur.length) {
+        this.cfg.watchlist = merged;
+        const v = this.cfg.vaults && this.cfg.vaults[this.cfg.activeVault];
+        if (v)
+          v.watchlist = merged;
+        await this.saveConfig();
+        console.log("[siyuan-edb] watchlist \u5DF2\u4E0E\u5E93\u7D22\u5F15\u5BF9\u9F50:", cur.length, "->", merged.length);
+      }
+      return merged.length;
+    } catch (e) {
+      console.warn("[siyuan-edb] syncWatchlistFromDb:", e);
+      return 0;
+    }
+  }
   async saveConfig() {
+    /* v1.6.36 试用时间完整性：每次保存时按当前 trialStart 重算 HMAC 指纹 */
+    if (this.cfg.trialStart) {
+      this.cfg.trialH = lic.authHmac("trial", this.cfg.trialStart);
+      if (this.cfg.trialTampered)
+        this.cfg.trialTampered = false;
+    }
     await this.saveData("config.json", JSON.stringify(this.cfg));
+    /* v1.6.35 双写备份：防手动删除 config.json 重置试用/配置 */
+    try {
+      await this.saveData("config.backup.json", JSON.stringify(this.cfg));
+    } catch (e) {
+    }
   }
   protyleDocId(protyle) {
     if (!protyle)
@@ -6906,6 +7040,7 @@ var EdbPlugin = class extends Plugin {
         showMessage(this.t("vaultUpgraded") || "\u52A0\u5BC6\u5F15\u64CE\u5DF2\u5347\u7EA7\uFF08MK \u4FE1\u5C01\uFF09\uFF0C\u6570\u636E\u5B8C\u6574");
       this.noPwd = true;
       console.log("[siyuan-edb] \u65E0\u5BC6\u7801\u6A21\u5F0F\uFF1A\u81EA\u52A8\u89E3\u9501\u6210\u529F");
+      await this.syncWatchlistFromDb();
       const chk = this.integrityCheck();
       if (!chk.ok)
         console.warn("[siyuan-edb] \u5B8C\u6574\u6027\u81EA\u68C0\u8B66\u544A", chk.msg);
@@ -6935,6 +7070,41 @@ var EdbPlugin = class extends Plugin {
       return m ? m[1] : null;
     } catch (e) {
       return null;
+    }
+  }
+  /** v1.6.26: 从思源 ws 编辑事务中解析「真实文档 id（rootID）」。
+   *  transactions 的 data 是 { transactions:[{ doOperations:[{ action, type, id, rootID, ... }] }] }，
+   *  元素 id 是块 id 不是文档 id；旧 pickDocId 只匹配 "id"，会把「块 id」误当文档 id（watchlist 不匹配 → 单篇自动同步失效）。
+   *  优先取 doOperations[].rootID，其次根层 rootID/id，最后回退 pickDocId。 */
+  pickRootId(detail) {
+    try {
+      const d = detail && detail.data;
+      if (!d)
+        return null;
+      let ops = [];
+      const pushOps = (t) => {
+        if (!t)
+          return;
+        if (Array.isArray(t.doOperations))
+          ops = ops.concat(t.doOperations);
+        else if (t.doOperations)
+          ops.push(t.doOperations);
+      };
+      if (Array.isArray(d))
+        d.forEach(pushOps);
+      else if (d.transactions)
+        (Array.isArray(d.transactions) ? d.transactions : [d.transactions]).forEach(pushOps);
+      else if (d.doOperations)
+        pushOps(d);
+      for (const op of ops) {
+        if (op && op.rootID)
+          return op.rootID;
+      }
+      if (d && d.rootID)
+        return d.rootID;
+      return this.pickDocId(detail);
+    } catch (e) {
+      return this.pickDocId(detail);
     }
   }
   /** 从 DOM 检测当前可见打开中的文档（思源每个打开的编辑器是 .protyle[data-node-id]；不可见/已关闭的排除） */
@@ -6979,6 +7149,9 @@ var EdbPlugin = class extends Plugin {
       if (this.cfg.watchlist.includes(id)) {
         this.openDocs[id] = Date.now();
         this.injectDocAssets(id).catch((e) => console.error("[siyuan-edb] \u6CE8\u5165\u5931\u8D25", id, e));
+      } else {
+        // v1.6.19: 打开但不在 watchlist → 记入诊断日志（排查"打开了却不注入"）
+        this.writeInjectDiag(id, { watchlist: false, protyle: true, assets: 0, els: 0, matched: 0, ok: 0, fail: "", samples: [], skipInjected: 0, streamFail: 0, err: "not-in-watchlist" });
       }
     }
   }
@@ -7015,55 +7188,217 @@ var EdbPlugin = class extends Plugin {
    *  大附件（>200MB，如 2GB+ 视频）：改用本地流式服务 URL（按 Range 边播边解密，内存 O(播放缓冲)）
    *  文件链接（xlsx 等）额外带 download 属性保持真实文件名 */
   async injectDocAssets(docId) {
-    if (!this.state)
+    // v1.6.19 诊断：一律记录到文件日志（不依赖截图），红框必现
+    const diag = { watchlist: false, protyle: false, assets: 0, els: 0, matched: 0, ok: 0, fail: "", samples: [], skipInjected: 0, streamFail: 0, err: "" };
+    if (!this.state) {
+      diag.err = "no-state";
+      this.writeInjectDiag(docId, diag);
       return;
+    }
     let protyle = null;
     try {
       protyle = document.querySelector('.protyle[data-node-id="' + docId + '"]');
     } catch (e) {
       protyle = null;
     }
-    if (!protyle || !protyle.querySelectorAll)
+    diag.protyle = !!protyle;
+    if (!protyle || !protyle.querySelectorAll) {
+      this.writeInjectDiag(docId, diag);
       return;
-    const assets = core.getAssetsByDoc(this.state.db, docId);
-    if (!assets || !assets.length)
+    }
+    let assets = [];
+    try {
+      assets = core.getAssetsByDoc(this.state.db, docId) || [];
+    } catch (e) {
+      // v1.6.31: getAssetsByDoc 偶发抛错（状态切换瞬间）同样跳过本轮，防 matched=0 误判
+      diag.err = "getAssetsByDoc-error: " + ((e && e.message) || String(e));
+      this.writeInjectDiag(docId, diag);
       return;
+    }
+    diag.assets = assets.length;
+    diag.watchlist = this.cfg.watchlist.includes(docId);
+    // v1.6.24: 资产索引改用全库（listAssets 未回收全量）——思源文档可引用任意 assets 文件，
+    // 包括"挂在他文档名下"的资产（如 qvgkb6x 混排文档引用 b0wpwsd 名下的 GIF）。
+    // 原实现仅按当前 docId 过滤 getAssetsByDoc → 跨文档引用的资产查不到 → 不注入 → 图片/动态图不显示。
+    // asset_path 全局唯一，全库索引覆盖即正确；diag.assets 仍保留"当前文档名下资产数"语义。
+    let allAssets = [];
+    try {
+      allAssets = core.listAssets(this.state.db) || [];
+    } catch (e) {
+      // v1.6.31: listAssets 偶发抛错（如状态切换瞬间 db 句柄短暂不可用）时，若静默置空
+      // 会让本轮 byName 索引为空 → matched=0 → 正在播放/显示的资产下一轮被误判失败。
+      // 记录诊断并直接跳过本轮注入（5 秒后下一轮自动恢复），避免「视频/图片间歇变黑」。
+      diag.err = "listAssets-error: " + ((e && e.message) || String(e));
+      this.writeInjectDiag(docId, diag);
+      return;
+    }
+    if (!allAssets || !allAssets.length) {
+      // 全库资产为空极不正常（当前库 1000+ 资产）；也可能 db 状态未就绪。同样跳过本轮防误判。
+      diag.err = "listAssets-empty";
+      this.writeInjectDiag(docId, diag);
+      return;
+    }
+    // 生成短名键：思源"同名冲突"资产真实文件名形如 <hash>_<n>-<时间戳>-<随机>.ext，
+    // 前端渲染/DOM src 只暴露资源短名 <hash>_<n>[.ext]（无时间戳后缀），库内 asset_path 却是完整名。
+    // 只为 hash 风格名生成短名键（避免 1.gif 这类普通短名互相覆盖造成误匹配）。
     const byName = {};
-    for (const a of assets)
+    for (const a of allAssets) {
+      if (!a || !a.asset_path)
+        continue;
       byName[a.asset_path] = a;
+      // v1.6.8: 思源 DOM 中 img 的 src 可能带 %20 编码（导出/渲染时空格被编码），
+      // 同时收录解码后的真实名，保证注入匹配（否则图片视频保持失效引用、打不开）
+      let dec = null;
+      try {
+        dec = decodeURIComponent(a.asset_path);
+      } catch (e) {
+        dec = a.asset_path.replace(/%20/g, " ");
+      }
+      if (dec !== a.asset_path)
+        byName[dec] = a;
+      // v1.6.16/23: 短名键（hash 风格才收）。思源"同名冲突"序号既有纯数字（_002）也有
+      // 字母数字混合（_125vduy、_12fw904）甚至 base64 风格（_6EfRQiv...）→ 只要前缀以 32hex_ 开头即收，
+      // 短名 = 去掉「-<14位时间戳>-<随机>.ext」后的完整前缀（含序号）。
+      if (/^[0-9a-f]{32}_/i.test(a.asset_path)) {
+        const sm = /^(.*)-(\d{14})-[a-z0-9]+(\.[A-Za-z0-9]+)?$/i.exec(a.asset_path);
+        if (sm && /^[0-9a-f]{32}_/i.test(sm[1])) {
+          byName[sm[1] + (sm[3] || "")] = a;
+          byName[sm[1]] = a;
+        }
+      }
+    }
     let els = [];
     try {
       els = protyle.querySelectorAll("img[src], video[src], audio[src], iframe[src], a[href]");
     } catch (e) {
       els = [];
     }
+    diag.els = els.length;
     for (const el of els) {
       try {
         const attr = el.tagName === "A" ? "href" : "src";
-        const cur = el.getAttribute(attr) || "";
+        let cur = el.getAttribute(attr) || "";
+        // v1.6.15: 思源前端渲染时会把 src 改写为资源 hash 名（如 assets/b430ed844d6192d3512b6c11d8a6f973_002，
+        // 当 assets 明文文件不存在时），但 img/video/audio 元素保留 data-src="assets/真实名"（原始引用）。
+        // 只用 src 匹配（hash 名）会全部落空 → 注入不执行。改为优先取 data-src 真实名匹配。
+        if (el.tagName !== "A") {
+          const ds = el.getAttribute("data-src");
+          if (ds)
+            cur = ds;
+        }
         const m = /assets\/([^\/?#]+)(\?.*)?$/i.exec(cur);
-        if (!m)
+        if (!m) {
+          // v1.6.31: 思源改写占位后 src/data-src 可能完全不带 assets/ 前缀（如纯 hash 短名）→
+          // 正则失败在更早处 continue，dataset.edbAsset 兜底一样够不到 → 视频/图片间歇变黑。
+          // 这里先用注入时存的真实库名补一次匹配（同样由下方 readAsset 按真实名解密注入）。
+          if (el.dataset && el.dataset.edbAsset && byName[el.dataset.edbAsset]) {
+            cur = "assets/" + el.dataset.edbAsset;
+          } else {
+            continue;
+          }
+        }
+        const m2 = /assets\/([^\/?#]+)(\?.*)?$/i.exec(cur);
+        if (!m2)
           continue;
-        const name = m[1];
-        const a = byName[name];
+        const name = m2[1];
+        let a = byName[name];
+        if (!a) {
+          // v1.6.8: DOM src 可能是 %20 编码名，解码后再匹配一次
+          let dec = null;
+          try {
+            dec = decodeURIComponent(name);
+          } catch (e) {
+            dec = name.replace(/%20/g, " ");
+          }
+          a = byName[dec];
+        }
+        if (!a) {
+          // v1.6.16: DOM 只暴露资源短名（<hash>_<n>[.ext]）时，用短名匹配；
+          // v1.6.23: 序号放宽为字母数字/base64 混合（_125vduy、_6EfRQiv...）
+          const shm = /^([0-9a-f]{32}_[A-Za-z0-9+/=-]+)-(\d{14})-[a-z0-9]+(\.[A-Za-z0-9]+)?$/i.exec(name);
+          if (shm) {
+            a = byName[shm[1] + (shm[3] || "")] || byName[shm[1]];
+            if (!a) {
+              try {
+                const d2 = decodeURIComponent(shm[1] + (shm[3] || ""));
+                a = byName[d2] || byName[shm[1]];
+              } catch (e2) {
+              }
+            }
+          }
+        }
+        if (!a) {
+          // v1.6.31: 思源渲染完成后会把 img/video 的 src/data-src 改写为「内容 hash 占位名」
+          // （明文文件不存在时的行为），中文/非 hash 前缀资产名无法通过短名键反查 → byName 落空。
+          // 但我们注入时在 dataset.edbAsset 存了库内真实名（v1.6.17 确认思源改写 src 不删 dataset）→
+          // 直接用真实名重注，覆盖被改写的占位（否则 matched=0 → 视频/图片重新变黑，间歇性不显示）。
+          if (el.dataset && el.dataset.edbAsset && byName[el.dataset.edbAsset]) {
+            a = byName[el.dataset.edbAsset];
+            cur = "assets/" + el.dataset.edbAsset;
+          }
+        }
         if (!a)
           continue;
-        if (el.dataset && el.dataset.edbInjected && !cur.startsWith("undefined"))
-          continue;
-        const mime = this.mimeOf(name);
+        diag.matched++;
+        diag.samples = diag.samples || [];
+        if (diag.samples.length < 20)
+          diag.samples.push({ t: el.tagName, cur: String(cur).slice(0, 90), big: Number(a.size) > BIG_ASSET_BYTES, inj: !!(el.dataset && el.dataset.edbInjected) });
+        // v1.6.14: 思源渲染时会对 img/video src 做 encodeURI（空格→%20、中文→%E5%92%AC…），
+        // 上文解码匹配命中的可能是 byName[dec]（解码名），而 a.asset_path 才是库内真实名。
+        // 后续 readAsset/流式/下载必须用 a.asset_path，否则 getAsset 按编码名精确查库失败 → 注入跳过 → 图片视频全不显示。
+        const realName = a.asset_path;
+        if (el.dataset && el.dataset.edbInjected) {
+          // v1.6.17: 思源渲染完成后可能把 src 改回失效的资源 hash 名（assets 明文不存在的占位），
+          // 但 dataset 标记保留 → 旧逻辑每轮误判"已注入"而跳过 → 永远灰色/黑屏。
+          // 改为：当前 src 仍是注入 URL（data:/blob:/本机流式）才跳过；被思源改写则强制重注覆盖。
+          // v1.6.21: 注入 URL 存在≠加载成功——IMG 加载失败（naturalWidth=0）或 VIDEO 无数据时
+          // 说明上一轮注入的 URL 已失效（data: URL 超浏览器 ~2MB 限制 / blob URL 跨渲染失效）→ 强制重注。
+          const s = el.getAttribute(attr) || "";
+          if (s.startsWith("data:") || s.startsWith("blob:") || s.startsWith("http://127.0.0.1")) {
+            let loaded = false;
+            if (el.tagName === "IMG") {
+              if (!el.complete) {
+                diag.skipInjected = (diag.skipInjected || 0) + 1;
+                continue;
+              }
+              loaded = el.naturalWidth > 0;
+            } else if (el.tagName === "VIDEO") {
+              loaded = el.readyState >= 1 && el.videoWidth > 0;
+            } else {
+              loaded = true;
+            }
+            if (loaded) {
+              diag.skipInjected = (diag.skipInjected || 0) + 1;
+              continue;
+            }
+          }
+        }
+        const mime = this.mimeOf(realName);
         const isBig = Number(a.size) > BIG_ASSET_BYTES;
         let url = null;
         if (isBig) {
           const base = await this.ensureStreamServer();
-          if (!base)
+          if (!base) {
+            diag.streamFail = (diag.streamFail || 0) + 1;
             continue;
-          url = base + encodeURIComponent(name);
+          }
+          url = base + encodeURIComponent(realName);
+          diag.ok++;
         } else {
-          const bytes = await core.readAsset(this.cfg.dbPath, this.state, name);
-          if (el.tagName === "IMG") {
+          let bytes = null;
+          try {
+            bytes = await core.readAsset(this.cfg.dbPath, this.state, realName);
+            diag.ok++;
+          } catch (e) {
+            diag.fail = (e && e.message) || String(e);
+            continue;
+          }
+          if (el.tagName === "A") {
             url = "data:" + mime + ";base64," + Buffer.from(bytes).toString("base64");
           } else {
-            const old = this._blobUrls ? this._blobUrls[name] : null;
+            // v1.6.21: IMG 也改用 blob URL——data: URL 有浏览器 ~2MB 限制（实测 1.8MB jpg base64≈2.4MB 即不显示），
+            // 统一 blob 后任意大小都能注入显示；旧 blob 先 revoke 防泄漏
+            const old = this._blobUrls ? this._blobUrls[realName] : null;
             if (old) {
               try {
                 URL.revokeObjectURL(old);
@@ -7077,24 +7412,85 @@ var EdbPlugin = class extends Plugin {
             } catch (e2) {
               url = "data:" + mime + ";base64," + Buffer.from(bytes).toString("base64");
             }
-            (this._blobUrls = this._blobUrls || {})[name] = url;
+            (this._blobUrls = this._blobUrls || {})[realName] = url;
           }
         }
         el.setAttribute(attr, url);
         if (el.tagName === "A") {
           try {
-            el.setAttribute("download", name);
+            el.setAttribute("download", realName);
           } catch (e3) {
           }
         }
         if (el.dataset) {
           el.dataset.edbInjected = "1";
-          el.dataset.edbAsset = name;
+          el.dataset.edbAsset = realName;
           if (isBig)
             el.dataset.edbStream = "1";
         }
       } catch (e) {
       }
+    }
+    // v1.6.22 诊断：日志必写；红框仅在异常时显示——
+    // 原"watchlist && protyle 即必现"把文档标题/内容挤走；全成功（ok+skipInjected>=matched）或无资产时不打扰。
+    // 异常才弹：err（no-state/not-in-watchlist）或 存在既未注入成功也未验证的元素（matched>ok+skipInjected）
+    this.writeInjectDiag(docId, diag);
+    if (diag.watchlist && diag.protyle) {
+      const allOk = !diag.err && (!diag.matched || diag.ok + diag.skipInjected >= diag.matched);
+      if (!allOk)
+        this.showInjectDiag(docId, diag);
+    }
+  }
+  /** v1.6.19 注入诊断写入文件日志（storage/petal/siyuan-edb/inject-diag.log，只留最近 200 行） */
+  writeInjectDiag(docId, diag) {
+    try {
+      let dir = this.storagePath || "";
+      if (!dir && this._dataDir)
+        dir = path.join(this._dataDir, "storage", "petal", "siyuan-edb");
+      if (!dir)
+        return;
+      const p = path.join(dir, "inject-diag.log");
+      const line = JSON.stringify(Object.assign({ t: new Date().toISOString(), id: docId }, diag));
+      let old = "";
+      try {
+        old = fs.readFileSync(p, "utf8");
+      } catch (e) {
+      }
+      const lines = old.split(/\r?\n/).filter(Boolean);
+      lines.push(line);
+      while (lines.length > 200)
+        lines.shift();
+      fs.writeFileSync(p, lines.join("\n") + "\n");
+    } catch (e) {
+    }
+  }
+  /** v1.6.16 注入诊断浮层（仅排障用，12 秒后自动消失；v1.6.22 改为悬浮 overlay 不参与文档流） */
+  showInjectDiag(docId, diag) {
+    try {
+      const protyle = document.querySelector('.protyle[data-node-id="' + docId + '"]');
+      if (!protyle || !protyle.querySelector)
+        return;
+      let box = protyle.querySelector(".siyuan-edb-diag");
+      if (!box) {
+        box = document.createElement("div");
+        box.className = "siyuan-edb-diag";
+        // v1.6.22: 原 prepend+position:relative 会把文档标题/内容挤到最底下 → 改为 fixed 悬浮 overlay，
+        // 不参与文档流、不改变文档布局；定位到该文档可视区域顶部，12 秒自动移除
+        box.style.cssText = "position:fixed;z-index:999999;max-width:min(720px,92vw);max-height:70vh;overflow:auto;padding:10px 12px;background:#fff1f0;color:#c0392b;border:2px solid #c0392b;border-radius:6px;font-size:12px;line-height:1.6;font-family:monospace;white-space:pre-wrap;";
+        const r = protyle.getBoundingClientRect();
+        box.style.top = Math.max(12, r.top) + "px";
+        box.style.left = Math.max(12, r.left) + "px";
+        document.body.appendChild(box);
+      }
+      box.textContent = "[密库注入诊断] " + JSON.stringify(diag, null, 1) + "\n打开文档若仍不显示请截图此框";
+      clearTimeout(box._t);
+      box._t = setTimeout(() => {
+        try {
+          box.remove();
+        } catch (e) {
+        }
+      }, 12000);
+    } catch (e) {
     }
   }
   /* ============ 大附件本地流式服务（按 Range 边播边解密，零明文、内存恒定） ============ */
@@ -7261,13 +7657,16 @@ var EdbPlugin = class extends Plugin {
     const dataDir = await this.wsDataDir();
     if (!dataDir || !this.state)
       return;
-    const assets = core.getAssetsByDoc(this.state.db, docId).filter((a) => !this.assetIsInline(a.asset_path));
-    for (const a of assets) {
+    // v1.6.25: 全引用收集（名下 + .sy 引用兜底）——跨文档引用资产也能还原明文供点击下载
+    const wanted = await this.collectDocReferencedAssets(docId, dataDir);
+    for (const raw of wanted.keys()) {
+      if (this.assetIsInline(raw))
+        continue;
       try {
-        const abs = path.join(dataDir, "assets", a.asset_path);
+        const abs = path.join(dataDir, "assets", raw);
         fs.mkdirSync(path.dirname(abs), { recursive: true });
         if (!fs.existsSync(abs))
-          core.streamAssetToFile(this.cfg.dbPath, this.state, a.asset_path, abs);
+          core.streamAssetToFile(this.cfg.dbPath, this.state, raw, abs);
       } catch (e) {
       }
     }
@@ -7299,15 +7698,16 @@ var EdbPlugin = class extends Plugin {
     const dataDir = await this.wsDataDir();
     if (!dataDir || !this.state)
       return;
-    const assets = core.getAssetsByDoc(this.state.db, docId);
+    // v1.6.25: 全引用收集（名下 + .sy 引用兜底）——跨文档引用资产打开时也能还原
+    const wanted = await this.collectDocReferencedAssets(docId, dataDir);
     const restored = [];
-    for (const a of assets) {
+    for (const raw of wanted.keys()) {
       try {
-        const abs = path.join(dataDir, "assets", a.asset_path);
+        const abs = path.join(dataDir, "assets", raw);
         fs.mkdirSync(path.dirname(abs), { recursive: true });
         if (!fs.existsSync(abs)) {
-          core.streamAssetToFile(this.cfg.dbPath, this.state, a.asset_path, abs);
-          restored.push(a.asset_path);
+          core.streamAssetToFile(this.cfg.dbPath, this.state, raw, abs);
+          restored.push(raw);
         }
       } catch (e) {
       }
@@ -7323,20 +7723,146 @@ var EdbPlugin = class extends Plugin {
     }
   }
   /** 清除明文资产：仅删除「已安全入库 + 未被非密文档引用 + 可安全删除（未打开，或打开但已注入显示）」的文件
-   *  opts.ignoreOpenDocs: 以 DOM 可见性为唯一依据（守护清理用，防 openDocs 残留）
+   *  opts.ignoreOpenDocs: 以 DOM 可见性为唯一依据（整本入库后的主动清理用，防 openDocs 历史残留）
    *  opts.allowVisible: 允许删除可见文档的明文（前提是其图片已全部从库注入） */
+  /** v1.6.4: 清理「未加入密库（不在任何 watchlist）」的历史残留文档——
+   *  移出/删除笔记本后，旧同步记录仍留在 docs 表，导致面板仍显示文档。
+   *  先自动备份到 backup/ 再删除；可重新加入密库恢复 */
+  async cleanOrphanDocs() {
+    if (!this.state)
+      return 0;
+    const wl = new Set(this.cfg.watchlist);
+    const docs = core.listDocs(this.state.db);
+    const orphans = docs.filter((d) => !wl.has(d.doc_id));
+    if (!orphans.length) {
+      showMessage(this.t("cleanOrphanNone") || "\u65E0\u672A\u52A0\u5165\u6B8B\u7559\u6587\u6863");
+      return 0;
+    }
+    const okc = await this.confirmBox((this.t("cleanOrphanConfirm") || "\u5C06\u4ECE\u5BC6\u5E93\u5220\u9664 {0} \u7BC7\u672A\u52A0\u5165\u6B8B\u7559\u6587\u6863\uFF08\u5DF2\u81EA\u52A8\u5907\u4EFD\uFF09\uFF0C\u786E\u8BA4\uFF1F").replace("{0}", orphans.length));
+    if (!okc)
+      return 0;
+    try {
+      const dataDir = await this.wsDataDir();
+      if (dataDir) {
+        const dir = path.join(dataDir, "storage", "petal", "siyuan-edb", "backup");
+        fs.mkdirSync(dir, { recursive: true });
+        const fn = "orphan-backup-" + Date.now() + ".json";
+        fs.writeFileSync(path.join(dir, fn), JSON.stringify({
+          time: Date.now(),
+          docs: orphans.map((d) => ({ doc_id: d.doc_id, notebook_id: d.notebook_id, title: d.title, hpath: d.hpath, markdown: d.markdown }))
+        }, null, 1), "utf8");
+        console.log("[siyuan-edb] \u5907\u4EFD\u672A\u52A0\u5165\u6B8B\u7559 ->", path.join(dir, fn));
+      }
+    } catch (e) {
+      console.error("[siyuan-edb] \u672A\u52A0\u5165\u6B8B\u7559\u5907\u4EFD\u5931\u8D25", e);
+    }
+    for (const d of orphans) {
+      try {
+        core.removeDoc(this.state.db, d.doc_id);
+      } catch (e) {
+      }
+      try {
+        core.clearRevisions(this.state.db, d.doc_id);
+      } catch (e) {
+      }
+    }
+    this.flushVault();
+    this.refreshPanel();
+    return orphans.length;
+  }
   async cleanPlainAssets(onlyDocId, opts) {
     if (!this.state || this.cfg.keepPlain)
       return;
     const dataDir = await this.wsDataDir();
     if (!dataDir)
       return;
+    try {
+      await this.ensurePlainRefIndex();
+    } catch (e) {
+    }
+    const idx = this._plainRefIdx || new Map();
     const domSet = this.openDocIdsFromDom();
-    let items = core.listAssets(this.state.db);
-    if (onlyDocId)
-      items = items.filter((a) => a.doc_id === onlyDocId);
-    for (const a of items) {
-      const abs = path.join(dataDir, "assets", a.asset_path);
+    // v1.6.0: 候选清单改用本地 .sy 引用索引（原实现仅遍历「库内资产」，去重副本与未入库副本漏清；
+    // 且逐资产 SQL LIKE 慢/超时会走 catch 保守跳过，导致整本入库后明文一个没清）
+    const names = new Set();
+    if (onlyDocId) {
+      for (const [name, refs] of idx) {
+        if (refs.has(onlyDocId))
+          names.add(name);
+      }
+      // v1.6.28: 库内名下资产也并入候选——新资产入库后 .sy 引用可能尚未落盘
+      // （思源保存延迟，最长数分钟），若只靠 .sy 索引，明文会残留到 .sy 写入+索引重建。
+      // 库内记录是权威：已入库且该文档在 watchlist，明文即可安全清理（删除前仍有
+      // size 一致门槛；若 .sy 索引已见其他引用者，需全部在 watchlist 才删）。
+      try {
+        const own = core.getAssetsByDoc(this.state.db, onlyDocId);
+        for (const a of own || []) {
+          if (!a || !a.asset_path)
+            continue;
+          const refs = idx.get(a.asset_path);
+          if (refs) {
+            let allIn = true;
+            for (const r of refs) {
+              if (!this.cfg.watchlist.includes(r)) {
+                allIn = false;
+                break;
+              }
+            }
+            if (!allIn)
+              continue;
+          }
+          names.add(a.asset_path);
+        }
+      } catch (e) {
+      }
+    } else {
+      for (const [name, refs] of idx) {
+        let allIn = true;
+        for (const r of refs) {
+          if (!this.cfg.watchlist.includes(r)) {
+            allIn = false;
+            break;
+          }
+        }
+        if (allIn)
+          names.add(name);
+      }
+      // v1.6.30: 全量分支也并入库内未回收资产（与单篇分支对称）——watchTimer 定时 /
+      // syncNow 结束兜底时，若新资产已入库但 .sy 引用尚未落盘（思源保存延迟），
+      // 仅靠 .sy 索引会漏候选 → 明文残留到下一轮。库内记录是权威：
+      // 已入库（未回收）且 doc_id 在 watchlist（或 .sy 引用者全部在 watchlist），
+      // 明文即可安全清理（删除前仍有下方 size 一致门槛）。
+      try {
+        const all = core.listAssets(this.state.db) || [];
+        for (const a of all) {
+          if (!a || !a.asset_path)
+            continue;
+          if (Number(a.trashed) === 1)
+            continue;
+          const refs = idx.get(a.asset_path);
+          if (refs) {
+            let allIn2 = true;
+            for (const r of refs) {
+              if (!this.cfg.watchlist.includes(r)) {
+                allIn2 = false;
+                break;
+              }
+            }
+            if (!allIn2)
+              continue;
+          } else if (!this.cfg.watchlist.includes(a.doc_id || "")) {
+            // 无 .sy 引用（=新资产未落盘）：必须该资产所属文档在 watchlist 才清，
+            // 防误删「非密库文档名下的未回收残留记录」对应明文
+            continue;
+          }
+          names.add(a.asset_path);
+        }
+      } catch (e) {
+      }
+    }
+    let cleared = 0;
+    for (const name of names) {
+      const abs = path.join(dataDir, "assets", name);
       if (!fs.existsSync(abs))
         continue;
       let st = null;
@@ -7345,48 +7871,135 @@ var EdbPlugin = class extends Plugin {
       } catch (e) {
         st = null;
       }
-      if (!st || Number(a.size) !== st.size)
+      if (!st || !st.isFile())
         continue;
-      if (domSet[a.doc_id]) {
+      // 必须已加密进库（库内存在且大小一致），否则保留明文（未入库资产不可删）
+      let exist = null;
+      try {
+        exist = core.getAsset(this.state.db, name);
+      } catch (e) {
+        exist = null;
+      }
+      if (!exist || Number(exist.size) !== st.size)
+        continue;
+      // 打开保护：该资产被任一正在打开的文档引用时，按 opts 决定是否跳过
+      const refDocs = idx.get(name) || new Set();
+      let domBlocked = false;
+      for (const d of refDocs) {
+        if (domSet[d]) {
+          domBlocked = true;
+          break;
+        }
+      }
+      if (domBlocked) {
         if (!(opts && opts.allowVisible))
           continue;
-        if (!this.docAssetsInjected(a.doc_id))
+        let injected = true;
+        for (const d of refDocs) {
+          if (domSet[d] && !this.docAssetsInjected(d)) {
+            injected = false;
+            break;
+          }
+        }
+        if (!injected)
           continue;
       }
-      if (!(opts && opts.ignoreOpenDocs) && this.openDocs[a.doc_id])
-        continue;
-      if (await this.referencedByOtherDoc(a.asset_path))
-        continue;
-      if (this.openDocIdsFromDom()[a.doc_id]) {
-        if (!(opts && opts.allowVisible))
-          continue;
-        if (!this.docAssetsInjected(a.doc_id))
+      if (!(opts && opts.ignoreOpenDocs)) {
+        let openBlocked = false;
+        for (const d of refDocs) {
+          const opAt = this.openDocs[d];
+          if (opAt && Date.now() - opAt < 30 * 60 * 1000) {
+            openBlocked = true;
+            break;
+          }
+        }
+        if (openBlocked)
           continue;
       }
-      if (!fs.existsSync(abs))
-        continue;
       try {
         fs.unlinkSync(abs);
+        cleared++;
       } catch (e) {
       }
     }
+    if (cleared > 0)
+      console.log("[siyuan-edb] \u660e\u6587\u8d44\u4ea7\u6e05\u7406", cleared, "\u4e2a");
   }
-  /** 资产名是否被非密文档（watchlist 之外）引用 */
+  /** asset name referenced by any non-vault doc? uses local .sy index (fast, no SQL) */
   async referencedByOtherDoc(name) {
     try {
-      const safe = name.replace(/[%_]/g, (c) => "\\" + c);
-      const res = await fetchSyncPost("/api/query/sql", {
-        stmt: "SELECT root_id FROM blocks WHERE content LIKE '%" + safe + "%' ESCAPE '\\' LIMIT 30"
-      });
-      const rows = res && res.data || [];
-      for (const r of rows) {
-        if (r && r.root_id && !this.cfg.watchlist.includes(r.root_id))
+      await this.ensurePlainRefIndex();
+      const refs = this._plainRefIdx ? this._plainRefIdx.get(name) : null;
+      if (!refs || !refs.size)
+        return false;
+      for (const rootId of refs) {
+        if (!this.cfg.watchlist.includes(rootId))
           return true;
       }
       return false;
     } catch (e) {
       return true;
     }
+  }
+  /** build local index: asset name -> Set(root doc id), scanning workspace .sy files.
+   *  v1.6.0: replaces per-asset SQL LIKE queries (slow / timeout caused plaintext cleanup to skip everything). */
+  async ensurePlainRefIndex() {
+    if (this._plainRefIdx && Date.now() - this._plainRefIdxAt < 5 * 60 * 1000)
+      return;
+    const dataDir = await this.wsDataDir();
+    if (!dataDir)
+      return;
+    const SKIP = new Set(["assets", "emojis", "icons", "plugins", "public", "snippets", "storage", "templates", "themes", "widgets", "MiKu", "MiKu-backup", ".siyuan"]);
+    const idx = new Map();
+    const re = /(?:data\/)?assets\/([^"'()<>\\]+)/g;
+    const rootIdOf = (p) => {
+      const rel = path.relative(dataDir, p).split(/[\\/]/);
+      const seg = rel.slice(1).join("/").replace(/\.sy$/, "");
+      return seg.split("/")[0];
+    };
+    const walk = (dir) => {
+      let ents;
+      try {
+        ents = fs.readdirSync(dir, { withFileTypes: true });
+      } catch (e) {
+        return;
+      }
+      for (const en of ents) {
+        const p = path.join(dir, en.name);
+        if (en.isDirectory()) {
+          walk(p);
+        } else if (en.name.endsWith(".sy") && en.name !== "data.sy") {
+          let raw;
+          try {
+            raw = fs.readFileSync(p, "utf8");
+          } catch (e) {
+            continue;
+          }
+          const rootId = rootIdOf(p);
+          let m;
+          while ((m = re.exec(raw)) !== null) {
+            const nm = m[1].replace(/[?#].*$/, "");
+            if (!nm || /^\.\.?\//.test(nm))
+              continue;
+            if (!idx.has(nm))
+              idx.set(nm, new Set());
+            idx.get(nm).add(rootId);
+          }
+        }
+      }
+    };
+    let top;
+    try {
+      top = fs.readdirSync(dataDir, { withFileTypes: true });
+    } catch (e) {
+      return;
+    }
+    for (const d of top) {
+      if (d.isDirectory() && !SKIP.has(d.name))
+        walk(path.join(dataDir, d.name));
+    }
+    this._plainRefIdx = idx;
+    this._plainRefIdxAt = Date.now();
   }
   /* ================= 事件 ================= */
   onDocTreeMenu(o) {
@@ -7398,6 +8011,15 @@ var EdbPlugin = class extends Plugin {
       const els = detail.elements || [];
       if (!els.length)
         return;
+      // 笔记本节点：思源 open-menu-doctree 的 detail.type 为 notebook/notebooks，
+      // items[].id 即笔记本 ID（笔记本节点默认没有 data-node-id，不能当文档处理）
+      const menuType = detail.type || "";
+      if (menuType === "notebook" || menuType === "notebooks") {
+        const boxIds = (detail.items || []).map((it) => it && it.id).filter(Boolean);
+        if (boxIds.length)
+          this.appendNotebookMenu(menu, boxIds);
+        return;
+      }
       const docId = this.docElId(els[0]);
       if (!docId)
         return;
@@ -7431,6 +8053,210 @@ var EdbPlugin = class extends Plugin {
     } catch (e) {
       console.error("[siyuan-edb]", e);
     }
+  }
+  /** 笔记本右键菜单：整本加入 / 整本移出密库 */
+  appendNotebookMenu(menu, boxIds) {
+    menu.addItem({
+      icon: "iconKey",
+      label: this.t("nbAdd"),
+      click: async () => {
+        try {
+          const n = await this.addNotebookToVault(boxIds);
+          showMessage(n > 0 ? this.t("nbAddOk").replace("{0}", n) : this.t("nbEmpty"));
+        } catch (e) {
+          console.error("[siyuan-edb]", e);
+          showMessage(this.t("addFail") + "\uff1a" + (e && e.message ? e.message : e));
+        }
+      }
+    });
+    menu.addItem({
+      icon: "iconKey",
+      label: this.t("nbRemove"),
+      click: async () => {
+        try {
+          const n = await this.removeNotebookFromVault(boxIds);
+          if (n > 0)
+            showMessage(this.t("nbRemoveOk").replace("{0}", n));
+          else if (n === 0)
+            showMessage(this.t("nbNotWatched"));
+        } catch (e) {
+          console.error("[siyuan-edb]", e);
+          showMessage(this.t("nbRemoveFail") + "\uff1a" + (e && e.message ? e.message : e));
+        }
+      }
+    });
+  }
+  /** 整本笔记本入库：查询该笔记本全部文档 ID → 批量加入 watchlist → 一次全量同步 */
+  async addNotebookToVault(boxIds) {
+    if (!this.isLicensed()) {
+      showMessage(this.t("licStatusNone"));
+      return 0;
+    }
+    if (!this.isUnlocked()) {
+      const ok = await this.ensureUnlocked();
+      if (!ok)
+        return 0;
+    }
+    const ids = [];
+    const seen = new Set();
+    const dataDir = await this.wsDataDir();
+    for (const box of boxIds) {
+      // ① SQL 查 blocks（正常路径）
+      let sqlIds = [];
+      try {
+        const boxEsc = String(box).replace(/'/g, "''");
+        const r = await fetchSyncPost("/api/query/sql", { stmt: "SELECT id FROM blocks WHERE type = 'd' AND box = '" + boxEsc + "'" });
+        const rows = (r && r.data) || [];
+        for (const row of rows) {
+          if (row && row.id)
+            sqlIds.push(row.id);
+        }
+      } catch (e) {
+        sqlIds = [];
+      }
+      // ② v1.6.9: .sy 文件系统兜底——新笔记本/刚导入大量内容时 blocks 索引可能尚未建立，
+      // SQL 查不到 → 整本加入 0 篇（实测「笔记怎么也入不了库」）。文件系统 .sy 是最终真相。
+      // v1.6.10: 单目录读取失败只跳过该目录、不中断整棵遍历（此前一个目录 readdirSync 抛错
+      // 会让 walk 提前中止，漏掉该目录之后的文档 → 实测漏掉子文档 bydqt0q → 图永不入库）
+      const syIds = [];
+      try {
+        const boxDir = path.join(dataDir, String(box));
+        if (fs.existsSync(boxDir)) {
+          const walk = (dir, acc) => {
+            let ents = null;
+            try {
+              ents = fs.readdirSync(dir, { withFileTypes: true });
+            } catch (e) {
+              return;
+            }
+            for (const e of ents) {
+              const p = path.join(dir, e.name);
+              if (e.isDirectory())
+                walk(p, acc);
+              else if (e.name.endsWith(".sy"))
+                acc.push(e.name.slice(0, -3));
+            }
+          };
+          walk(boxDir, syIds);
+        }
+      } catch (e) {
+        // 忽略
+      }
+      const merged = [...new Set([...sqlIds, ...syIds])];
+      for (const id of merged) {
+        if (id && !seen.has(id)) {
+          seen.add(id);
+          if (!this.cfg.watchlist.includes(id))
+            ids.push(id);
+        }
+      }
+    }
+    if (!ids.length)
+      return 0;
+    this.cfg.watchlist = this.cfg.watchlist.concat(ids);
+    await this.saveConfig();
+    // v1.6.11: 整本加入期间显示动态等待（扫描+同步+明文清理耗时）
+    this.setBusy(this.t("nbAddBusy") || ("\u6B63\u5728\u6574\u672C\u52A0\u5165 " + ids.length + " \u7BC7\u6587\u6863..."));
+    try {
+      await this.syncNow();
+      // 整本入库后主动清理明文资产（等待完成再提示）：
+      // 忽略 openDocs 历史残留（刚入库的文档资产已全部加密进库，明文可安全删除；
+      // 正打开的文档由 DOM 可见性保护，跨笔记本引用的资产仍受引用保护）
+      try {
+        await this.cleanPlainAssets(null, { ignoreOpenDocs: true });
+      } catch (e) {
+        console.error("[siyuan-edb] \u6574\u672c\u5165\u5e93\u540e\u6e05\u7406\u660e\u6587\u5931\u8d25", e);
+      }
+    } finally {
+      this.clearBusy();
+    }
+    this.refreshPanel();
+    await this.maybeAutoCompact();
+    return ids.length;
+  }
+  /** 整本笔记本移出密库：找出该笔记本下已入库文档 → 还原资产 → 从库内移除（记录进回收站） */
+  async removeNotebookFromVault(boxIds) {
+    const ids = new Set();
+    // v1.6.9: 与整本加入一致，SQL + .sy 文件系统双路兜底（blocks 索引未建时 SQL 查不到）
+    const dataDir = await this.wsDataDir();
+    for (const box of boxIds) {
+      try {
+        const boxEsc = String(box).replace(/'/g, "''");
+        const r = await fetchSyncPost("/api/query/sql", { stmt: "SELECT id FROM blocks WHERE type = 'd' AND box = '" + boxEsc + "'" });
+        const rows = (r && r.data) || [];
+        for (const row of rows) {
+          if (row && row.id)
+            ids.add(row.id);
+        }
+      } catch (e) {
+        // 忽略
+      }
+      try {
+        const boxDir = path.join(dataDir, String(box));
+        if (fs.existsSync(boxDir)) {
+          const walk = (dir, acc) => {
+            let ents = null;
+            try {
+              ents = fs.readdirSync(dir, { withFileTypes: true });
+            } catch (e) {
+              return;
+            }
+            for (const e of ents) {
+              const p = path.join(dir, e.name);
+              if (e.isDirectory())
+                walk(p, acc);
+              else if (e.name.endsWith(".sy"))
+                acc.add(e.name.slice(0, -3));
+            }
+          };
+          walk(boxDir, ids);
+        }
+      } catch (e) {
+        // 忽略
+      }
+    }
+    const targets = this.cfg.watchlist.filter((d) => ids.has(d));
+    if (!targets.length)
+      return 0;
+    const okc = await this.confirmBox(this.t("nbRemoveConfirm").replace("{0}", targets.length));
+    if (!okc)
+      return -1;
+    // v1.6.11: 确认后显示动态等待（还原资产+清理库记录耗时，防止界面无反馈）
+    this.setBusy(this.t("nbRemoveBusy") || ("\u6B63\u5728\u79FB\u51FA " + targets.length + " \u7BC7\u6587\u6863..."));
+    try {
+      for (const docId of targets) {
+        if (this.state) {
+          try {
+            const n = await this.restoreDocAssets(docId);
+            if (n > 0)
+              console.log("[siyuan-edb] \u6574\u672c\u79fb\u51fa\u65f6\u5df2\u8fd8\u539f\u8d44\u4ea7", n, docId);
+          } catch (e) {
+            console.error("[siyuan-edb] \u8fd8\u539f\u8d44\u4ea7\u5931\u8d25", e);
+          }
+          try {
+            core.removeDoc(this.state.db, docId);
+          } catch (e) {
+          }
+          try {
+            core.clearRevisions(this.state.db, docId);
+          } catch (e) {
+          }
+          try {
+            core.audit(this.state.db, "remove", docId, "\u6574\u672c\u79fb\u51fa\u5bc6\u5e93");
+          } catch (e) {
+          }
+        }
+        delete this.docBoxMap[docId];
+      }
+      this.cfg.watchlist = this.cfg.watchlist.filter((d) => !ids.has(d));
+      await this.saveConfig();
+      this.flushVault();
+    } finally {
+      this.clearBusy();
+    }
+    this.refreshPanel();
+    await this.maybeAutoCompact();
+    return targets.length;
   }
   docElId(el) {
     try {
@@ -7488,6 +8314,8 @@ var EdbPlugin = class extends Plugin {
               this.restoreOpenAssets(id).catch((e2) => console.error("[siyuan-edb]", e2));
             else
               this.injectDocAssets(id).catch((e2) => console.error("[siyuan-edb] \u6CE8\u5165\u5931\u8D25", id, e2));
+            // v1.6.26: 打开已入库文档时也补一次单篇自动入库（可能上次编辑后未来得及同步）
+            this.scheduleAutoSyncDoc(id);
           }
         }
         this.injectOpenDocs().catch((e2) => console.error("[siyuan-edb]", e2));
@@ -7503,7 +8331,7 @@ var EdbPlugin = class extends Plugin {
         return;
       }
       if (["transactions", "rename", "moveDoc", "create"].includes(cmd)) {
-        const id = this.pickDocId(detail);
+        const id = this.pickRootId(detail);
         if (id && this.cfg.watchlist.includes(id)) {
           this.openDocs[id] = Date.now();
           if (this.isUnlocked()) {
@@ -7512,8 +8340,12 @@ var EdbPlugin = class extends Plugin {
             else
               this.injectDocAssets(id).catch((e2) => console.error("[siyuan-edb] \u6CE8\u5165\u5931\u8D25", id, e2));
           }
+          // v1.6.26: 编辑已入库文档 → 单篇实时自动入库（防抖合并；替代原先每次编辑都全量扫描）
+          this.scheduleAutoSyncDoc(id);
+        } else {
+          // 拿不到具体已入库文档 id 时，保留全量防抖同步兜底（原行为）
+          this.scheduleSync();
         }
-        this.scheduleSync();
       }
     } catch (e2) {
       console.error("[siyuan-edb]", e2);
@@ -7638,12 +8470,24 @@ var EdbPlugin = class extends Plugin {
     const set = {};
     if (!markdown)
       return [];
-    const re = /(?:data\/)?assets\/([^"'()\s\\]+)/g;
+    const re = /(?:data\/)?assets\/([^"'()<>\\]+)/g;
     let m;
     while ((m = re.exec(markdown)) !== null) {
       const name = m[1].replace(/[?#].*$/, "");
-      if (name && !/^\.\.?\//.test(name))
+      if (name && !/^\.\.?\//.test(name)) {
         set[name] = true;
+        // v1.6.7: 思源导出 Markdown 时把图片 URL 里的空格等编码为 %20（video 等 HTML 标签不编码），
+        // 导致图片文件名含空格时 statSync 永远失败、图片不入库。解码出真实文件名一并收录；
+        // 解码失败（名字本身含非法 % 序列）则保守替换 %20 为空格
+        let dec = null;
+        try {
+          dec = decodeURIComponent(name);
+        } catch (e) {
+          dec = name.replace(/%20/g, " ");
+        }
+        if (dec !== name)
+          set[dec] = true;
+      }
     }
     return Object.keys(set);
   }
@@ -7652,12 +8496,43 @@ var EdbPlugin = class extends Plugin {
     const dataDir = await this.wsDataDir();
     if (!dataDir)
       return false;
-    const names = this.parseAssetRefs(markdown);
+    let names = this.parseAssetRefs(markdown);
+    // v1.6.0: 思源 exportMdContent 导出的 Markdown 偶有资产引用缺失，
+    // 从本地 .sy 文件补充同一文档的全部引用，避免「文档入库了但部分资产明文未加密进库」
+    // v1.6.6: 补充无条件执行——fetchDoc 导出可能漏掉任意资产（markdown 有部分引用时也会漏），
+    // findDocSyPath 定位失败时兜底走全局扫描（带缓存，避免每篇全盘扫）
+    let syPath = null;
+    try {
+      syPath = await this.findDocSyPath(docId, dataDir);
+    } catch (e) {
+    }
+    if (!syPath) {
+      try {
+        syPath = await this.findDocSyPathGlobal(docId, dataDir, this._syCache);
+      } catch (e) {
+      }
+    }
+    if (syPath) {
+      try {
+        const raw = fs.readFileSync(syPath, "utf8");
+        const re = /(?:data\/)?assets\/([^"'()<>\\]+)/g;
+        let m;
+        while ((m = re.exec(raw)) !== null) {
+          const nm = m[1].replace(/[?#].*$/, "");
+          if (nm && !/^\.\.?\//.test(nm))
+            names.push(nm);
+        }
+        names = [...new Set(names)];
+      } catch (e) {
+      }
+    }
     const keepSet = {};
     let changed = false;
     let stored = 0;
     for (const name of names) {
       keepSet[name] = true;
+      if (this._syncKeep)
+        this._syncKeep.add(name);
       const abs = path.join(dataDir, "assets", name);
       let st = null;
       try {
@@ -7684,12 +8559,83 @@ var EdbPlugin = class extends Plugin {
         console.error("[siyuan-edb] \u8D44\u4EA7\u5165\u5E93\u5931\u8D25", name, e);
       }
     }
-    core.gcAssets(this.state.db, Object.keys(keepSet));
+    // v1.6.3: gcAssets 不再在单篇内调用——每篇调用会删除「本篇未引用」的其他文档资产记录（多文档同步连环误删）
     if (stored > 0)
       console.log("[siyuan-edb] \u8D44\u4EA7\u52A0\u5BC6\u5165\u5E93", stored, "\u4E2A ->", names.length, "\u4E2A\u5F15\u7528");
     return changed;
   }
+  /** v1.6.3: docBoxMap 未知时的全局 .sy 定位兜底（在全部笔记本目录内按 docId 查找） */
+  async findDocSyPathGlobal(docId, dataDir, cache) {
+    if (cache) {
+      if (cache.has(docId))
+        return cache.get(docId);
+    }
+    let nbDirs = [];
+    try {
+      nbDirs = fs.readdirSync(dataDir).filter((n) => /^\d{14}-[0-9a-z]+$/.test(n));
+    } catch (e) {
+      if (cache)
+        cache.set(docId, null);
+      return null;
+    }
+    let found = null;
+    for (const nb of nbDirs) {
+      const root = path.join(dataDir, nb);
+      const stack = [root];
+      while (stack.length) {
+        const p = stack.pop();
+        let ents;
+        try {
+          ents = fs.readdirSync(p, { withFileTypes: true });
+        } catch (e) {
+          continue;
+        }
+        for (const en of ents) {
+          const fp = path.join(p, en.name);
+          if (en.isDirectory()) {
+            stack.push(fp);
+          } else if (en.name === docId + ".sy") {
+            found = fp;
+            break;
+          }
+        }
+        if (found)
+          break;
+      }
+      if (found)
+        break;
+    }
+    if (cache)
+      cache.set(docId, found);
+    return found;
+  }
   /* ================= 核心流程 ================= */
+  /** v1.6.0: 在笔记本目录内定位 docId 对应的 .sy 文件（导出 Markdown 引用不全时用它补充资产引用） */
+  async findDocSyPath(docId, dataDir) {
+    const box = this.docBoxMap ? this.docBoxMap[docId] : null;
+    const roots = box ? [path.join(dataDir, box)] : [];
+    for (const r of roots) {
+      const stack = [r];
+      while (stack.length) {
+        const p = stack.pop();
+        let ents;
+        try {
+          ents = fs.readdirSync(p, { withFileTypes: true });
+        } catch (e) {
+          continue;
+        }
+        for (const en of ents) {
+          const fp = path.join(p, en.name);
+          if (en.isDirectory()) {
+            stack.push(fp);
+          } else if (en.name === docId + ".sy") {
+            return fp;
+          }
+        }
+      }
+    }
+    return null;
+  }
   scheduleSync() {
     if (!this.cfg.autoSync)
       return;
@@ -7704,6 +8650,69 @@ var EdbPlugin = class extends Plugin {
       this.syncTimer = null;
       this.syncNow().catch((e) => console.error("[siyuan-edb]", e));
     }, SYNC_DEBOUNCE_MS);
+  }
+  /** v1.6.26: 单篇实时自动入库——编辑已入库文档后，防抖合并多次编辑，
+   *  仅同步被编辑的那一篇（fetchDoc 更新文字 + 新资产加密入库 + 清理该文档明文），
+   *  秒级完成，不触发全量 109 篇扫描。 */
+  scheduleAutoSyncDoc(docId) {
+    if (!docId || !this.cfg.autoSync || !this.isUnlocked())
+      return;
+    if (!this.cfg.watchlist.includes(docId))
+      return;
+    if (this._autoSyncTimers && this._autoSyncTimers[docId])
+      clearTimeout(this._autoSyncTimers[docId]);
+    if (!this._autoSyncTimers)
+      this._autoSyncTimers = {};
+    this._autoSyncTimers[docId] = setTimeout(() => {
+      delete this._autoSyncTimers[docId];
+      this.syncOneDoc(docId).catch((e) => console.error("[siyuan-edb] 单篇自动同步失败", docId, e));
+    }, SYNC_DEBOUNCE_MS);
+  }
+  /** v1.6.26: 单篇增量同步：更新库内文字快照 + 新资产加密入库 + 清理该文档明文。
+   *  与 syncNow 的区别：只处理一篇、不做 _syncKeep/gcAssets（避免与全量回收冲突）。 */
+  async syncOneDoc(docId) {
+    if (!this.state || !this.isUnlocked() || !this.cfg.watchlist.includes(docId))
+      return { ok: false, reason: "skip" };
+    let info = null;
+    try {
+      info = await this.fetchDoc(docId);
+    } catch (e) {
+      info = null;
+    }
+    if (!info || !info.ok)
+      return { ok: false, reason: "fetch-fail" };
+    try {
+      const oldDoc = core.getDoc(this.state.db, docId);
+      core.addRevision(this.state.db, docId, oldDoc ? oldDoc.markdown : null, oldDoc ? oldDoc.updated_at : null);
+      core.upsertDoc(this.state.db, {
+        doc_id: docId,
+        notebook_id: info.notebook_id || "",
+        title: info.title,
+        hpath: info.hpath,
+        markdown: info.markdown,
+        updated_at: Date.now()
+      });
+      if (info.notebook_id)
+        this.docBoxMap[docId] = info.notebook_id;
+      const changed = await this.syncDocAssets(docId, info.markdown);
+      this.cfg.lastSyncAt = Date.now();
+      await this.saveConfig();
+      this.pendingSync = false;
+      this.refreshPanel();
+      // v1.6.27: 有新资产入库时强制失效 .sy 引用索引缓存——
+      // 否则新资产要等 ensurePlainRefIndex 的 5 分钟缓存过期后才进明文清理候选，明文延迟残留
+      if (changed) {
+        this._plainRefIdx = null;
+        this._plainRefIdxAt = 0;
+      }
+      // 新资产加密完成后清理该文档明文（含刚入库的新图片/视频；keepPlain 由 cleanPlainAssets 自判）
+      const domSet = this.openDocIdsFromDom();
+      await this.cleanPlainAssets(docId, { ignoreOpenDocs: true, allowVisible: !!domSet[docId] });
+      return { ok: true, changed };
+    } catch (e) {
+      console.error("[siyuan-edb] syncOneDoc \u5931\u8D25", docId, e);
+      return { ok: false, reason: "err", e };
+    }
   }
   /** 解析自动分库规则文本：每行「匹配项1, 匹配项2 → 库名」；返回 [{match:[...], vault}] */
   parseAutoRules(text) {
@@ -7961,6 +8970,9 @@ var EdbPlugin = class extends Plugin {
         return;
     }
     this.cfg.watchlist = this.cfg.watchlist.filter((x) => x !== docId);
+    // v1.6.11: 移出期间显示动态等待（还原大视频等资产耗时）
+    this.setBusy(this.t("removeBusy") || "\u6B63\u5728\u79FB\u51FA\u6587\u6863...");
+    try {
     if (this.state) {
       try {
         const n = await this.restoreDocAssets(docId);
@@ -7978,27 +8990,81 @@ var EdbPlugin = class extends Plugin {
     }
     await this.saveConfig();
     this.flushVault();
-    this.refreshPanel();
+    } finally {
+      this.clearBusy();
+    }
+    try {
+      this.refreshPanel();
+    } catch (e) {
+      console.error("[siyuan-edb] \u79FB\u51FA\u540e\u9762\u677f\u5237\u65b0\u5931\u8d25", e);
+    }
     showMessage(this.t("removeOk"));
+    await this.maybeAutoCompact();
   }
   /** 把指定文档在库内的全部资产解密写回思源 assets 目录（已存在文件跳过，不覆盖） */
+  /** v1.6.25: 收集某文档引用的全部资产（名下 + 该文档 .sy 引用 + 库记录兜底）。
+   *  原实现仅 getAssetsByDoc(docId) 按「名下」过滤——思源文档可引用任意 assets 文件，
+   *  跨文档引用资产挂在其他文档名下（如 qvgkb6x 引用 b0wpwsd 名下的 GIF）→ 移出/还原时查不到 → 明文不还原 → 图片视频不显示。
+   *  返回 Map<asset_path, size>，size 未知时为 0。 */
+  async collectDocReferencedAssets(docId, dataDir) {
+    const wanted = new Map();
+    if (!this.state || !docId)
+      return wanted;
+    // v1.6.29: 还原以「文档当前 .sy 引用」为权威——.sy 是文档内容的真实来源，
+    // 思源文档可引用任意 assets 文件（含跨文档，如 qvgkb6x 引用 b0wpwsd 名下的 GIF）。
+    // 名下资产仅在 .sy 无法定位时兜底：避免「已删除引用的资产」因仍在名下记录中
+    // 而随移出/还原以明文形式复活（用户从文档删除的视频/图片不应在磁盘再现）。
+    let syPath = null;
+    try {
+      syPath = await this.findDocSyPath(docId, dataDir);
+    } catch (e) {
+    }
+    if (!syPath) {
+      try {
+        syPath = await this.findDocSyPathGlobal(docId, dataDir, this._syCache);
+      } catch (e) {
+      }
+    }
+    if (syPath) {
+      try {
+        const raw = fs.readFileSync(syPath, "utf8");
+        const re = /(?:data\/)?assets\/([^"'()<>\\]+)/g;
+        let m;
+        while ((m = re.exec(raw)) !== null) {
+          const nm = m[1].replace(/[?#].*$/, "");
+          if (!nm || /^\.\.?\//.test(nm))
+            continue;
+          // 库内有记录才还原（库内无记录 = 未加密资产，磁盘本就有明文，无需还原）
+          try {
+            const rec = core.getAsset(this.state.db, nm);
+            if (rec)
+              wanted.set(nm, Number(rec.size) || 0);
+          } catch (e2) {
+          }
+        }
+      } catch (e) {
+      }
+      return wanted;
+    }
+    // .sy 无法定位：兜底用名下资产全量（防文档内容完全无法还原）
+    try {
+      const own = core.getAssetsByDoc(this.state.db, docId);
+      if (own)
+        for (const a of own)
+          wanted.set(a.asset_path, Number(a.size) || 0);
+    } catch (e) {
+    }
+    return wanted;
+  }
   async restoreDocAssets(docId) {
     if (!this.state || !docId)
-      return 0;
-    let assets = null;
-    try {
-      assets = core.getAssetsByDoc(this.state.db, docId);
-    } catch (e) {
-      assets = null;
-    }
-    if (!assets || !assets.length)
       return 0;
     const dataDir = await this.wsDataDir();
     const assetsDir = path.join(dataDir, "assets");
     fs.mkdirSync(assetsDir, { recursive: true });
+    const wanted = await this.collectDocReferencedAssets(docId, dataDir);
     let restored = 0;
-    for (const a of assets) {
-      const raw = String(a.asset_path || "");
+    for (const raw of wanted.keys()) {
       if (!raw)
         continue;
       const rel = raw.replace(/\\/g, "/").replace(/^\/+/, "");
@@ -8092,6 +9158,18 @@ var EdbPlugin = class extends Plugin {
   async ensureUnlocked() {
     if (this.isUnlocked())
       return true;
+    // v1.6.32: 无密码库（空密码即可解锁）在 state 丢失后（锁定/压缩重载/切换库/
+    // 插件重载/WebDAV 拉取等）应先自动解锁，而不是直接弹「解锁密库」输入框——
+    // 否则无密码用户会被卡死在输入框（不知道输什么，空输入又被 pwdEmpty 拦截）。
+    // tryAutoUnlock 内部：库存在才尝试、空密码解锁成功置 noPwd=true；有密码库
+    // 解锁失败快速抛错（不影响下方原有弹框流程），不打扰。
+    try {
+      await this.tryAutoUnlock();
+    } catch (e) {
+      console.error("[siyuan-edb] ensureUnlocked tryAutoUnlock", e);
+    }
+    if (this.isUnlocked())
+      return true;
     if (core.vaultExists(this.cfg.dbPath)) {
       const pwd = await this.promptInput(this.t("unlockTitle"), this.t("dbPath") + "\uFF1A" + this.cfg.dbPath, "password");
       if (pwd === null)
@@ -8114,6 +9192,7 @@ var EdbPlugin = class extends Plugin {
         }
         this.state = r.state;
         this.noPwd = false;
+        await this.syncWatchlistFromDb();
         if (r.migrated)
           showMessage(this.t("vaultUpgraded") || "\u52A0\u5BC6\u5F15\u64CE\u5DF2\u5347\u7EA7\uFF08MK \u4FE1\u5C01\uFF09\uFF0C\u6570\u636E\u5B8C\u6574");
         showMessage(this.t("unlocked"));
@@ -8138,6 +9217,7 @@ var EdbPlugin = class extends Plugin {
         try {
           this.state = await core.unlockWithRecovery(this.cfg.dbPath, words, this.wasmPath(), WASM_B64);
           showMessage(this.t("recoverOk") || "\u6062\u590D\u5BC6\u94A5\u9A8C\u8BC1\u901A\u8FC7\uFF0C\u6B63\u5728\u89E3\u9501\u2026");
+          await this.syncWatchlistFromDb();
           const r2 = await this.promptNewPassword(core.readVaultHint(this.cfg.dbPath));
           if (r2 !== null) {
             this.state = core.setNewPassword(this.cfg.dbPath, this.state, r2.pwd, r2.hint);
@@ -8165,6 +9245,7 @@ var EdbPlugin = class extends Plugin {
       try {
         this.state = await core.createVault(this.cfg.dbPath, r.pwd, this.wasmPath(), WASM_B64, r.hint, r.recWords, true);
         this.noPwd = !r.pwd;
+        await this.syncWatchlistFromDb();
         showMessage(this.t("vaultCreated"));
         if (r.recWords) {
           this.saveRecoveryWords(r.recWords).catch(() => {
@@ -8194,6 +9275,14 @@ var EdbPlugin = class extends Plugin {
   lockVault() {
     if (this.syncTimer)
       clearTimeout(this.syncTimer);
+    // v1.6.26: 锁定/切换库时清掉单篇自动同步定时器，避免锁定时触发写库
+    if (this._autoSyncTimers) {
+      for (const k in this._autoSyncTimers) {
+        if (this._autoSyncTimers[k])
+          clearTimeout(this._autoSyncTimers[k]);
+      }
+      this._autoSyncTimers = {};
+    }
     this.stopStreamServer();
     this._viewerState = null;
     this.state = null;
@@ -8221,6 +9310,12 @@ var EdbPlugin = class extends Plugin {
   /** 全量同步：拉取所有已加入文档的最新内容 → 更新 SQLite → 加密写文件 */
   async syncNow() {
     this.clockGuard();
+    // v1.6.33: 互斥锁——ensureUnlocked→tryAutoUnlock 的延迟 syncNow(1200ms)
+    // 与调用方（addToVault/手动同步）自己的 syncNow 可能交错执行，共享 _syncKeep/
+    // _syCache 会被互相覆盖，导致整轮 gcAssets 基于被污染的引用并集误删资产。
+    // 后到者检测 busy 直接跳过本轮（数据安全优先；下轮/下个动作自然补跑）。
+    if (this._syncing)
+      return { ok: false, reason: "busy" };
     if (!this.isUnlocked())
       return { ok: false, reason: "locked" };
     if (!this.isLicensed()) {
@@ -8230,60 +9325,117 @@ var EdbPlugin = class extends Plugin {
       }
       return { ok: false, reason: "no-license" };
     }
+    // v1.6.11: 同步期间显示动态等待
+    this.setBusy(this.t("syncing") || "\u6B63\u5728\u540C\u6B65\u5BC6\u5E93...");
+    this._syncing = true;
     let changed = false;
+    let failCount = 0;
+    // v1.6.3: 全轮同步资产引用并集——gcAssets 只在整轮结束后统一执行（此前单篇内调用会连环误删其他文档资产）
+    this._syncKeep = new Set();
+    // v1.6.6: 全局 .sy 定位缓存（本轮同步内复用，避免每篇全盘扫描）
+    this._syCache = new Map();
+    // v1.6.8: 文档存在性兜底需要 dataDir 定位 .sy
+    const dataDir = await this.wsDataDir();
     const list = [...this.cfg.watchlist];
     for (const docId of list) {
-      const info = await this.fetchDoc(docId);
-      if (info && info.ok) {
-        const oldDoc = core.getDoc(this.state.db, docId);
-        core.addRevision(this.state.db, docId, oldDoc ? oldDoc.markdown : null, oldDoc ? oldDoc.updated_at : null);
-        const hits = core.sensitiveMatches(info.markdown);
-        if (hits.length) {
-          const seenKey = "sens_seen:" + docId;
-          if (!core.getMeta(this.state.db, seenKey)) {
-            core.setMeta(this.state.db, seenKey, hits.join(","));
-            this._sensitiveWarn = { doc: info.title || docId, types: hits };
+      try {
+        const info = await this.fetchDoc(docId);
+        if (info && info.ok) {
+          const oldDoc = core.getDoc(this.state.db, docId);
+          core.addRevision(this.state.db, docId, oldDoc ? oldDoc.markdown : null, oldDoc ? oldDoc.updated_at : null);
+          // 敏感信息检测：仅记录审计，不弹窗打断。
+          // 同步对象均为「已加入密库」的文档（手动加入 = 用户已主动保密），弹「建议加入密库保护」反而造成困惑
+          const hits = core.sensitiveMatches(info.markdown);
+          if (hits.length) {
+            const seenKey = "sens_seen:" + docId;
+            if (!core.getMeta(this.state.db, seenKey)) {
+              core.setMeta(this.state.db, seenKey, hits.join(","));
+              try {
+                core.audit(this.state.db, "sens", docId, "\u5df2\u5165\u5e93\u6587\u6863\u68c0\u6d4b\u5230\u654f\u611f\u4fe1\u606f\uFF1A" + hits.join("\u3001"));
+              } catch (e2) {
+              }
+            }
+          }
+          core.upsertDoc(this.state.db, {
+            doc_id: docId,
+            notebook_id: info.notebook_id,
+            title: info.title,
+            hpath: info.hpath,
+            markdown: info.markdown,
+            updated_at: Date.now()
+          });
+          if (info.notebook_id)
+            this.docBoxMap[docId] = info.notebook_id;
+          if (await this.syncDocAssets(docId, info.markdown))
+            changed = true;
+          changed = true;
+        } else {
+          // 区分「文档真不存在」与「暂时导出失败」：不存在才移除，失败则保留待下轮重试
+          // （整本入库场景下，大量文档串行导出偶发失败不应被误判为删除，否则表现为「加入后消失了」）
+          // v1.6.1: API 请求异常（code 非 0）按「暂时失败」处理，仅当明确返回 code:0 且无 data 才判定不存在
+          let exists = true;
+          try {
+            const d3 = await fetchSyncPost("/api/filetree/getDocByID", { id: docId });
+            if (d3 && d3.code === 0 && d3.data && d3.data.id) {
+              exists = true;
+            } else if (d3 && d3.code === 0) {
+              // v1.6.8: API 返回空时不要直接判「不存在」——本地 .sy 存在即视为文档存在。
+              // 思源刚导入/复制大批文档时 API 索引可能延迟，误判会把已加入文档连环移出（实测 watchlist 56→1）
+              let syLocal = null;
+              try {
+                syLocal = await this.findDocSyPathGlobal(docId, dataDir, this._syCache);
+              } catch (e4) {
+                syLocal = null;
+              }
+              exists = !!syLocal;
+            }
+          } catch (e3) {
+            exists = true;
+          }
+          if (!exists) {
+            core.removeDoc(this.state.db, docId);
+            core.clearRevisions(this.state.db, docId);
+            core.audit(this.state.db, "remove", docId, "\u6587\u6863\u5DF2\u5220\u9664\uFF0C\u8D44\u4EA7\u8FDB\u56DE\u6536\u7AD9");
+            this.cfg.watchlist = this.cfg.watchlist.filter((x) => x !== docId);
+            delete this.docBoxMap[docId];
+            changed = true;
+          } else {
+            console.log("[siyuan-edb] \u6587\u6863\u5B58\u5728\u4F46\u5BFC\u51FA\u5931\u8D25\uFF0C\u4FDD\u7559\u5F85\u91CD\u8BD5", docId);
+            failCount++;
           }
         }
-        core.upsertDoc(this.state.db, {
-          doc_id: docId,
-          notebook_id: info.notebook_id,
-          title: info.title,
-          hpath: info.hpath,
-          markdown: info.markdown,
-          updated_at: Date.now()
-        });
-        if (info.notebook_id)
-          this.docBoxMap[docId] = info.notebook_id;
-        if (await this.syncDocAssets(docId, info.markdown))
-          changed = true;
-        changed = true;
-      } else {
-        core.removeDoc(this.state.db, docId);
-        core.clearRevisions(this.state.db, docId);
-        core.audit(this.state.db, "remove", docId, "\u6587\u6863\u5DF2\u5220\u9664\uFF0C\u8D44\u4EA7\u8FDB\u56DE\u6536\u7AD9");
-        this.cfg.watchlist = this.cfg.watchlist.filter((x) => x !== docId);
-        delete this.docBoxMap[docId];
-        changed = true;
+      } catch (e) {
+        // 单篇同步失败不中断整本同步（防「提示后停止」：一篇异常导致其余文档全部未入库）
+        console.error("[siyuan-edb] \u540c\u6b65\u5355\u7bc7\u5931\u8d25\uFF0C\u5df2\u8df3\u8fc7", docId, e);
       }
     }
     if (changed) {
       this.cfg.lastSyncAt = Date.now();
+      // v1.6.3: 整轮同步后统一回收「未被任何已同步文档引用」的资产记录（并集为空则保守跳过）
+      // v1.6.30: failCount>0 时跳过回收——有文档导出失败时 _syncKeep 不完整，
+      // 若仍按并集清理会误删「失败文档名下但本轮未解析到引用」的资产记录（数据丢失）
+      try {
+        if (failCount === 0 && this._syncKeep && this._syncKeep.size) {
+          core.gcAssets(this.state.db, [...this._syncKeep]);
+        }
+      } catch (e) {
+        console.error("[siyuan-edb] gcAssets", e);
+      }
+      this._syncKeep = null;
       await this.saveConfig();
       this.flushVault();
+    } else if (this._syncKeep) {
+      this._syncKeep = null;
     }
     this.pendingSync = false;
     this.refreshDocBoxes();
     this.refreshPanel();
-    if (this._sensitiveWarn) {
-      const w = this._sensitiveWarn;
-      this._sensitiveWarn = null;
-      showMessage("\u26A0\uFE0F " + this.t("sensWarn").replace("{0}", w.doc).replace("{1}", w.types.join("\u3001")));
-    }
     this.cleanPlainAssets(null).catch((e) => console.error("[siyuan-edb]", e));
     this.maybeAutoBackup();
     this.maybePullFromWebdav();
-    return { ok: true, changed };
+    this.clearBusy();
+    this._syncing = false;
+    return { ok: true, changed, failCount };
   }
   /* ================= 自动备份 ================= */
   /** 同步后按间隔触发备份 */
@@ -9344,8 +10496,23 @@ var EdbPlugin = class extends Plugin {
       if (!res || res.code !== 0)
         return { ok: false };
       const data = res.data || {};
-      const content = data.content || "";
-      const hpath = data.hpath || "";
+      let content = data.content || "";
+      let hpath = data.hPath || data.hpath || "";
+      // v1.6.1: 导出可能为空（文档未索引/导出异常）时，用 SQL 拼 blocks 内容兜底，避免文档内容/资产引用全部丢失
+      if (!content.trim()) {
+        try {
+          const q = await fetchSyncPost("/api/query/sql", { stmt: "SELECT type, content FROM blocks WHERE root_id = '" + docId + "' ORDER BY type, id" });
+          const rows = (q && q.data) || [];
+          const parts = [];
+          for (const r of rows) {
+            if (r && r.content)
+              parts.push(r.content);
+          }
+          if (parts.length)
+            content = parts.join("\n\n");
+        } catch (e2) {
+        }
+      }
       const title = hpath.split("/").filter(Boolean).pop() || docId;
       let notebook_id = "";
       try {
@@ -9364,7 +10531,32 @@ var EdbPlugin = class extends Plugin {
     this.panelEl = document.createElement("div");
     this.panelEl.className = "syedb-panel";
     this.panelEl.style.cssText = "display:flex;flex-direction:column;height:100%;padding:12px;box-sizing:border-box;gap:8px;overflow:auto;font-size:13px;";
+    // v1.6.11: 注入动态等待动画所需的关键帧样式
+    try {
+      if (!document.getElementById("syedb-style")) {
+        const st = document.createElement("style");
+        st.id = "syedb-style";
+        st.textContent = "@keyframes edb-spin{to{transform:rotate(360deg)}}";
+        document.head.appendChild(st);
+      }
+    } catch (e) {
+    }
     this.refreshPanel();
+  }
+  /** v1.6.11: 操作中的动态等待状态——面板顶部显示转圈+文字，操作完成自动消失 */
+  setBusy(text) {
+    this._busy = { text: text || "...", at: Date.now() };
+    try {
+      this.refreshPanel();
+    } catch (e) {
+    }
+  }
+  clearBusy() {
+    this._busy = null;
+    try {
+      this.refreshPanel();
+    } catch (e) {
+    }
   }
   refreshPanel(el) {
     const target = el || this.panelEl;
@@ -9385,12 +10577,50 @@ var EdbPlugin = class extends Plugin {
       return b;
     };
     elc.innerHTML = "";
+    // v1.6.34: 面板头部品牌 Logo（透明底盾牌锁 + SECRET DATABASE 副标）
+    try {
+      const head = document.createElement("div");
+      head.style.cssText = "display:flex;align-items:center;gap:8px;padding:2px 0 6px;border-bottom:1px solid var(--b3-theme-background-light,#eee);";
+      const lg = document.createElement("img");
+      lg.src = "data:image/png;base64,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";
+      lg.style.cssText = "width:30px;height:30px;flex:none;object-fit:contain;";
+      head.appendChild(lg);
+      const bt = document.createElement("div");
+      bt.style.cssText = "font-size:13px;color:var(--b3-theme-on-background,#888);letter-spacing:.4px;";
+      bt.textContent = "SECRET DATABASE";
+      head.appendChild(bt);
+      elc.appendChild(head);
+    } catch (e) {
+    }
+    // v1.6.11: 操作中的动态等待指示（转圈 + 文字），整本加入/移出/同步/压缩等耗时操作期间显示
+    if (this._busy && this._busy.text) {
+      const busy = document.createElement("div");
+      busy.style.cssText = "display:flex;align-items:center;gap:8px;padding:10px;border-radius:6px;background:var(--b3-theme-background,#fff);border:1px solid var(--b3-theme-background-light,#ddd);color:#576b95;font-weight:600;";
+      const sp = document.createElement("span");
+      sp.style.cssText = "width:16px;height:16px;flex:none;border:2px solid rgba(87,107,149,.25);border-top-color:#576b95;border-radius:50%;display:inline-block;animation:edb-spin .8s linear infinite;";
+      busy.appendChild(sp);
+      const t = document.createElement("span");
+      t.textContent = this._busy.text;
+      busy.appendChild(t);
+      elc.appendChild(busy);
+    }
+    // （用户手动删除 .sydb 后，面板不再残留「已解锁 / 文档N / 大小0B」的假状态）
+    if (this.state && this.cfg.dbPath && !fs.existsSync(this.cfg.dbPath)) {
+      this.state = null;
+      this.noPwd = false;
+    }
     const status = document.createElement("div");
     status.style.cssText = "padding:10px;border:1px solid var(--b3-theme-background-light,#ddd);border-radius:6px;background:var(--b3-theme-background,#fff);";
     let info = "";
     const unlocked = this.isUnlocked();
     if (unlocked) {
-      const stats = core.dbStats(this.state.db);
+      // v1.5.8：库文件可能已被删除/库状态异常，读取统计失败不中断面板渲染（否则列表等后续内容不刷新）
+      let stats = { count: 0, assetCount: 0, assetBytes: 0 };
+      try {
+        stats = core.dbStats(this.state.db);
+      } catch (e) {
+        stats = { count: 0, assetCount: 0, assetBytes: 0 };
+      }
       const size = fs.existsSync(this.cfg.dbPath) ? fs.statSync(this.cfg.dbPath).size : 0;
       info = "<b>" + this.t("unlocked") + "</b>" + (this.noPwd ? "\u3000<span style='color:#8590a6;'>" + this.t("noPwdMode") + "</span>" : "") + "<br>" + this.t("dbPath") + "\uFF1A" + this.esc(this.cfg.dbPath) + "<br>" + this.t("docCount") + "\uFF1A" + stats.count + "\u3000" + this.t("size") + "\uFF1A" + this.fmtSize(size) + "<br>" + this.t("assetCount") + "\uFF1A" + stats.assetCount + "\u3000" + this.t("assetSize") + "\uFF1A" + this.fmtSize(stats.assetBytes) + "<br>" + this.t("lastSync") + "\uFF1A" + (this.cfg.lastSyncAt ? new Date(this.cfg.lastSyncAt).toLocaleString() : "\u2014");
       if (!/\.sydb$/i.test(this.cfg.dbPath)) {
@@ -9413,36 +10643,39 @@ var EdbPlugin = class extends Plugin {
     elc.appendChild(status);
     const licLine = document.createElement("div");
     licLine.style.cssText = "padding:6px 10px;font-size:12px;color:" + (this.isLicensed() ? "var(--b3-theme-on-background,#999)" : "#d23f31") + ";border-bottom:1px solid var(--b3-theme-background-light,#ddd);";
-    licLine.textContent = "\u{1F511} " + (this.isLicensed() ? this.licenseText() : this.licState ? this.t("licExpired") + "\uFF08" + this.licenseText() + "\uFF09" : this.t("licStatusNone"));
+    licLine.textContent = "\u{1F511} " + (this.isLicensed() ? this.licenseText() : this.cfg.revoked ? this.licenseText() : this.licState ? this.t("licExpired") + "\uFF08" + this.licenseText() + "\uFF09" : this.t("licStatusNone"));
     elc.appendChild(licLine);
     const vaults = this.vaultList();
-    if (vaults.length) {
+    {
       const vb = document.createElement("div");
       vb.style.cssText = "display:flex;flex-wrap:wrap;gap:6px;align-items:center;font-size:12px;";
-      const vl = document.createElement("span");
-      vl.textContent = this.t("vaultCurrent") + "\uFF1A" + vaults[this.cfg.activeVault].name;
-      vl.style.cssText = "font-weight:bold;";
-      vb.appendChild(vl);
-      for (const v of vaults) {
-        if (v.active)
-          continue;
-        const b = btn(v.name, async () => {
-          try {
-            await this.switchVault(v.i);
-            showMessage(this.t("vaultCurrent") + "\uFF1A" + v.name);
-          } catch (e) {
-            showMessage(e && e.message);
-          }
-        });
-        b.title = this.t("vaultSwitch") || v.name;
-        vb.appendChild(b);
+      if (vaults.length) {
+        const vl = document.createElement("span");
+        vl.textContent = this.t("vaultCurrent") + "\uFF1A" + vaults[this.cfg.activeVault].name;
+        vl.style.cssText = "font-weight:bold;";
+        vb.appendChild(vl);
+        for (const v of vaults) {
+          if (v.active)
+            continue;
+          const b = btn(v.name, async () => {
+            try {
+              await this.switchVault(v.i);
+              showMessage(this.t("vaultCurrent") + "\uFF1A" + v.name);
+            } catch (e) {
+              showMessage(e && e.message);
+            }
+          });
+          b.title = this.t("vaultSwitch") || v.name;
+          vb.appendChild(b);
+        }
+        const ab = btn("\u{1F5C3} " + this.t("vaultArchive"), () => this.openArchiveDialog());
+        ab.title = this.t("vaultArchive");
+        vb.appendChild(ab);
       }
+      // v1.5.7：无任何库时也提供「新建库」入口（此前 vaults 为空时该按钮不渲染，用户无法新建库）
       const nb = btn("\uFF0B" + this.t("vaultNew"), () => this.openNewVaultDialog());
       nb.title = this.t("vaultNew");
-      const ab = btn("\u{1F5C3} " + this.t("vaultArchive"), () => this.openArchiveDialog());
-      ab.title = this.t("vaultArchive");
       vb.appendChild(nb);
-      vb.appendChild(ab);
       elc.appendChild(vb);
     }
     const mkGroup = (label) => {
@@ -9461,7 +10694,13 @@ var EdbPlugin = class extends Plugin {
     const dataGrid = mkGroup(this.t("grpData"));
     dataGrid.appendChild(btn(this.t("syncNow"), async () => {
       const r = await this.syncNow();
-      showMessage(r.changed ? this.t("syncOk") : this.t("syncNone"));
+      // v1.6.1: 区分真实状态，避免「未解锁/导出失败」被误报为「无需同步」
+      if (r.reason === "locked")
+        showMessage(this.t("needUnlock"));
+      else if (r.failCount)
+        showMessage((this.t("syncOk") || "\u540C\u6B65\u5B8C\u6210") + "\uFF0C" + r.failCount + " \u7BC7\u5BFC\u51FA\u5931\u8D25\uFF0C\u5DF2\u4FDD\u7559\u91CD\u8BD5");
+      else
+        showMessage(r.changed ? this.t("syncOk") : this.t("syncNone"));
     }));
     if (unlocked)
       dataGrid.appendChild(btn(this.t("cleanPlain"), async () => {
@@ -9470,6 +10709,13 @@ var EdbPlugin = class extends Plugin {
       }));
     if (unlocked)
       dataGrid.appendChild(btn("\u{1F558} " + (this.t("historyTitle") || "\u5386\u53F2\u7248\u672C"), () => this.openHistoryDialog()));
+    // v1.6.4: 清理「未加入密库的历史残留文档」（移出/删除笔记本后遗留，导致面板仍显示文档）
+    if (unlocked)
+      dataGrid.appendChild(btn("\u{1F9F9} " + (this.t("cleanOrphan") || "\u6E05\u7406\u672A\u52A0\u5165\u6B8B\u7559"), async () => {
+        const n = await this.cleanOrphanDocs();
+        if (n > 0)
+          showMessage("\u5DF2\u6E05\u7406 " + n + " \u7BC7\u672A\u52A0\u5165\u6B8B\u7559\u6587\u6863\uFF08\u5DF2\u81EA\u52A8\u5907\u4EFD\uFF0C\u53EF\u91CD\u65B0\u52A0\u5165\u6062\u5FA9\uFF09");
+      }));
     const secGrid = mkGroup(this.t("grpSec"));
     if (unlocked) {
       if (!this.noPwd)
@@ -9496,6 +10742,19 @@ var EdbPlugin = class extends Plugin {
     }
     if (unlocked) {
       sysGrid.appendChild(btn("\u{1F4E4} " + (this.t("exportVault") || "\u5BFC\u51FA\u5E93\u526F\u672C"), () => this.exportVaultCopy()));
+      // v1.6.5: 整理库（压缩）——丢弃回收站/无主密文块，文件瘦身
+      sysGrid.appendChild(btn("\u{1F9F9} " + (this.t("compactVault") || "\u6574\u7406\u5E93\uFF08\u538B\u7F29\uFF09"), async () => {
+        const okc = await this.confirmBox((this.t("compactVaultConfirm") || "\u5C06\u91CD\u5EFA\u5BC6\u5E93\uFF1A\u4EC5\u4FDD\u7559\u5B58\u6D3B\u6587\u6863\u4E0E\u8D44\u4EA7\uFF0C\u4E22\u5F03\u56DE\u6536\u7AD9/\u65E0\u4E3B\u5BC6\u6587\u5757\uFF08\u81EA\u52A8\u5907\u4EFD\u65E7\u5E93\uFF09\uFF0C\u786E\u8BA4\uFF1F"));
+        if (okc) {
+          // v1.6.11: 压缩期间显示动态等待
+          this.setBusy(this.t("compactRun") || "\u6B63\u5728\u6574\u7406\u5BC6\u5E93\uFF08\u538B\u7F29\uFF09...");
+          try {
+            await this.compactVault();
+          } finally {
+            this.clearBusy();
+          }
+        }
+      }));
       sysGrid.appendChild(btn("\u{1F4CB} " + (this.t("auditTitle") || "\u5BA1\u8BA1\u65E5\u5FD7"), () => this.openAuditDialog()));
     }
     const searchRow = document.createElement("div");
@@ -9541,8 +10800,13 @@ var EdbPlugin = class extends Plugin {
     elc.appendChild(searchRow);
     const resultsEl = document.createElement("div");
     elc.appendChild(resultsEl);
-    if (unlocked)
-      this.renderSearchResults("", resultsEl);
+    if (unlocked) {
+      try {
+        this.renderSearchResults("", resultsEl);
+      } catch (e) {
+        console.error("[siyuan-edb] \u641c\u7d22\u5217\u8868\u6e32\u67d3\u5931\u8d25", e);
+      }
+    }
     const h = s(this.t("watchedTitle"));
     h.style.cssText = "font-weight:bold;margin-top:8px;";
     elc.appendChild(h);
@@ -9588,7 +10852,9 @@ var EdbPlugin = class extends Plugin {
       el.appendChild(document.createTextNode(this.t("needUnlock")));
       return;
     }
-    const rows = keyword ? core.searchDocs(this.state.db, keyword) : core.listDocs(this.state.db).slice(0, 50);
+    // v1.6.4: 文档列表默认只显示「已加入密库（watchlist）」的文档；
+    // 历史残留孤儿文档（移出/删除笔记本后遗留）不再混在列表里，避免「移出库了但库里还在」
+    const rows = keyword ? core.searchDocs(this.state.db, keyword) : core.listDocs(this.state.db).filter((d) => this.cfg.watchlist.includes(d.doc_id)).slice(0, 50);
     const ocrHit = /* @__PURE__ */ new Set();
     if (keyword) {
       const seen = new Set(rows.map((r) => r.doc_id));
@@ -9955,6 +11221,181 @@ var EdbPlugin = class extends Plugin {
       showMessage("\u5BFC\u51FA\u5931\u8D25\uFF1A" + (e && e.message));
     }
   }
+  /** v1.6.5: 整理库（压缩重建）——丢弃回收站/无主密文块，仅保留存活文档与资产，文件瘦身。
+   *  密库"只增不减"：反复移出→清回收站→再加入会让文件膨胀，点此按钮一键整理 */
+  async compactVault(keepBackup) {
+    if (!this.isUnlocked()) {
+      showMessage(this.t("needUnlock"));
+      return;
+    }
+    const dbPath = this.cfg.dbPath;
+    if (!this.state || !dbPath || !fs.existsSync(dbPath))
+      return;
+    const SALT_LEN = 16, IV_LEN = 12, TAG_LEN = 16, HEADER_LEN = 128;
+    const WRAP_LEN = IV_LEN + TAG_LEN + 32, V3_HEAD = HEADER_LEN + WRAP_LEN;
+    const KDF_FLAG_OFFSET = 5 + 1 + 4 + SALT_LEN + 8 + 8, HINT_OFFSET = KDF_FLAG_OFFSET + 1, HINT_MAX = 40;
+    const MAGIC = Buffer.from("SYEDB");
+    const crypto3 = require("crypto");
+    const aesEnc = (key, plain) => {
+      const iv = crypto3.randomBytes(IV_LEN);
+      const c = crypto3.createCipheriv("aes-256-gcm", key, iv);
+      const ct = Buffer.concat([c.update(plain), c.final()]);
+      return { iv, tag: c.getAuthTag(), ct };
+    };
+    const readRange = (fd, off, len) => {
+      const b = Buffer.alloc(len);
+      let n = 0;
+      while (n < len) {
+        const r = fs.readSync(fd, b, n, len - n, off + n);
+        if (r <= 0)
+          break;
+        n += r;
+      }
+      return b.subarray(0, n);
+    };
+    const buildHeader = (iters, salt, idxOffset, idxLen, kdf, hint) => {
+      const h = Buffer.alloc(HEADER_LEN);
+      MAGIC.copy(h, 0);
+      h[5] = 3;
+      h.writeUInt32LE(iters, 6);
+      salt.copy(h, 10);
+      h.writeBigUInt64LE(BigInt(idxOffset), 26);
+      h.writeBigUInt64LE(BigInt(idxLen), 34);
+      h[KDF_FLAG_OFFSET] = kdf;
+      if (hint) {
+        const b = Buffer.from(String(hint).slice(0, HINT_MAX), "utf8");
+        h[HINT_OFFSET] = b.length;
+        b.copy(h, HINT_OFFSET + 1);
+      }
+      return h;
+    };
+    try {
+      this.flushVault();
+    } catch (e) {
+    }
+    const size0 = fs.statSync(dbPath).size;
+    // v1.6.18: 压缩只保留存活资产密文，回收站密文块被丢弃 → 回收站记录必须同步删除，
+    // 否则残留旧偏移记录（重建后仍在索引里）→ 之后"移出→再加入"命中 → "数据区读取不完整"
+    try {
+      this.state.db.run("DELETE FROM assets WHERE trashed = 1");
+    } catch (e) {
+    }
+    const rows = this.state.db.exec("SELECT asset_path, doc_id, size, mtime, chunks, hash FROM assets WHERE (trashed IS NULL OR trashed = 0)");
+    const assets = (rows.length ? rows[0].values : []).map((r) => {
+      let ch = [];
+      try {
+        ch = JSON.parse(String(r[4] || "[]"));
+      } catch (e) {
+        ch = [];
+      }
+      return { asset_path: r[0], doc_id: r[1], size: r[2], mtime: r[3], chunks: ch, hash: r[5] };
+    });
+    const fd = fs.openSync(dbPath, "r");
+    const h0 = readRange(fd, 0, HEADER_LEN);
+    const iters = h0.readUInt32LE(6), salt = Buffer.from(h0.subarray(10, 10 + SALT_LEN));
+    const kdf = h0[KDF_FLAG_OFFSET] === 1 || h0[KDF_FLAG_OFFSET] === 2 ? h0[KDF_FLAG_OFFSET] : 0;
+    let hint = "";
+    const hl = h0[HINT_OFFSET] || 0;
+    if (hl > 0 && hl <= HINT_MAX)
+      hint = h0.subarray(HINT_OFFSET + 1, HINT_OFFSET + 1 + hl).toString("utf8");
+    const wrapBuf = readRange(fd, HEADER_LEN, WRAP_LEN);
+    const rebuilt = [];
+    for (const a of assets) {
+      const parts = [];
+      let bad = false;
+      for (const c of a.chunks) {
+        const blk = readRange(fd, c.o, c.l + IV_LEN + TAG_LEN + 4);
+        if (blk.length !== c.l + IV_LEN + TAG_LEN + 4) {
+          bad = true;
+          break;
+        }
+        parts.push(blk);
+      }
+      if (bad || parts.length !== a.chunks.length)
+        continue;
+      rebuilt.push({ asset_path: a.asset_path, doc_id: a.doc_id, size: a.size, mtime: a.mtime, hash: a.hash, blocks: parts });
+    }
+    fs.closeSync(fd);
+    const tmp = dbPath + ".compact.tmp";
+    const fdW = fs.openSync(tmp, "w");
+    try {
+      const header0 = buildHeader(iters, salt, 0, 0, kdf, hint);
+      fs.writeSync(fdW, header0, 0, header0.length, 0);
+      fs.writeSync(fdW, wrapBuf, 0, wrapBuf.length, HEADER_LEN);
+      let pos = V3_HEAD;
+      for (const a of rebuilt) {
+        const newChunks = [];
+        for (const blk of a.blocks) {
+          fs.writeSync(fdW, blk, 0, blk.length, pos);
+          const len = blk.readUInt32LE(0);
+          newChunks.push({ o: pos, l: len, iv: blk.subarray(4, 4 + IV_LEN).toString("hex"), tag: blk.subarray(4 + IV_LEN, 4 + IV_LEN + TAG_LEN).toString("hex") });
+          pos += blk.length;
+        }
+        this.state.db.run("UPDATE assets SET chunks = ? WHERE asset_path = ?", [JSON.stringify(newChunks), a.asset_path]);
+      }
+      const mk = this.state.mk || this.state.key;
+      const e = aesEnc(mk, this.state.db.export());
+      const idxBuf = Buffer.concat([e.iv, e.tag, e.ct]);
+      fs.writeSync(fdW, idxBuf, 0, idxBuf.length, pos);
+      const header = buildHeader(iters, salt, pos, idxBuf.length, kdf, hint);
+      fs.writeSync(fdW, header, 0, header.length, 0);
+    } finally {
+      fs.closeSync(fdW);
+    }
+    const bak = dbPath + ".bak-" + Date.now();
+    fs.renameSync(dbPath, bak);
+    try {
+      fs.renameSync(tmp, dbPath);
+    } catch (e) {
+      try {
+        fs.renameSync(bak, dbPath);
+      } catch (e2) {
+      }
+      throw e;
+    }
+    // v1.6.12: 自动压缩（keepBackup=false）成功后删除旧库备份，避免 7GB 级旧库堆积占满磁盘；失败时备份已保留
+    if (keepBackup === false) {
+      try {
+        fs.unlinkSync(bak);
+      } catch (e) {
+        console.error("[siyuan-edb] \u81EA\u52A8\u538B\u7F29\u540E\u6E05\u7406\u65E7\u5E93\u5907\u4EFD\u5931\u8D25", e);
+      }
+    }
+    // v1.6.13: 重建成功 → 重新加载新库到 state（否则 state.db 句柄仍指向被改名/删除的旧库 inode，后续记录写旧库、密文写新库，错位导致注入解密失败）
+    try {
+      this.state = core.reloadVaultState(dbPath, this.state);
+    } catch (e) {
+      console.error("[siyuan-edb] \u538B\u7F29\u540E\u91CD\u65B0\u52A0\u8F7D\u5E93\u5931\u8D25", e);
+    }
+    const size1 = fs.statSync(dbPath).size;
+    showMessage("\u{1F9F9} \u6574\u7406\u5B8C\u6210\uFF1A" + Math.round(size0 / 1048576) + "MB \u2192 " + (size1 > 1048576 ? Math.round(size1 / 1048576) + "MB" : Math.round(size1 / 1024) + "KB") + (keepBackup === false ? "" : "\uFF08\u65E7\u5E93\u5DF2\u5907\u4EFD " + path.basename(bak) + "\uFF09"));
+  }
+  /** v1.6.12: 移出/清理后自动压缩——回收站垃圾超过阈值时重建库文件（不留旧库备份；会清空回收站记录，需恢复的文档请先恢复） */
+  async maybeAutoCompact() {
+    try {
+      if (!this.isUnlocked() || !this.state || !this.cfg.dbPath || !fs.existsSync(this.cfg.dbPath))
+        return;
+      if (!this.isLicensed())
+        return;
+      const th = Math.max(0, Number(this.cfg.autoCompactMB) || 256);
+      if (th <= 0)
+        return;
+      const st = core.trashStats(this.state.db);
+      if (!st || st.bytes < th * 1024 * 1024)
+        return;
+      console.log("[siyuan-edb] \u81EA\u52A8\u538B\u7F29\uFF1A\u56DE\u6536\u7AD9 " + (st.bytes / 1048576).toFixed(1) + "MB \u8D85\u8FC7\u9608\u503C " + th + "MB");
+      this.setBusy(this.t("compactRun") || "\u6B63\u5728\u6574\u7406\u5BC6\u5E93\uFF08\u538B\u7F29\uFF09...");
+      try {
+        // v1.6.18: 自动压缩也保留 .bak 备份（曾因不留备份 + 压缩后记录错位造成数据读取失败，
+      // 多一份压缩前快照可随时回滚；磁盘吃紧时由用户手动删除 .bak-*）
+      await this.compactVault(true);
+      } finally {
+        this.clearBusy();
+      }
+    } catch (e) {
+      console.error("[siyuan-edb] \u81EA\u52A8\u538B\u7F29\u5931\u8D25", e);
+    }
+  }
   /** 审计日志（库内操作留痕） */
   openAuditDialog() {
     if (!this.isUnlocked())
@@ -10212,8 +11653,9 @@ var EdbPlugin = class extends Plugin {
           showMessage(this.t("unlockFirst"));
           return;
         }
+        // v1.6.11: 整理库（压缩）显示动态等待
+        this.setBusy(this.t("compactRun") || "\u6B63\u5728\u6574\u7406\u5BC6\u5E93\uFF08\u538B\u7F29\uFF09...");
         compactBtn.disabled = true;
-        compactHint.textContent = this.t("compactRun");
         await new Promise((r) => setTimeout(r, 60));
         const before = core.fileSize(this.cfg.dbPath);
         core.compactVault(this.cfg.dbPath, this.state);
@@ -10224,6 +11666,7 @@ var EdbPlugin = class extends Plugin {
         showMessage(this.t("compactFail") + (e && e.message ? e.message : e));
       } finally {
         compactBtn.disabled = false;
+        this.clearBusy();
       }
     });
     const compactRow = document.createElement("div");
@@ -10586,6 +12029,23 @@ var EdbPlugin = class extends Plugin {
     wdBtnRow.appendChild(wdInfo);
     wdBox.appendChild(wdBtnRow);
     box.appendChild(wdBox);
+    /* v1.6.35 云端授权（可选）：onlineUrl 留空 = 纯离线（默认） */
+    const olBox = document.createElement("div");
+    olBox.style.cssText = "border:1px solid var(--b3-border-color,#333);border-radius:6px;padding:10px;display:flex;flex-direction:column;gap:8px;";
+    const olTitle = document.createElement("div");
+    olTitle.style.cssText = "font-size:14px;font-weight:bold;";
+    olTitle.textContent = "\u2601\uFE0F " + (this.t("onlineTitle") || "\u4E91\u7AEF\u6388\u6743\uFF08\u53EF\u9009\uFF09");
+    const olUrl = document.createElement("input");
+    olUrl.className = "b3-text-field";
+    olUrl.placeholder = "https://\u4F60\u7684\u57DF\u540D/\u9879\u76EE\u6587\u4EF6\u5939 \uFF08\u5982 https://mirlous.site/siyuan-edb\uFF0C\u7559\u7A7A = \u7EAF\u79BB\u7EBF\uFF09";
+    olUrl.value = this.cfg.onlineUrl || "";
+    const olHint = document.createElement("div");
+    olHint.textContent = this.t("onlineHint") || "\u586B\u5165\u670D\u52A1\u5668\u5730\u5740\u540E\uFF1A\u6FC0\u6D3B\u65F6\u8054\u7F51\u767B\u8BB0\u4E00\u6B21\uFF08\u9632\u4E00\u7801\u591A\u673A\u3001\u9632\u6539\u516C\u94A5\u81EA\u9020\u7801\uFF09\uFF0C\u542F\u52A8\u65F6\u6821\u9A8C\u5B98\u65B9\u7248\u672C\u6307\u7EB9\uFF08\u9632\u63D2\u4EF6\u6587\u4EF6\u88AB\u7BE1\u6539\uFF09\u3002\u7559\u7A7A = \u5B8C\u5168\u79BB\u7EBF\uFF08\u9ED8\u8BA4\uFF09\u3002";
+    olHint.style.cssText = "font-size:12px;color:var(--b3-theme-on-background,#666);";
+    olBox.appendChild(olTitle);
+    olBox.appendChild(mkRow(this.t("onlineUrlLabel") || "\u670D\u52A1\u5668\u5730\u5740", olUrl));
+    olBox.appendChild(olHint);
+    box.appendChild(olBox);
     const vwBox = document.createElement("div");
     vwBox.style.cssText = "border:1px solid var(--b3-border-color,#333);border-radius:6px;padding:10px;display:flex;flex-direction:column;gap:8px;";
     const vwTitle = document.createElement("div");
@@ -10694,6 +12154,7 @@ var EdbPlugin = class extends Plugin {
       this.cfg.webdavPass = wdPass.value;
       this.cfg.webdavAutoSync = wdAuto.checked;
       this.cfg.webdavAutoMin = Math.max(10, parseInt(wdAutoMin.value, 10) || 30);
+      this.cfg.onlineUrl = olUrl.value.trim();
       const vwEnabled = vwEnable.checked;
       this.cfg.viewerEnabled = vwEnabled;
       this.cfg.viewerPort = Math.max(1024, parseInt(vwPort.value, 10) || 18989);
@@ -11091,7 +12552,11 @@ var EdbPlugin = class extends Plugin {
     this.state = st;
     this.noPwd = !pwd;
     await this.saveConfig();
-    this.refreshPanel();
+    try {
+      this.refreshPanel();
+    } catch (e) {
+      console.error("[siyuan-edb] \u65b0\u5efa\u5e93\u540e\u9762\u677f\u5237\u65b0\u5931\u8d25", e);
+    }
     return true;
   }
   /** 封存当前库：当前库文件原样保留（可随时切回查看），新建空库继续用 */
@@ -11209,11 +12674,33 @@ var EdbPlugin = class extends Plugin {
     } catch (e) {
       raw = null;
     }
+    if (!raw) {
+      /* v1.6.35 备份恢复：license.json 被删/损坏时从 backup 恢复授权（防手动删文件重装） */
+      try {
+        raw = await this.loadData("license.backup.json");
+      } catch (e) {
+        raw = null;
+      }
+    }
     if (raw && raw.code) {
       const r = lic.verifyCode(raw.code, this.pubPem());
       if (r.ok) {
+        /* v1.6.36 授权状态完整性：expAt/activatedAt 必须与 code/fp 一起通过 HMAC 指纹，防篡改到期时间永久激活。
+         * 无 h = 旧版授权文件 → 一次性补签升级；h 不匹配 = 字段被改动 → 拒绝该授权（回到未授权/试用）。 */
+        let authOk = false;
+        if (raw.h && raw.h === lic.authHmac(raw.code, raw.fp || "", raw.expAt != null ? raw.expAt : "", raw.activatedAt != null ? raw.activatedAt : "")) {
+          authOk = true;
+        } else if (!raw.h) {
+          authOk = true;
+          try {
+            const licJson2 = JSON.stringify(Object.assign({}, raw, { h: lic.authHmac(raw.code, raw.fp || "", raw.expAt != null ? raw.expAt : "", raw.activatedAt != null ? raw.activatedAt : "") }));
+            await this.saveData("license.json", licJson2);
+            await this.saveData("license.backup.json", licJson2);
+          } catch (e) {
+          }
+        }
         const fp = lic.deviceFingerprint();
-        if (raw.fp && raw.fp !== fp) {
+        if (authOk && raw.fp && raw.fp !== fp) {
           this.cfg.bindMismatch = true;
           try {
             await this.saveConfig();
@@ -11221,18 +12708,26 @@ var EdbPlugin = class extends Plugin {
           }
           return;
         }
-        const activatedAt = raw.activatedAt || Date.now();
-        const expAt = raw.expAt != null ? Number(raw.expAt) : r.t === "F" ? 0 : activatedAt + r.d * 864e5;
-        this.licState = {
-          t: r.t,
-          d: r.d,
-          n: r.n,
-          s: r.s,
-          activatedAt,
-          expAt,
-          fp: raw.fp || "",
-          bound: !!raw.fp
-        };
+        if (authOk) {
+          const activatedAt = raw.activatedAt != null ? Number(raw.activatedAt) : Date.now();
+          const expAt = raw.expAt != null ? Number(raw.expAt) : r.t === "F" ? 0 : activatedAt + r.d * 864e5;
+          this.licState = {
+            t: r.t,
+            d: r.d,
+            n: r.n,
+            s: r.s,
+            activatedAt,
+            expAt,
+            fp: raw.fp || "",
+            bound: !!raw.fp
+          };
+        } else {
+          this.cfg.authTampered = true;
+          try {
+            await this.saveConfig();
+          } catch (e) {
+          }
+        }
         if (!raw.fp)
           this.cfg.needRebind = true;
       }
@@ -11247,7 +12742,7 @@ var EdbPlugin = class extends Plugin {
       }
     }
     if (this.licState && this.licState.expAt && this.cfg.licWarnShown !== String(this.licState.expAt)) {
-      const left = this.licState.expAt - Date.now();
+      const left = this.licState.expAt - this.nowTs();
       if (left > 0 && left < 7 * 864e5) {
         this.cfg.licWarnShown = String(this.licState.expAt);
         try {
@@ -11279,9 +12774,126 @@ var EdbPlugin = class extends Plugin {
         showMessage("\u26D4 " + (this.t("bindMismatch") || "\u68C0\u6D4B\u5230\u672C\u673A\u4E0E\u6FC0\u6D3B\u7ED1\u5B9A\u8BBE\u5907\u4E0D\u4E00\u81F4\uFF08\u6FC0\u6D3B\u7801\u88AB\u590D\u5236\u5230\u5176\u4ED6\u673A\u5668\uFF1F\uFF09\u3002\u8BF7\u8054\u7CFB\u5356\u5BB6\u89E3\u7ED1\u540E\u91CD\u65B0\u7ED1\u5B9A\uFF0C\u5FAE\u4FE1\uFF1Anglzhy"));
       }, 2500);
     }
+    /* v1.6.35 云端启动校验（异步，不阻塞）；v1.6.42 运行期每 10 分钟轮询（撤销/封禁实时生效） */
+    if (this.cfg.onlineUrl && this.licState) {
+      setTimeout(() => { this.onlineCheck(); }, 800);
+      if (!this._checkTimer)
+        this._checkTimer = setInterval(() => { this.onlineCheck(); }, 10 * 60 * 1000);
+    }
+  }
+  /** v1.6.35 云端登记（激活时联网一次）：防一码多机 / 防改公钥自造码；服务器 emergency 时放行 */
+  async onlineRegister(code, bindCode, fp, n) {
+    const url = String(this.cfg.onlineUrl || "").replace(/\/+$/, "").replace(/\/api\.php$/i, "");
+    if (!url)
+      return { ok: true };
+    try {
+      const res = await fetch(url + "/api.php?action=register", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ code, bind: bindCode, fp, n })
+      });
+      const j = await res.json();
+      if (j.emergency)
+        return { ok: true };
+      if (j.ok)
+        return { ok: true, serverTime: j.serverTime ? Number(j.serverTime) : 0 };
+      return { ok: false, msg: j.msg || "\u63A5\u6536\u4E0D\u660E" };
+    } catch (e) {
+      return { ok: false, msg: "\u7F51\u7EDC\u8BF7\u6C42\u5931\u8D25\uFF0C\u8BF7\u68C0\u67E5\u7F51\u7EDC\u540E\u91CD\u8BD5" };
+    }
+  }
+  /** v1.6.35 云端启动校验：撤销/拉黑 + 官方版本指纹比对（防篡改插件文件）；v1.6.42 运行期定时轮询复用（防重入） */
+  async onlineCheck() {
+    if (this._checking)
+      return;
+    this._checking = true;
+    const url = String(this.cfg.onlineUrl || "").replace(/\/+$/, "").replace(/\/api\.php$/i, "");
+    if (!url || !this.licState) {
+      this._checking = false;
+      return;
+    }
+    try {
+      const res = await fetch(url + "/api.php?action=check", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ code: this.licState.n, fp: this.licState.fp, activatedAt: this.licState.activatedAt || 0, expAt: this.licState.expAt || 0 })
+      });
+      const j = await res.json();
+      this.cfg.onlineLastCheck = Date.now();
+      /* v1.6.40 服务器时间锚点：在线时校准本地时间（防改系统时间绕过到期）；离线用最后一次锚点+clockRollback 兜底 */
+      if (j.serverTime)
+        this.cfg.srvTime = { s: Number(j.serverTime), l: Date.now() };
+      try {
+        await this.saveConfig();
+      } catch (e) {
+      }
+      if (j.revoked) {
+        showMessage("\u26D4 \u6B64\u6FC0\u6D3B\u7801\u5DF2\u88AB\u5356\u5BB6\u64A4\u9500\uFF0C\u8BF7\u8054\u7CFB\u5356\u5BB6\u3002\u5FAE\u4FE1\uFF1Anglzhy");
+        /* v1.6.41 撤销立即生效：清除本地授权并锁定密库（不只提示）——防"撤销了仍激活" */
+        this.cfg.revoked = true;
+        this.licState = null;
+        try {
+          await this.saveConfig();
+        } catch (e) {
+        }
+        try {
+          await this.saveData("license.json", JSON.stringify({ revoked: true, ts: Date.now() }));
+        } catch (e) {
+        }
+        try {
+          await this.saveData("license.backup.json", JSON.stringify({ revoked: true, ts: Date.now() }));
+        } catch (e) {
+        }
+        this.refreshPanel();
+        if (this._checkTimer) {
+          clearInterval(this._checkTimer);
+          this._checkTimer = null;
+        }
+        this._checking = false;
+        return;
+      }
+      if (j.warn) {
+        showMessage("\u26A0 " + j.warn + "\u3002\u5FAE\u4FE1\uFF1Anglzhy");
+        return;
+      }
+      if (j.official && j.official.sha) {
+        try {
+          const self = await this.loadSelfHash();
+          if (self && self !== j.official.sha) {
+            showMessage("\u26A0 \u68C0\u6D4B\u5230\u672C\u5730\u63D2\u4EF6\u6587\u4EF6\u4E0E\u5B98\u65B9\u7248\u672C\u4E0D\u4E00\u81F4\uFF0C\u53EF\u80FD\u88AB\u4FEE\u6539\u3002\u8BF7\u4ECE\u5B98\u65B9\u6E20\u9053\u91CD\u65B0\u5B89\u88C5\uFF0C\u5FAE\u4FE1\uFF1Anglzhy\u3002");
+          }
+        } catch (e) {
+        }
+      }
+    } catch (e) {
+    } finally {
+      this._checking = false;
+    }
+  }
+  /** 读取本插件 index.js 的 sha256（官方版本指纹比对用） */
+  async loadSelfHash() {
+    try {
+      const dataDir = await this.wsDataDir();
+      if (!dataDir)
+        return "";
+      const p = path.join(dataDir, "plugins", "siyuan-edb", "index.js");
+      const buf = fs2.readFileSync(p);
+      return crypto3.createHash("sha256").update(buf).digest("hex");
+    } catch (e) {
+      return "";
+    }
+  }
+  /** v1.6.40 校准时间：在线时以服务器时间为锚点（防本地改系统时间绕过到期），离线回落本地时钟 */
+  nowTs() {
+    const st = this.cfg.srvTime;
+    if (st && st.s > 0)
+      return Date.now() - st.l + st.s;
+    return Date.now();
   }
   /** 是否在授权有效期内（含试用模式） */
   isLicensed() {
+    if (this.cfg.revoked)
+      return false;
     if (this.cfg.clockRollback)
       return false;
     if (this.cfg.bindMismatch)
@@ -11289,7 +12901,7 @@ var EdbPlugin = class extends Plugin {
     if (this.licState) {
       if (this.licState.expAt === 0)
         return true;
-      return Date.now() < this.licState.expAt;
+      return this.nowTs() < this.licState.expAt;
     }
     return this.isTrialValid();
   }
@@ -11297,16 +12909,38 @@ var EdbPlugin = class extends Plugin {
   isTrialValid() {
     if (this.cfg.clockRollback)
       return false;
+    if (this.cfg.trialTampered)
+      return false;
     if (!this.cfg.trialStart)
       return false;
-    return Date.now() - this.cfg.trialStart < 7 * 864e5;
+    return this.nowTs() - this.cfg.trialStart < 7 * 864e5;
   }
   /** 试用剩余天数（向上取整） */
   trialDaysLeft() {
     if (!this.cfg.trialStart)
       return 0;
-    const left = 7 * 864e5 - (Date.now() - this.cfg.trialStart);
+    const left = 7 * 864e5 - (this.nowTs() - this.cfg.trialStart);
     return Math.max(0, Math.ceil(left / 864e5));
+  }
+  /** v1.6.34: 剩余毫秒 → "X 天 X 小时 X 分钟"（分钟向上取整，至少 1） */
+  fmtLeft(ms) {
+    if (!(ms > 0))
+      return "0 分钟";
+    const totalMin = Math.max(1, Math.ceil(ms / 6e4));
+    const d = Math.floor(totalMin / 1440);
+    const h = Math.floor(totalMin % 1440 / 60);
+    const m = totalMin % 60;
+    if (d > 0)
+      return d + " 天 " + h + " 小时 " + m + " 分钟";
+    if (h > 0)
+      return h + " 小时 " + m + " 分钟";
+    return m + " 分钟";
+  }
+  /** v1.6.34: 试用剩余时间（精确到分钟） */
+  trialTimeLeft() {
+    if (!this.cfg.trialStart)
+      return "0 分钟";
+    return this.fmtLeft(7 * 864e5 - (Date.now() - this.cfg.trialStart));
   }
   /** 时钟回拨防护 + 最近活动时间（每秒/每同步更新一次） */
   clockGuard() {
@@ -11359,19 +12993,21 @@ var EdbPlugin = class extends Plugin {
   }
   /** 授权状态文本（面板/设置展示） */
   licenseText() {
+    if (this.cfg.revoked)
+      return "\u26D4 \u5DF2\u88AB\u5356\u5BB6\u64A4\u9500\uFF0C\u8BF7\u8054\u7CFB\u5356\u5BB6\u91CD\u65B0\u6FC0\u6D3B";
     if (this.cfg.clockRollback)
       return this.t("licFrozen");
     if (this.cfg.bindMismatch)
       return "\u26D4 " + (this.t("bindMismatch") || "\u7ED1\u5B9A\u8BBE\u5907\u4E0D\u5339\u914D\uFF0C\u8BF7\u8054\u7CFB\u5356\u5BB6\u89E3\u7ED1");
     if (!this.licState) {
-      return this.t("licTrial") + " " + this.trialDaysLeft() + " \u5929";
+      return this.t("licTrial") + " " + this.trialTimeLeft();
     }
     if (this.licState.expAt === 0)
       return this.t("licStatusForever");
     const d = new Date(this.licState.expAt);
     const pad = (x) => String(x).padStart(2, "0");
-    const left = Math.ceil((this.licState.expAt - Date.now()) / 864e5);
-    const leftTxt = left > 0 ? " \xB7 " + (this.t("licDaysLeft") || "\u5269\u4F59") + " " + left + " \u5929" : left === 0 ? " \xB7 " + (this.t("licLastDay") || "\u4ECA\u5929\u5230\u671F") : " \xB7 " + (this.t("licOverdue") || "\u5DF2\u5230\u671F") + " " + -left + " \u5929";
+    const left = Math.ceil((this.licState.expAt - this.nowTs()) / 864e5);
+    const leftTxt = left > 0 ? " \xB7 " + (this.t("licDaysLeft") || "\u5269\u4F59") + " " + this.fmtLeft(this.licState.expAt - this.nowTs()) : left === 0 ? " \xB7 " + (this.t("licLastDay") || "\u4ECA\u5929\u5230\u671F") : " \xB7 " + (this.t("licOverdue") || "\u5DF2\u5230\u671F") + " " + -left + " \u5929";
     return this.t("licStatusOk") + " " + d.getFullYear() + "-" + pad(d.getMonth() + 1) + "-" + pad(d.getDate()) + leftTxt;
   }
   /** 激活：验证激活码 + 设备绑定码（一码一机）；续费自动叠加天数 */
@@ -11387,7 +13023,24 @@ var EdbPlugin = class extends Plugin {
       showMessage(this.t("bindInvalid") || "\u7ED1\u5B9A\u7801\u65E0\u6548\u6216\u4E0E\u672C\u673A\u4E0D\u5339\u914D\u3002\u8BF7\u628A\u300C\u6FC0\u6D3B\u7801 + \u8BBE\u5907\u6307\u7EB9 " + fp + "\u300D\u53D1\u7ED9\u5356\u5BB6\u6362\u53D6\u7ED1\u5B9A\u7801\u3002");
       return false;
     }
-    const activatedAt = Date.now();
+    /* v1.6.35 防重复白嫖：同一激活码已在本设备激活过 → 重复激活不累计（续费请用新激活码，新码自动叠加） */
+    if (this.licState && this.licState.bound && this.licState.n === r.n && this.licState.fp === fp && this.licState.expAt !== 0) {
+      showMessage("\u8BE5\u6FC0\u6D3B\u7801\u5DF2\u5728\u6B64\u8BBE\u5907\u6FC0\u6D3B\u8FC7\uFF0C\u91CD\u590D\u6FC0\u6D3B\u4E0D\u7D2F\u8BA1\u3002\u7EED\u8D39\u8BF7\u4F7F\u7528\u65B0\u6FC0\u6D3B\u7801\u3002");
+      return false;
+    }
+    /* v1.6.35 云端登记：配置了 onlineUrl 时，激活必须联网登记成功（防一码多机 / 防改公钥自造码）。
+     * 服务器返回 emergency=1 时放行（卖家维护期降级）；网络失败 = 严格拦截，提示重试。 */
+    if (this.cfg.onlineUrl) {
+      const reg = await this.onlineRegister(String(code).trim(), String(bindCode).trim(), fp, r.n);
+      if (!reg.ok) {
+        showMessage("\u4E91\u7AEF\u6388\u6743\u5E73\u53F0\u62D2\u7EDD\u6B64\u6FC0\u6D3B\uFF1A" + (reg.msg || "\u672A\u77E5\u539F\u56E0") + "\u3002\u8BF7\u8054\u7CFB\u5356\u5BB6\u3002");
+        return false;
+      }
+      /* v1.6.40 激活成功即建立服务器时间锚点（防本地改时间） */
+      if (reg.serverTime)
+        this.cfg.srvTime = { s: Number(reg.serverTime), l: Date.now() };
+    }
+    const activatedAt = this.nowTs();
     let expAt;
     if (r.t === "F")
       expAt = 0;
@@ -11398,9 +13051,19 @@ var EdbPlugin = class extends Plugin {
     this.licState = { t: r.t, d: r.d, n: r.n, s: r.s, activatedAt, expAt, fp, bound: true };
     this.cfg.needRebind = false;
     this.cfg.bindMismatch = false;
+    this.cfg.revoked = false; /* v1.6.41 新码激活清除撤销标记（恢复激活） */
+    /* v1.6.42 重新激活后恢复云端轮询（撤销时定时器已被清理） */
+    if (this.cfg.onlineUrl && !this._checkTimer)
+      this._checkTimer = setInterval(() => { this.onlineCheck(); }, 10 * 60 * 1000);
     try {
       await this.saveConfig();
-      await this.saveData("license.json", JSON.stringify({ code: String(code).trim(), activatedAt, bindCode: String(bindCode).trim(), fp, expAt, payload: { t: r.t, d: r.d, n: r.n, s: r.s } }));
+      const licJson = JSON.stringify({ code: String(code).trim(), activatedAt, bindCode: String(bindCode).trim(), fp, expAt, payload: { t: r.t, d: r.d, n: r.n, s: r.s }, h: lic.authHmac(String(code).trim(), fp, expAt, activatedAt) });
+      await this.saveData("license.json", licJson);
+      /* v1.6.35 双写备份：防手动删除 license.json 重装 */
+      try {
+        await this.saveData("license.backup.json", licJson);
+      } catch (e) {
+      }
     } catch (e) {
     }
     showMessage(r.t === "F" ? this.t("licOkForever") : this.t("licOk") + "\uFF08" + lic.typeLabel(r.t) + (this.licState.expAt ? "\uFF0C\u5230\u671F " + this.fmtTs(this.licState.expAt) : "") + "\uFF09");

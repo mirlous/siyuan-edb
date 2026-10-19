@@ -1,21 +1,29 @@
-MIT License
+专有软件许可协议 / Proprietary Software License
 
-Copyright (c) 2026 siyuan-edb contributors
+密库（siyuan-edb）© 2026 siyuan-edb 作者（下称"授权方"）。保留所有权利。
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+本协议为"密库"思源笔记插件（下称"本软件"）的唯一有效许可。下载、安装或以任何方式使用本软件，即表示您同意本协议全部条款。
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
+一、授权范围（Grant of License）
+1. 授权方授予您非独占、不可转让、不可分许可的个人使用许可：您可在本人持有的设备上安装并使用本软件，每个有效激活码对应一台设备。
+2. 本软件按"试用 7 天 + 付费激活码"模式发行。激活码由授权方签发，仅对持码人有效；到期后需购买新的激活码续期。
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+二、禁止事项（Prohibitions）
+未经授权方书面许可，您不得：
+1. 复制、再分发、转售、出租、出借本软件或其任何部分；
+2. 修改、改编、翻译、合并本软件或其任何部分；
+3. 对本软件进行反编译、反向工程、反汇编，或试图获取、绕过、破解其加密、授权与激活机制；
+4. 删除、更改本软件中的版权声明、许可声明或任何标识；
+5. 以任何方式帮助第三方规避本软件的授权验证，或提供破解、注册机、改号服务；
+6. 将本软件用于任何违法、侵权或未经授权的用途。
+
+三、免责声明（Disclaimer）
+本软件按"现状"提供，不附带任何明示或默示的担保，包括但不限于适销性、特定用途适用性与不侵权的默示担保。在任何情况下，授权方不对因使用或无法使用本软件造成的任何直接、间接、附带或后果性损害承担责任，即使已被告知此类损害的可能性。
+
+四、终止（Termination）
+您违反本协议任何条款时，本许可自动终止，您必须停止使用并删除本软件的全部副本。其他条款不受影响。
+
+五、其他（Miscellaneous）
+本协议受中华人民共和国法律管辖。本协议未明确授予的所有权利均归授权方保留。
+
+联系授权方（反馈问题 / 获取激活码）：微信 nglzhy

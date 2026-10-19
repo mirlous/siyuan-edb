@@ -6786,6 +6786,7 @@ var EdbPlugin = class extends Plugin {
         await this.injectOpenDocs();
         const domSet = this.openDocIdsFromDom();
         for (const id of this.cfg.watchlist) {
+          if ((this.cfg.excludedDocs || []).includes(id)) continue; /* v1.6.45: 跳过移出黑名单 */
           await this.cleanPlainAssets(id, { ignoreOpenDocs: true, allowVisible: domSet[id] });
         }
       } catch (e) {
@@ -6984,8 +6985,10 @@ var EdbPlugin = class extends Plugin {
       return 0;
     try {
       const dbIds = (core.listDocs(this.state.db) || []).map((d) => d.doc_id).filter(Boolean);
+      /* v1.6.45: 对齐时跳过移出黑名单——即使库 docs 表残留（删除失败等），移出文档也不自动加回 watchlist */
+      const exclSet = new Set(this.cfg.excludedDocs || []);
       const cur = Array.isArray(this.cfg.watchlist) ? this.cfg.watchlist : [];
-      const merged = Array.from(new Set([...cur, ...dbIds]));
+      const merged = Array.from(new Set([...cur, ...dbIds])).filter((d) => !exclSet.has(d));
       if (merged.length !== cur.length) {
         this.cfg.watchlist = merged;
         const v = this.cfg.vaults && this.cfg.vaults[this.cfg.activeVault];
@@ -7001,6 +7004,10 @@ var EdbPlugin = class extends Plugin {
     }
   }
   async saveConfig() {
+    /* v1.6.45: 顶层 watchlist 强制同步到活动库——防 applyActiveAliases（重启加载时 cfg.watchlist=vaults.watchlist）用旧值覆盖移出结果导致"移出后重启明文自动回库" */
+    const _v = this.cfg.vaults && this.cfg.vaults[this.cfg.activeVault];
+    if (_v && Array.isArray(this.cfg.watchlist))
+      _v.watchlist = this.cfg.watchlist;
     /* v1.6.36 试用时间完整性：每次保存时按当前 trialStart 重算 HMAC 指纹 */
     if (this.cfg.trialStart) {
       this.cfg.trialH = lic.authHmac("trial", this.cfg.trialStart);
@@ -7146,7 +7153,7 @@ var EdbPlugin = class extends Plugin {
       return;
     const domSet = this.openDocIdsFromDom();
     for (const id in domSet) {
-      if (this.cfg.watchlist.includes(id)) {
+      if (this.cfg.watchlist.includes(id) && !(this.cfg.excludedDocs || []).includes(id)) {
         this.openDocs[id] = Date.now();
         this.injectDocAssets(id).catch((e) => console.error("[siyuan-edb] \u6CE8\u5165\u5931\u8D25", id, e));
       } else {
@@ -7677,7 +7684,7 @@ var EdbPlugin = class extends Plugin {
       return;
     const domSet = this.openDocIdsFromDom();
     for (const id in domSet) {
-      if (this.cfg.watchlist.includes(id))
+      if (this.cfg.watchlist.includes(id) && !(this.cfg.excludedDocs || []).includes(id))
         await this.restoreFileAssets(id);
     }
   }
@@ -7687,7 +7694,7 @@ var EdbPlugin = class extends Plugin {
       return;
     const domSet = this.openDocIdsFromDom();
     for (const id in domSet) {
-      if (this.cfg.watchlist.includes(id)) {
+      if (this.cfg.watchlist.includes(id) && !(this.cfg.excludedDocs || []).includes(id)) {
         this.openDocs[id] = Date.now();
         await this.restoreOpenAssets(id);
       }
@@ -7803,7 +7810,7 @@ var EdbPlugin = class extends Plugin {
           if (refs) {
             let allIn = true;
             for (const r of refs) {
-              if (!this.cfg.watchlist.includes(r)) {
+              if (!this.cfg.watchlist.includes(r) || (this.cfg.excludedDocs || []).includes(r)) {
                 allIn = false;
                 break;
               }
@@ -7843,14 +7850,14 @@ var EdbPlugin = class extends Plugin {
           if (refs) {
             let allIn2 = true;
             for (const r of refs) {
-              if (!this.cfg.watchlist.includes(r)) {
+              if (!this.cfg.watchlist.includes(r) || (this.cfg.excludedDocs || []).includes(r)) {
                 allIn2 = false;
                 break;
               }
             }
             if (!allIn2)
               continue;
-          } else if (!this.cfg.watchlist.includes(a.doc_id || "")) {
+          } else if (!this.cfg.watchlist.includes(a.doc_id || "") || (this.cfg.excludedDocs || []).includes(a.doc_id || "")) {
             // 无 .sy 引用（=新资产未落盘）：必须该资产所属文档在 watchlist 才清，
             // 防误删「非密库文档名下的未回收残留记录」对应明文
             continue;
@@ -8023,7 +8030,8 @@ var EdbPlugin = class extends Plugin {
       const docId = this.docElId(els[0]);
       if (!docId)
         return;
-      const isIn = this.cfg.watchlist.includes(docId);
+      /* v1.6.45: 移出黑名单中的文档不算"已入库"——菜单显示"加入"而非"移出" */
+      const isIn = this.cfg.watchlist.includes(docId) && !(this.cfg.excludedDocs || []).includes(docId);
       menu.addItem({
         icon: "iconKey",
         label: isIn ? this.t("menuRemove") : this.t("menuAdd"),
@@ -8054,37 +8062,53 @@ var EdbPlugin = class extends Plugin {
       console.error("[siyuan-edb]", e);
     }
   }
-  /** 笔记本右键菜单：整本加入 / 整本移出密库 */
+  /** 笔记本右键菜单：按「整本加入标记 + docBoxMap 已入库数」同步判断，只显示当前适用的一个操作
+   *  - 已整本加入过（或 docBoxMap 有该笔记本已入库文档）→ 只显示"整本移出密库（已入库 N 篇）"
+   *  - 未加入 → 只显示"整本加入密库"
+   *  同步构建（不查 SQL），绝不影响思源菜单渲染 */
   appendNotebookMenu(menu, boxIds) {
-    menu.addItem({
-      icon: "iconKey",
-      label: this.t("nbAdd"),
-      click: async () => {
-        try {
-          const n = await this.addNotebookToVault(boxIds);
-          showMessage(n > 0 ? this.t("nbAddOk").replace("{0}", n) : this.t("nbEmpty"));
-        } catch (e) {
-          console.error("[siyuan-edb]", e);
-          showMessage(this.t("addFail") + "\uff1a" + (e && e.message ? e.message : e));
+    let inCount = 0;
+    const excl = new Set(this.cfg.excludedDocs || []);
+    const nbSet = new Set(this.cfg.notebookInVault || []);
+    const marked = boxIds.some((b) => nbSet.has(b));
+    for (const id in this.docBoxMap) {
+      if (boxIds.includes(this.docBoxMap[id]) && this.cfg.watchlist.includes(id) && !excl.has(id))
+        inCount++;
+    }
+    /* v1.6.45: 兜底——docBoxMap 映射不可靠时（SQL 未填充），只要有任何文档在密库就显示"移出"，绝不隐藏 */
+    const anyIn = this.cfg.watchlist.length > 0;
+    if (marked || inCount > 0 || anyIn) {
+      menu.addItem({
+        icon: "iconKey",
+        label: this.t("nbRemove") + (inCount > 0 ? "（\u5DF2\u5165\u5E93 " + inCount + " \u7BC7\uFF09" : ""),
+        click: async () => {
+          try {
+            const n = await this.removeNotebookFromVault(boxIds);
+            if (n > 0)
+              showMessage(this.t("nbRemoveOk").replace("{0}", n));
+            else if (n === 0)
+              showMessage(this.t("nbNotWatched"));
+          } catch (e) {
+            console.error("[siyuan-edb]", e);
+            showMessage(this.t("nbRemoveFail") + "\uff1a" + (e && e.message ? e.message : e));
+          }
         }
-      }
-    });
-    menu.addItem({
-      icon: "iconKey",
-      label: this.t("nbRemove"),
-      click: async () => {
-        try {
-          const n = await this.removeNotebookFromVault(boxIds);
-          if (n > 0)
-            showMessage(this.t("nbRemoveOk").replace("{0}", n));
-          else if (n === 0)
-            showMessage(this.t("nbNotWatched"));
-        } catch (e) {
-          console.error("[siyuan-edb]", e);
-          showMessage(this.t("nbRemoveFail") + "\uff1a" + (e && e.message ? e.message : e));
+      });
+    } else {
+      menu.addItem({
+        icon: "iconKey",
+        label: this.t("nbAdd"),
+        click: async () => {
+          try {
+            const n = await this.addNotebookToVault(boxIds);
+            showMessage(n > 0 ? this.t("nbAddOk").replace("{0}", n) : this.t("nbEmpty"));
+          } catch (e) {
+            console.error("[siyuan-edb]", e);
+            showMessage(this.t("addFail") + "\uff1a" + (e && e.message ? e.message : e));
+          }
         }
-      }
-    });
+      });
+    }
   }
   /** 整本笔记本入库：查询该笔记本全部文档 ID → 批量加入 watchlist → 一次全量同步 */
   async addNotebookToVault(boxIds) {
@@ -8154,6 +8178,10 @@ var EdbPlugin = class extends Plugin {
     if (!ids.length)
       return 0;
     this.cfg.watchlist = this.cfg.watchlist.concat(ids);
+    /* v1.6.45: 重新加入 → 从移出黑名单移除（黑名单为独立持久化字段，防库记录残留时自动回库） */
+    this.cfg.excludedDocs = (this.cfg.excludedDocs || []).filter((x) => !ids.includes(x));
+    /* v1.6.45: 整本加入 → 记录笔记本标记（菜单据此显示"移出"） */
+    this.cfg.notebookInVault = [...new Set([...(this.cfg.notebookInVault || []), ...boxIds])];
     await this.saveConfig();
     // v1.6.11: 整本加入期间显示动态等待（扫描+同步+明文清理耗时）
     this.setBusy(this.t("nbAddBusy") || ("\u6B63\u5728\u6574\u672C\u52A0\u5165 " + ids.length + " \u7BC7\u6587\u6863..."));
@@ -8236,6 +8264,8 @@ var EdbPlugin = class extends Plugin {
           try {
             core.removeDoc(this.state.db, docId);
           } catch (e) {
+            /* v1.6.45: 删除库记录失败（磁盘满等）必须暴露，否则重启后 watchlist/库记录残留 → 明文回库 */
+            console.error("[siyuan-edb] \u79FB\u51FA\u65F6\u5220\u9664\u5E93\u8BB0\u5F55\u5931\u8D25\uFF1A", e && e.message ? e.message : e);
           }
           try {
             core.clearRevisions(this.state.db, docId);
@@ -8249,7 +8279,21 @@ var EdbPlugin = class extends Plugin {
         delete this.docBoxMap[docId];
       }
       this.cfg.watchlist = this.cfg.watchlist.filter((d) => !ids.has(d));
+      /* v1.6.45: 移出 → 加入移出黑名单（独立持久化；即使库记录/删除失败残留，重启也不再自动加回） */
+      this.cfg.excludedDocs = [...new Set([...(this.cfg.excludedDocs || []), ...ids])];
+      /* v1.6.45: 整本移出 → 移除笔记本标记（菜单据此显示"加入"） */
+      this.cfg.notebookInVault = (this.cfg.notebookInVault || []).filter((b) => !boxIds.includes(b));
       await this.saveConfig();
+      /* v1.6.45: 验证 watchlist 已持久化（磁盘满时 saveData 可能静默失败 → 重启读旧配置 → 明文回库） */
+      try {
+        const re = await this.loadData("config.json");
+        if (re && Array.isArray(re.watchlist) && re.watchlist.some((d) => ids.has(d))) {
+          console.warn("[siyuan-edb] \u79FB\u51FA\u540E watchlist \u6301\u4E45\u5316\u5F02\u5E38\uFF0C\u91CD\u8BD5\u4FDD\u5B58");
+          await this.saveConfig();
+        }
+      } catch (e) {
+        console.error("[siyuan-edb] \u79FB\u51FA\u540E\u9A8C\u8BC1 watchlist \u5931\u8D25", e);
+      }
       this.flushVault();
     } finally {
       this.clearBusy();
@@ -8288,6 +8332,8 @@ var EdbPlugin = class extends Plugin {
         for (const id of ids) {
           if (this.cfg.watchlist.includes(id)) {
             this.cfg.watchlist = this.cfg.watchlist.filter((x) => x !== id);
+            /* v1.6.45: 移出黑名单（防库记录残留时重启自动回库） */
+            this.cfg.excludedDocs = [...new Set([...(this.cfg.excludedDocs || []), id])];
             delete this.docBoxMap[id];
             if (this.state) {
               try {
@@ -8309,7 +8355,7 @@ var EdbPlugin = class extends Plugin {
         const id = this.pickDocId(detail);
         if (id) {
           this.openDocs[id] = Date.now();
-          if (this.isUnlocked() && this.cfg.watchlist.includes(id)) {
+          if (this.isUnlocked() && this.cfg.watchlist.includes(id) && !(this.cfg.excludedDocs || []).includes(id)) {
             if (this.cfg.keepPlain)
               this.restoreOpenAssets(id).catch((e2) => console.error("[siyuan-edb]", e2));
             else
@@ -8332,7 +8378,7 @@ var EdbPlugin = class extends Plugin {
       }
       if (["transactions", "rename", "moveDoc", "create"].includes(cmd)) {
         const id = this.pickRootId(detail);
-        if (id && this.cfg.watchlist.includes(id)) {
+        if (id && this.cfg.watchlist.includes(id) && !(this.cfg.excludedDocs || []).includes(id)) {
           this.openDocs[id] = Date.now();
           if (this.isUnlocked()) {
             if (this.cfg.keepPlain)
@@ -8657,7 +8703,7 @@ var EdbPlugin = class extends Plugin {
   scheduleAutoSyncDoc(docId) {
     if (!docId || !this.cfg.autoSync || !this.isUnlocked())
       return;
-    if (!this.cfg.watchlist.includes(docId))
+    if (!this.cfg.watchlist.includes(docId) || (this.cfg.excludedDocs || []).includes(docId))
       return;
     if (this._autoSyncTimers && this._autoSyncTimers[docId])
       clearTimeout(this._autoSyncTimers[docId]);
@@ -8671,7 +8717,7 @@ var EdbPlugin = class extends Plugin {
   /** v1.6.26: 单篇增量同步：更新库内文字快照 + 新资产加密入库 + 清理该文档明文。
    *  与 syncNow 的区别：只处理一篇、不做 _syncKeep/gcAssets（避免与全量回收冲突）。 */
   async syncOneDoc(docId) {
-    if (!this.state || !this.isUnlocked() || !this.cfg.watchlist.includes(docId))
+    if (!this.state || !this.isUnlocked() || !this.cfg.watchlist.includes(docId) || (this.cfg.excludedDocs || []).includes(docId))
       return { ok: false, reason: "skip" };
     let info = null;
     try {
@@ -8951,6 +8997,8 @@ var EdbPlugin = class extends Plugin {
       }
       if (!this.cfg.watchlist.includes(docId)) {
         this.cfg.watchlist.push(docId);
+        /* v1.6.45: 重新加入 → 移出黑名单移除 */
+        this.cfg.excludedDocs = (this.cfg.excludedDocs || []).filter((x) => x !== docId);
         await this.saveConfig();
       }
       await this.syncNow();
@@ -8970,6 +9018,8 @@ var EdbPlugin = class extends Plugin {
         return;
     }
     this.cfg.watchlist = this.cfg.watchlist.filter((x) => x !== docId);
+    /* v1.6.45: 移出黑名单（防库记录残留时重启自动回库） */
+    this.cfg.excludedDocs = [...new Set([...(this.cfg.excludedDocs || []), docId])];
     // v1.6.11: 移出期间显示动态等待（还原大视频等资产耗时）
     this.setBusy(this.t("removeBusy") || "\u6B63\u5728\u79FB\u51FA\u6587\u6863...");
     try {
@@ -9336,7 +9386,7 @@ var EdbPlugin = class extends Plugin {
     this._syCache = new Map();
     // v1.6.8: 文档存在性兜底需要 dataDir 定位 .sy
     const dataDir = await this.wsDataDir();
-    const list = [...this.cfg.watchlist];
+    const list = [...this.cfg.watchlist].filter((d) => !(this.cfg.excludedDocs || []).includes(d));
     for (const docId of list) {
       try {
         const info = await this.fetchDoc(docId);
@@ -9397,6 +9447,8 @@ var EdbPlugin = class extends Plugin {
             core.clearRevisions(this.state.db, docId);
             core.audit(this.state.db, "remove", docId, "\u6587\u6863\u5DF2\u5220\u9664\uFF0C\u8D44\u4EA7\u8FDB\u56DE\u6536\u7AD9");
             this.cfg.watchlist = this.cfg.watchlist.filter((x) => x !== docId);
+            /* v1.6.45: 文档已删除自动移出 → 也进黑名单（防 docs 残留重启回库） */
+            this.cfg.excludedDocs = [...new Set([...(this.cfg.excludedDocs || []), docId])];
             delete this.docBoxMap[docId];
             changed = true;
           } else {
@@ -10816,6 +10868,7 @@ var EdbPlugin = class extends Plugin {
       list.appendChild(s(this.t("emptyWatched")));
     } else {
       for (const id of this.cfg.watchlist) {
+        if ((this.cfg.excludedDocs || []).includes(id)) continue; /* v1.6.45: 黑名单不显示为已入库 */
         const doc = this.state ? core.getDoc(this.state.db, id) : null;
         const rowItem = document.createElement("div");
         rowItem.style.cssText = "display:flex;align-items:center;justify-content:space-between;gap:6px;padding:4px 6px;border:1px solid var(--b3-theme-background-light,#ddd);border-radius:4px;";
@@ -11342,6 +11395,16 @@ var EdbPlugin = class extends Plugin {
     } finally {
       fs.closeSync(fdW);
     }
+    // v1.6.45: 生成新备份前先清理同库旧备份——主库+备份始终 2 个库，防 7GB 级 .bak-* 堆积占满磁盘
+    try {
+      const bakDir = path.dirname(dbPath);
+      const bakBase = path.basename(dbPath);
+      for (const f of fs.readdirSync(bakDir)) {
+        if (f.startsWith(bakBase + ".bak-")) {
+          try { fs.unlinkSync(path.join(bakDir, f)); } catch (e) { }
+        }
+      }
+    } catch (e) { }
     const bak = dbPath + ".bak-" + Date.now();
     fs.renameSync(dbPath, bak);
     try {
@@ -12334,6 +12397,8 @@ var EdbPlugin = class extends Plugin {
     }
     if (!this.cfg.watchlist.includes(newId))
       this.cfg.watchlist.push(newId);
+    /* v1.6.45: 新建加入 → 黑名单移除 */
+    this.cfg.excludedDocs = (this.cfg.excludedDocs || []).filter((x) => x !== newId);
     if (notebook)
       this.docBoxMap[newId] = notebook;
     await this.saveConfig();
@@ -12658,6 +12723,8 @@ var EdbPlugin = class extends Plugin {
     const dstV = vs[targetIdx];
     if (!dstV.watchlist.includes(docId))
       dstV.watchlist.push(docId);
+    /* v1.6.45: 跨库移入目标库 → 黑名单移除（目标库需正常加密） */
+    this.cfg.excludedDocs = (this.cfg.excludedDocs || []).filter((x) => x !== docId);
     await this.saveConfig();
     this.refreshPanel();
     return true;

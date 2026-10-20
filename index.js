@@ -6726,7 +6726,9 @@ var EdbPlugin = class extends Plugin {
       clockRollback: false,
       /* v1.6.35 云端授权：onlineUrl 为空 = 纯离线（默认）；非空 = 激活联网登记 + 启动校验 */
       onlineUrl: "",
-      onlineLastCheck: 0
+      onlineLastCheck: 0,
+      /* v1.6.52 离线超时锁库：超过该天数未连上云端 → 授权失效（防断网规避撤销/到期） */
+      onlineGraceDays: 3
     };
     this.state = null;
     this.syncTimer = null;
@@ -9514,9 +9516,14 @@ var EdbPlugin = class extends Plugin {
         showMessage(this.t("unlocked"));
         /* v1.6.50 到期续费闭环：解锁成功但授权异常 → 明确提示（密库数据完整保留，续费后自动恢复） */
         if (!this.isLicensed()) {
+          const offlineLock = this.edbOnlineUrl() && this.cfg.onlineLastCheck && (this.nowTs() - this.cfg.onlineLastCheck) > (this.cfg.onlineGraceDays || 3) * 864e5;
           const expMsg = this.cfg.revoked
             ? "\u23F3 \u6388\u6743\u5DF2\u88AB\u5356\u5BB6\u64A4\u9500\uFF1A\u5BC6\u5E93\u6570\u636E\u5B8C\u6574\u4FDD\u7559\uFF0C\u8BF7\u8054\u7CFB\u5356\u5BB6\u91CD\u65B0\u6FC0\u6D3B\u540E\u6062\u590D\u67E5\u770B\u3002"
-            : "\u23F3 \u6388\u6743\u5DF2\u5230\u671F\uFF1A\u5BC6\u5E93\u6570\u636E\u5B8C\u6574\u4FDD\u7559\u3002\u8BF7\u8D2D\u4E70\u65B0\u6FC0\u6D3B\u7801\uFF0C\u5728\u300C\u{1F511} \u6388\u6743\u6FC0\u6D3B\u300D\u8F93\u5165\u540E\u81EA\u52A8\u7EED\u8D39\u6062\u590D\u89E3\u9501\u3002";
+            : offlineLock
+              ? "\u23F3 \u957F\u671F\u672A\u8054\u7F51\u9A8C\u8BC1\uFF08\u8D85\u8FC7 " + (this.cfg.onlineGraceDays || 3) + " \u5929\uFF09\uFF1A\u5BC6\u5E93\u6570\u636E\u5B8C\u6574\u4FDD\u7559\uFF0C\u8BF7\u8054\u7F51\u540E\u91CD\u65B0\u89E3\u9501\u9A8C\u8BC1\u3002"
+              : !this.licState
+                ? "\u23F3 \u8BD5\u7528\u5DF2\u7ED3\u675F\uFF1A\u5BC6\u5E93\u6570\u636E\u5B8C\u6574\u4FDD\u7559\u3002\u8D2D\u4E70\u6FC0\u6D3B\u7801\u5728\u300C\u{1F511} \u6388\u6743\u6FC0\u6D3B\u300D\u8F93\u5165\u5373\u53EF\u89E3\u9501\uFF08\u6708 9.9 \u5143 / \u534A\u5E74 29.9 / \u5E74 49.9 / \u6C38\u4E45 99\uFF09\uFF0C\u8054\u7CFB\u5356\u5BB6\u8D2D\u4E70\u3002"
+                : "\u23F3 \u6388\u6743\u5DF2\u5230\u671F\uFF1A\u5BC6\u5E93\u6570\u636E\u5B8C\u6574\u4FDD\u7559\u3002\u8BF7\u8D2D\u4E70\u65B0\u6FC0\u6D3B\u7801\uFF0C\u5728\u300C\u{1F511} \u6388\u6743\u6FC0\u6D3B\u300D\u8F93\u5165\u540E\u81EA\u52A8\u7EED\u8D39\u6062\u590D\u89E3\u9501\u3002";
           setTimeout(() => showMessage(expMsg), 1500);
         }
         const chk = this.integrityCheck();
@@ -13403,6 +13410,9 @@ var EdbPlugin = class extends Plugin {
   isLicensed() {
     if (this.cfg.revoked)
       return false;
+    /* v1.6.52 离线超时锁库：超过宽限期未连上云端 → 授权失效（防断网规避撤销/到期）；联网校验成功后自动恢复 */
+    if (this.edbOnlineUrl() && this.cfg.onlineLastCheck && this.nowTs() - this.cfg.onlineLastCheck > (this.cfg.onlineGraceDays || 3) * 864e5)
+      return false;
     if (this.cfg.clockRollback)
       return false;
     if (this.cfg.bindMismatch)
@@ -13548,6 +13558,8 @@ var EdbPlugin = class extends Plugin {
       /* v1.6.40 激活成功即建立服务器时间锚点（防本地改时间） */
       if (reg.serverTime)
         this.cfg.srvTime = { s: Number(reg.serverTime), l: Date.now() };
+      /* v1.6.52 激活成功即记为在线（离线宽限从此刻起算） */
+      this.cfg.onlineLastCheck = Date.now();
     }
     const activatedAt = this.nowTs();
     let expAt;

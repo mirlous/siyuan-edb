@@ -12594,6 +12594,20 @@ var EdbPlugin = class extends Plugin {
           showMessage(j.msg || "\u63D0\u4EA4\u5931\u8D25");
           return;
         }
+        /* v1.6.56 库存自动发码：提交即已发码（云端从库存池直接取码返回），零等待直接显示 */
+        if (j.status === "issued" && j.code) {
+          const cp = document.createElement("button");
+          cp.textContent = "\u590D\u5236";
+          cp.className = "b3-button";
+          cp.style.cssText = "font-size:12px;padding:2px 10px;margin-left:8px;";
+          cp.addEventListener("click", () => {
+            try { navigator.clipboard.writeText(j.code); showMessage("\u5DF2\u590D\u5236\u6FC0\u6D3B\u7801"); }
+            catch (e) { showMessage("\u8BF7\u624B\u52A8\u590D\u5236\uFF1A" + j.code); }
+          });
+          payStatus.innerHTML = "\u2705 \u5DF2\u53D1\u7801\uFF1A<b style='color:#7ee787'>" + j.code + "</b>";
+          payStatus.appendChild(cp);
+          return;
+        }
         payStatus.textContent = "\u8BA2\u5355\u5DF2\u63D0\u4EA4\uFF1A" + j.reqId + "\uFF0C\u7B49\u5F85\u5356\u5BB6\u6838\u5BF9\u53D1\u7801\u2026";
         let n = 0;
         const timer = setInterval(async () => {
@@ -12634,7 +12648,8 @@ var EdbPlugin = class extends Plugin {
         showMessage("\u63D0\u4EA4\u5931\u8D25\uFF1A\u7F51\u7EDC\u5F02\u5E38");
       }
     });
-    box.appendChild(payBox);
+    /* v1.6.56 购买区挪到授权激活面板：紧跟"购买激活码请联系微信…"下方 */
+    licContact.after(payBox);
     const ruleBox = document.createElement("div");
     ruleBox.style.cssText = "border:1px solid var(--b3-border-color,#333);border-radius:6px;padding:10px;display:flex;flex-direction:column;gap:8px;";
     const ruleTitle = document.createElement("div");

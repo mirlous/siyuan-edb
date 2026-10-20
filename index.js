@@ -6745,6 +6745,10 @@ var EdbPlugin = class extends Plugin {
     } catch (e) {
     }
     this.refreshDocBoxes();
+    this.inferNotebookVault();
+    this.applyNotebookVisibility();
+    this.applyDocMask();
+    this.startNotebookObserver();
     try {
       await this.saveData("probe.json", JSON.stringify({ t: Date.now() }));
     } catch (e) {
@@ -6794,6 +6798,7 @@ var EdbPlugin = class extends Plugin {
       }
     }, 5e3);
     this.eventBus.on("open-menu-doctree", this.onDocTreeMenu.bind(this));
+    this.eventBus.on("open-doc", (e) => this.openDocGuard(e));
     this.eventBus.on("ws-main", this.onWsMain.bind(this));
     this.lastActive = Date.now();
     const bump = () => {
@@ -8062,6 +8067,252 @@ var EdbPlugin = class extends Plugin {
       console.error("[siyuan-edb]", e);
     }
   }
+  /** v1.6.45: 未解锁时隐藏已整本加入密库的笔记本（文档树不可见，杜绝未解锁查看明文） */
+  /** v1.6.45: 旧式笔记本标记（纯 id，未记录所属库）自动推断归属：
+   *  查该笔记本全部文档 id 与各库 watchlist 的交集，命中即归属该库（多库切换隐藏才正确） */
+  async inferNotebookVault() {
+    try {
+      const arr = this.cfg.notebookInVault || [];
+      const need = arr.filter((e) => typeof e === "string" || (e && typeof e.v !== "number"));
+      if (!need.length || !(this.cfg.vaults || []).length)
+        return;
+      let changed = false;
+      for (const e of need) {
+        const box = typeof e === "string" ? e : e && e.id;
+        if (!box)
+          continue;
+        let ids = [];
+        try {
+          const boxEsc = String(box).replace(/'/g, "''");
+          const r = await fetchSyncPost("/api/query/sql", { stmt: "SELECT id FROM blocks WHERE type = 'd' AND box = '" + boxEsc + "'" });
+          ids = ((r && r.data) || []).map((x) => x.id);
+        } catch (err) {
+          ids = [];
+        }
+        if (!ids.length)
+          continue;
+        const idSet = new Set(ids);
+        for (let i = 0; i < (this.cfg.vaults || []).length; i++) {
+          const w = new Set((this.cfg.vaults[i].watchlist || []));
+          if ([...idSet].some((d) => w.has(d))) {
+            this.cfg.notebookInVault = this.cfg.notebookInVault.map((x) => {
+              const bid = typeof x === "string" ? x : x && x.id;
+              if (bid !== box)
+                return x;
+              return typeof x === "string" ? { id: x, v: i } : Object.assign({}, x, { v: i });
+            });
+            changed = true;
+            break;
+          }
+        }
+      }
+      if (changed)
+        await this.saveConfig();
+    } catch (e) {
+      console.error("[siyuan-edb]", e);
+    }
+  }
+  applyNotebookVisibility() {
+    try {
+      if (!this.cfg || !Array.isArray(this.cfg.notebookInVault) || !this.cfg.notebookInVault.length) {
+        this.hideLostAssets();
+        return;
+      }
+      /* v1.6.45: 多库归属——notebookInVault 元素可为 {id, v}(v=所属库) 或旧式纯 id(v=-1 未知) */
+      const nbMap = new Map();
+      (this.cfg.notebookInVault || []).forEach((e) => {
+        const bid = typeof e === "string" ? e : e && e.id;
+        const v = typeof e === "string" ? -1 : e && typeof e.v === "number" ? e.v : -1;
+        if (bid)
+          nbMap.set(bid, v);
+      });
+      const activeUnlocked = this.isUnlocked();
+      const activeV = this.cfg.activeVault;
+      document.querySelectorAll("[data-node-id]").forEach((el) => {
+        const bid = el.getAttribute("data-node-id");
+        if (!nbMap.has(bid))
+          return;
+        const v = nbMap.get(bid);
+        let want;
+        if (v === -1)
+          want = activeUnlocked ? "" : "none";
+        else if (v === activeV)
+          want = activeUnlocked ? "" : "none";
+        else
+          want = "none";
+        if (el.style.display !== want)
+          el.style.display = want;
+      });
+      /* v1.6.45: 隐藏 设置→资源→丢失的资源文件 中的密库加密资产条目（防泄露库内文件名） */
+      this.hideLostAssets();
+      /* v1.6.45: 密库已打开时每 60 秒刷新一次资产名缓存（未解锁也能用上次缓存隐藏） */
+      const now = Date.now();
+      if (this.state && this.state.db && (!this._assetSyncAt || now - this._assetSyncAt > 60000)) {
+        this._assetSyncAt = now;
+        this.syncEncryptedAssetCache();
+      }
+    } catch (e) {
+      console.error("[siyuan-edb]", e);
+    }
+  }
+  /** v1.6.45: 未解锁时当前打开的已入库文档 → 正文遮罩（视觉锁定，杜绝未解锁看明文）；
+   *  解锁后 → 防拍照水印角标（激活码尾号，截图外传可溯源）。只覆盖编辑器主区，不挡侧边栏 */
+  applyDocMask() {
+    try {
+      const unlocked = this.isUnlocked();
+      const domSet = this.openDocIdsFromDom();
+      let needMask = false;
+      if (!unlocked) {
+        const excl = new Set(this.cfg.excludedDocs || []);
+        for (const id in domSet) {
+          if (this.cfg.watchlist.includes(id) && !excl.has(id)) {
+            needMask = true;
+            break;
+          }
+        }
+      }
+      let mask = document.getElementById("edb-unlock-mask");
+      if (needMask) {
+        if (!mask) {
+          mask = document.createElement("div");
+          mask.id = "edb-unlock-mask";
+          mask.style.cssText = "position:absolute;left:0;top:0;right:0;bottom:0;background:rgba(40,40,40,.5);z-index:2147483000;display:flex;align-items:center;justify-content:center;backdrop-filter:blur(5px);";
+          const inner = document.createElement("div");
+          inner.style.cssText = "background:#fff;color:#333;padding:24px 40px;border-radius:12px;font-size:16px;box-shadow:0 10px 40px rgba(0,0,0,.3);text-align:center;line-height:1.9;";
+          inner.textContent = "\u{1F512} \u5BC6\u5E93\u5DF2\u9501\u5B9A\n\u8BF7\u5148\u5728\u5BC6\u5E93\u9762\u677F\u89E3\u9501\u540E\u518D\u67E5\u770B\u6587\u6863";
+          mask.appendChild(inner);
+          const host = document.querySelector(".layout__center") || document.body;
+          if (host) {
+            if (getComputedStyle(host).position === "static")
+              host.style.position = "relative";
+            host.appendChild(mask);
+          }
+        }
+      } else if (mask) {
+        mask.remove();
+      }
+      this.applyWatermark(unlocked, domSet);
+    } catch (e) {
+      console.error("[siyuan-edb]", e);
+    }
+  }
+  /** 防拍照水印角标：解锁且当前文档已入库 → 右下角浅色激活码尾号 */
+  applyWatermark(unlocked, domSet) {
+    try {
+      let wm = document.getElementById("edb-watermark");
+      if (unlocked) {
+        const excl = new Set(this.cfg.excludedDocs || []);
+        const anyIn = Object.keys(domSet || {}).some((id) => this.cfg.watchlist.includes(id) && !excl.has(id));
+        if (anyIn) {
+          if (!wm) {
+            wm = document.createElement("div");
+            wm.id = "edb-watermark";
+            wm.style.cssText = "position:fixed;right:14px;bottom:10px;z-index:2147482900;color:rgba(120,120,120,.4);font-size:12px;pointer-events:none;user-select:none;";
+            wm.textContent = "\u5BC6\u5E93 " + ((this.licCode || "").slice(-6) || "\u5DF2\u89E3\u9501");
+            document.body.appendChild(wm);
+          }
+          return;
+        }
+      }
+      if (wm)
+        wm.remove();
+    } catch (e) {
+    }
+  }
+  /** v1.6.45: 每 3 秒同步笔记本显隐（覆盖文档树刷新/解锁状态变化，轻量） */
+  startNotebookObserver() {
+    try {
+      if (this._nbTimer)
+        clearInterval(this._nbTimer);
+      this._nbTimer = setInterval(() => {
+      this.applyNotebookVisibility();
+      this.applyDocMask();
+    }, 3000);
+    } catch (e) {
+      console.error("[siyuan-edb]", e);
+    }
+  }
+  /** v1.6.45: 打开已加密文档时若未解锁 → 提示（隐藏为主，此为其兜底） */
+  openDocGuard(e) {
+    try {
+      const id = e && e.detail && e.detail.id;
+      if (!id || this.isUnlocked())
+        return;
+      const excl = new Set(this.cfg.excludedDocs || []);
+      if (this.cfg.watchlist.includes(id) && !excl.has(id))
+        showMessage("密库未解锁，无法查看已加入的文档，请先解锁");
+    } catch (err) {
+      console.error("[siyuan-edb]", err);
+    }
+  }
+  /** v1.6.45: 从密库同步加密资产名缓存（供"丢失的资源文件"隐藏，未解锁也可用上次缓存） */
+  async syncEncryptedAssetCache() {
+    try {
+      if (!this.state || !this.state.db || !this.isUnlocked())
+        return;
+      const rows = core.listAllAssets(this.state.db) || [];
+      /* v1.6.45: 多库累积——当前库清单合并进缓存，不清空其他库（切库后丢失列表仍能隐藏） */
+      const cur = new Set(this.cfg.encryptedAssets || []);
+      rows.forEach((r) => {
+        if (r && r.asset_path)
+          cur.add(r.asset_path);
+      });
+      this.cfg.encryptedAssets = [...cur];
+      await this.saveConfig();
+    } catch (e) {
+      console.error("[siyuan-edb]", e);
+    }
+  }
+  /** v1.6.45: 智能隐藏——资源管理「丢失的资源文件」仅隐藏密库加密资产（含回收站），
+   *  非密库的丢失文件正常显示，绝不整页清空 */
+  hideLostAssets() {
+    try {
+      let names = this.cfg.encryptedAssets || [];
+      if (!names.length && this.state && this.state.db && this.isUnlocked()) {
+        const rows = core.listAllAssets(this.state.db) || [];
+        const cur = new Set(this.cfg.encryptedAssets || []);
+        rows.forEach((r) => {
+          if (r && r.asset_path)
+            cur.add(r.asset_path);
+        });
+        names = [...cur];
+        this.cfg.encryptedAssets = names;
+        this.saveConfig().catch(() => {});
+      }
+      const basenames = new Set();
+      for (const n of names) {
+        const bn = String(n).split(/[\\/]/).pop();
+        if (bn)
+          basenames.add(bn);
+      }
+      let hit = 0;
+      const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+      while (walker.nextNode()) {
+        const t = (walker.currentNode.textContent || "").trim();
+        if (!t || !basenames.has(t))
+          continue;
+        let el = walker.currentNode.parentElement;
+        let done = false;
+        while (el && el !== document.body) {
+          const cls = el.className && el.className.toString ? el.className.toString() : "";
+          if (/b3-list-item|list__item|__item|b3-list|asset|file/.test(cls) || el.tagName === "LI") {
+            el.style.display = "none";
+            hit++;
+            done = true;
+            break;
+          }
+          el = el.parentElement;
+        }
+        if (!done && walker.currentNode.parentElement)
+          walker.currentNode.parentElement.style.display = "none";
+      }
+      if (hit > 0)
+        console.log("[siyuan-edb] \u667A\u80FD\u9690\u85CF\u5BC6\u5E93\u8D44\u4EA7\u6761\u76EE " + hit + " \u6761");
+    } catch (e) {
+      console.error("[siyuan-edb]", e);
+    }
+  }
+
   /** 笔记本右键菜单：按「整本加入标记 + docBoxMap 已入库数」同步判断，只显示当前适用的一个操作
    *  - 已整本加入过（或 docBoxMap 有该笔记本已入库文档）→ 只显示"整本移出密库（已入库 N 篇）"
    *  - 未加入 → 只显示"整本加入密库"
@@ -8069,7 +8320,7 @@ var EdbPlugin = class extends Plugin {
   appendNotebookMenu(menu, boxIds) {
     let inCount = 0;
     const excl = new Set(this.cfg.excludedDocs || []);
-    const nbSet = new Set(this.cfg.notebookInVault || []);
+    const nbSet = new Set((this.cfg.notebookInVault || []).map((e) => (typeof e === "string" ? e : e && e.id)));
     const marked = boxIds.some((b) => nbSet.has(b));
     for (const id in this.docBoxMap) {
       if (boxIds.includes(this.docBoxMap[id]) && this.cfg.watchlist.includes(id) && !excl.has(id))
@@ -8181,7 +8432,15 @@ var EdbPlugin = class extends Plugin {
     /* v1.6.45: 重新加入 → 从移出黑名单移除（黑名单为独立持久化字段，防库记录残留时自动回库） */
     this.cfg.excludedDocs = (this.cfg.excludedDocs || []).filter((x) => !ids.includes(x));
     /* v1.6.45: 整本加入 → 记录笔记本标记（菜单据此显示"移出"） */
-    this.cfg.notebookInVault = [...new Set([...(this.cfg.notebookInVault || []), ...boxIds])];
+    const nbMap = new Map();
+    (this.cfg.notebookInVault || []).forEach((e) => {
+      const bid = typeof e === "string" ? e : e && e.id;
+      const v = typeof e === "string" ? -1 : e && typeof e.v === "number" ? e.v : -1;
+      if (bid)
+        nbMap.set(bid, v);
+    });
+    boxIds.forEach((b) => nbMap.set(b, this.cfg.activeVault));
+    this.cfg.notebookInVault = [...nbMap.entries()].map((kv) => ({ id: kv[0], v: kv[1] }));
     await this.saveConfig();
     // v1.6.11: 整本加入期间显示动态等待（扫描+同步+明文清理耗时）
     this.setBusy(this.t("nbAddBusy") || ("\u6B63\u5728\u6574\u672C\u52A0\u5165 " + ids.length + " \u7BC7\u6587\u6863..."));
@@ -8282,7 +8541,10 @@ var EdbPlugin = class extends Plugin {
       /* v1.6.45: 移出 → 加入移出黑名单（独立持久化；即使库记录/删除失败残留，重启也不再自动加回） */
       this.cfg.excludedDocs = [...new Set([...(this.cfg.excludedDocs || []), ...ids])];
       /* v1.6.45: 整本移出 → 移除笔记本标记（菜单据此显示"加入"） */
-      this.cfg.notebookInVault = (this.cfg.notebookInVault || []).filter((b) => !boxIds.includes(b));
+      this.cfg.notebookInVault = (this.cfg.notebookInVault || []).filter((e) => {
+        const bid = typeof e === "string" ? e : e && e.id;
+        return !boxIds.includes(bid);
+      });
       await this.saveConfig();
       /* v1.6.45: 验证 watchlist 已持久化（磁盘满时 saveData 可能静默失败 → 重启读旧配置 → 明文回库） */
       try {
@@ -9243,9 +9505,17 @@ var EdbPlugin = class extends Plugin {
         this.state = r.state;
         this.noPwd = false;
         await this.syncWatchlistFromDb();
+        this.syncEncryptedAssetCache();
         if (r.migrated)
           showMessage(this.t("vaultUpgraded") || "\u52A0\u5BC6\u5F15\u64CE\u5DF2\u5347\u7EA7\uFF08MK \u4FE1\u5C01\uFF09\uFF0C\u6570\u636E\u5B8C\u6574");
         showMessage(this.t("unlocked"));
+        /* v1.6.50 到期续费闭环：解锁成功但授权异常 → 明确提示（密库数据完整保留，续费后自动恢复） */
+        if (!this.isLicensed()) {
+          const expMsg = this.cfg.revoked
+            ? "\u23F3 \u6388\u6743\u5DF2\u88AB\u5356\u5BB6\u64A4\u9500\uFF1A\u5BC6\u5E93\u6570\u636E\u5B8C\u6574\u4FDD\u7559\uFF0C\u8BF7\u8054\u7CFB\u5356\u5BB6\u91CD\u65B0\u6FC0\u6D3B\u540E\u6062\u590D\u67E5\u770B\u3002"
+            : "\u23F3 \u6388\u6743\u5DF2\u5230\u671F\uFF1A\u5BC6\u5E93\u6570\u636E\u5B8C\u6574\u4FDD\u7559\u3002\u8BF7\u8D2D\u4E70\u65B0\u6FC0\u6D3B\u7801\uFF0C\u5728\u300C\u{1F511} \u6388\u6743\u6FC0\u6D3B\u300D\u8F93\u5165\u540E\u81EA\u52A8\u7EED\u8D39\u6062\u590D\u89E3\u9501\u3002";
+          setTimeout(() => showMessage(expMsg), 1500);
+        }
         const chk = this.integrityCheck();
         if (!chk.ok)
           showMessage("\u5B8C\u6574\u6027\u81EA\u68C0\u8B66\u544A\uFF1A" + chk.msg);
@@ -10675,6 +10945,29 @@ var EdbPlugin = class extends Plugin {
       }
       const size = fs.existsSync(this.cfg.dbPath) ? fs.statSync(this.cfg.dbPath).size : 0;
       info = "<b>" + this.t("unlocked") + "</b>" + (this.noPwd ? "\u3000<span style='color:#8590a6;'>" + this.t("noPwdMode") + "</span>" : "") + "<br>" + this.t("dbPath") + "\uFF1A" + this.esc(this.cfg.dbPath) + "<br>" + this.t("docCount") + "\uFF1A" + stats.count + "\u3000" + this.t("size") + "\uFF1A" + this.fmtSize(size) + "<br>" + this.t("assetCount") + "\uFF1A" + stats.assetCount + "\u3000" + this.t("assetSize") + "\uFF1A" + this.fmtSize(stats.assetBytes) + "<br>" + this.t("lastSync") + "\uFF1A" + (this.cfg.lastSyncAt ? new Date(this.cfg.lastSyncAt).toLocaleString() : "\u2014");
+      /* v1.6.49 数据统计仪表盘：资产分类统计 + 加密前后对比 */
+      try {
+        const as = core.listAssets(this.state.db);
+        const cls = { "\u56FE\u7247": 0, "\u89C6\u9891": 0, "\u97F3\u9891": 0, "\u6587\u6863": 0, "\u5176\u4ED6": 0 };
+        let totalBytes = 0;
+        const IMG = ["png", "jpg", "jpeg", "webp", "gif", "bmp", "svg"];
+        const VID = ["mp4", "mov", "mkv", "avi", "webm", "flv"];
+        const AUD = ["mp3", "wav", "m4a", "aac", "flac", "ogg"];
+        const DOC = ["pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "md", "txt"];
+        for (const a of as) {
+          const ext = String(a.asset_path || "").split(".").pop().toLowerCase();
+          totalBytes += Number(a.size) || 0;
+          if (IMG.includes(ext)) cls["\u56FE\u7247"]++;
+          else if (VID.includes(ext)) cls["\u89C6\u9891"]++;
+          else if (AUD.includes(ext)) cls["\u97F3\u9891"]++;
+          else if (DOC.includes(ext)) cls["\u6587\u6863"]++;
+          else cls["\u5176\u4ED6"]++;
+        }
+        const clsTxt = Object.keys(cls).map((k) => k + " " + cls[k]).join(" \xB7 ");
+        info += "<br><span style='color:#576b95;font-weight:bold;'>\u{1F4CA} \u5206\u7C7B\uFF1A</span> " + clsTxt;
+        info += "<br><span style='color:#576b95;font-weight:bold;'>\u{1F510} \u52A0\u5BC6\u540E\uFF1A</span> \u5E93\u6587\u4EF6 " + this.fmtSize(size) + "\uFF08\u660E\u6587\u8D44\u4EA7\u5408\u8BA1 " + this.fmtSize(totalBytes) + (size > 0 && totalBytes > size ? "\uFF0C\u7701\u7F6E " + Math.round((1 - size / totalBytes) * 100) + "%\uFF09" : "") + "\uFF09";
+      } catch (e) {
+      }
       if (!/\.sydb$/i.test(this.cfg.dbPath)) {
         info = "<span style='color:#e6a23c;font-weight:bold;'>\u26A0 \u5F53\u524D\u5E93\u6587\u4EF6\u6269\u5C55\u540D\u4E0D\u662F .sydb\uFF0C\u5907\u4EFD/\u4E91\u540C\u6B65/\u5BFC\u51FA\u5C06\u65E0\u6CD5\u8BC6\u522B\u6B64\u5E93\u3002\u8BF7\u5728\u300C\u5BC6\u5E93\u8BBE\u7F6E\u300D\u4E2D\u628A\u8DEF\u5F84\u6539\u4E3A .sydb \u7ED3\u5C3E</span><br>" + info;
       }
@@ -11274,6 +11567,64 @@ var EdbPlugin = class extends Plugin {
       showMessage("\u5BFC\u51FA\u5931\u8D25\uFF1A" + (e && e.message));
     }
   }
+  /** v1.6.50 导出加密备份：库文件 AES-256-GCM 打包为 .sydbk（带密码单文件，换机/迁移用） */
+  exportEncryptedBackup(pwd) {
+    if (!this.isUnlocked() || !this.state) {
+      showMessage(this.t("needUnlock"));
+      return { ok: false };
+    }
+    try {
+      this.flushVault();
+      const src = this.cfg.dbPath;
+      if (!fs.existsSync(src)) {
+        showMessage("\u5E93\u6587\u4EF6\u4E0D\u5B58\u5728");
+        return { ok: false };
+      }
+      const crypto3 = require("crypto");
+      const base = path.basename(src).replace(/\.sydb$/i, "");
+      const data = fs.readFileSync(src);
+      const salt = crypto3.randomBytes(16);
+      const key = crypto3.scryptSync(pwd, salt, 32);
+      const iv = crypto3.randomBytes(12);
+      const c = crypto3.createCipheriv("aes-256-gcm", key, iv);
+      const ct = Buffer.concat([c.update(data), c.final()]);
+      const tag = c.getAuthTag();
+      const out = Buffer.concat([Buffer.from("EDBBK1"), salt, iv, tag, ct]);
+      const dest = path.join(path.dirname(src), base + "-enc-" + new Date().toISOString().replace(/[:T]/g, "").slice(0, 14) + ".sydbk");
+      fs.writeFileSync(dest, out);
+      showMessage("\u2705 \u5DF2\u5BFC\u51FA\u52A0\u5BC6\u5907\u4EFD\uFF08" + this.fmtSize(out.length) + "\uFF09\uFF1A" + dest + "\uFF08\u5BC6\u7801\u4E0D\u4FDD\u5B58\uFF0C\u8BF7\u7262\u8BB0\uFF09");
+      return { ok: true, dest };
+    } catch (e) {
+      showMessage("\u5BFC\u51FA\u5931\u8D25\uFF1A" + (e && e.message));
+      return { ok: false };
+    }
+  }
+  /** v1.6.50 导入加密备份：.sydbk 解包还原为 .sydb（换机迁移用；旧库自动备份 .pre-import） */
+  importEncryptedBackup(pwd, file) {
+    try {
+      const crypto3 = require("crypto");
+      const raw = fs.readFileSync(file);
+      if (raw.subarray(0, 6).toString() !== "EDBBK1")
+        throw new Error("\u4E0D\u662F\u6709\u6548\u7684\u52A0\u5BC6\u5907\u4EFD\u5305\uFF08\u9700 .sydbk\uFF09");
+      const salt = raw.subarray(6, 22), iv = raw.subarray(22, 34), tag = raw.subarray(34, 50), ct = raw.subarray(50);
+      const key = crypto3.scryptSync(pwd, salt, 32);
+      const d = crypto3.createDecipheriv("aes-256-gcm", key, iv);
+      d.setAuthTag(tag);
+      const plain = Buffer.concat([d.update(ct), d.final()]);
+      if (!plain.subarray(0, 5).equals(Buffer.from("SYEDB")))
+        throw new Error("\u89E3\u5BC6\u5185\u5BB9\u5F02\u5E38\uFF0C\u4E0D\u662F\u6B63\u786E\u7684\u5BC6\u5E93\u6587\u4EF6");
+      const dbPath = this.cfg.dbPath;
+      if (!dbPath)
+        throw new Error("\u672A\u914D\u7F6E\u5BC6\u5E93\u8DEF\u5F84");
+      if (fs.existsSync(dbPath))
+        fs.copyFileSync(dbPath, dbPath + ".pre-import");
+      fs.writeFileSync(dbPath, plain);
+      return { ok: true };
+    } catch (e) {
+      showMessage("\u5BFC\u5165\u5931\u8D25\uFF1A" + (e && e.message));
+      return { ok: false };
+    }
+  }
   /** v1.6.5: 整理库（压缩重建）——丢弃回收站/无主密文块，仅保留存活文档与资产，文件瘦身。
    *  密库"只增不减"：反复移出→清回收站→再加入会让文件膨胀，点此按钮一键整理 */
   async compactVault(keepBackup) {
@@ -11637,6 +11988,104 @@ var EdbPlugin = class extends Plugin {
     bakBox.appendChild(mkRow(this.t("backupKeep"), bakKeep));
     bakBox.appendChild(bakBtnRow);
     box.appendChild(bakBox);
+    /* v1.6.50 加密备份导出/导入（带密码单文件 .sydbk，换机迁移用） */
+    const expBox = document.createElement("div");
+    expBox.style.cssText = "border:1px solid var(--b3-border-color,#333);border-radius:6px;padding:10px;display:flex;flex-direction:column;gap:8px;";
+    const expTitle = document.createElement("div");
+    expTitle.style.cssText = "font-size:14px;font-weight:bold;";
+    expTitle.textContent = "\u{1F4E4} \u52A0\u5BC6\u5907\u4EFD\uFF08\u5BFC\u51FA/\u5BFC\u5165\uFF09";
+    expBox.appendChild(expTitle);
+    const expPwd = document.createElement("input");
+    expPwd.className = "b3-text-field";
+    expPwd.type = "password";
+    expPwd.placeholder = "\u5BFC\u51FA\u5BC6\u7801\uFF08\u81F3\u5C11 6 \u4F4D\uFF0C\u8BF7\u7262\u8BB0\uFF09";
+    const expPwd2 = document.createElement("input");
+    expPwd2.className = "b3-text-field";
+    expPwd2.type = "password";
+    expPwd2.placeholder = "\u518D\u6B21\u8F93\u5165\u786E\u8BA4";
+    const expBtn = document.createElement("button");
+    expBtn.textContent = "\u5BFC\u51FA\u52A0\u5BC6\u5907\u4EFD";
+    expBtn.className = "b3-button";
+    expBtn.addEventListener("click", () => {
+      const p1 = expPwd.value, p2 = expPwd2.value;
+      if (p1.length < 6) {
+        showMessage("\u5BFC\u51FA\u5BC6\u7801\u81F3\u5C11 6 \u4F4D");
+        return;
+      }
+      if (p1 !== p2) {
+        showMessage("\u4E24\u6B21\u5BC6\u7801\u4E0D\u4E00\u81F4");
+        return;
+      }
+      const r = this.exportEncryptedBackup(p1);
+      if (r && r.ok) {
+        expPwd.value = "";
+        expPwd2.value = "";
+      }
+    });
+    const expRow = document.createElement("div");
+    expRow.style.cssText = "display:flex;gap:6px;align-items:center;flex-wrap:wrap;";
+    expRow.appendChild(expPwd);
+    expRow.appendChild(expPwd2);
+    expRow.appendChild(expBtn);
+    expBox.appendChild(expRow);
+    const impSel = document.createElement("select");
+    impSel.className = "b3-select";
+    const impPwd = document.createElement("input");
+    impPwd.className = "b3-text-field";
+    impPwd.type = "password";
+    impPwd.placeholder = "\u5BFC\u5165\u5BC6\u7801";
+    const impBtn = document.createElement("button");
+    impBtn.textContent = "\u5BFC\u5165\u8FD8\u539F";
+    impBtn.className = "b3-button";
+    const refreshImpList = () => {
+      impSel.innerHTML = "";
+      try {
+        const dir = path.dirname(this.cfg.dbPath || "");
+        const files = fs.readdirSync(dir).filter((f) => /\.sydbk$/i.test(f));
+        if (!files.length) {
+          const o = document.createElement("option");
+          o.textContent = "\uFF08\u65E0\u5907\u4EFD\u5305\uFF0C\u5148\u5BFC\u51FA\uFF09";
+          impSel.appendChild(o);
+          return;
+        }
+        for (const f of files) {
+          const o = document.createElement("option");
+          o.value = f;
+          o.textContent = f;
+          impSel.appendChild(o);
+        }
+      } catch (e) {
+      }
+    };
+    refreshImpList();
+    impBtn.addEventListener("click", () => {
+      const f = impSel.value, p = impPwd.value;
+      if (!f || !/\.sydbk$/i.test(f)) {
+        showMessage("\u8BF7\u9009\u62E9\u5907\u4EFD\u5305");
+        return;
+      }
+      if (!p) {
+        showMessage("\u8BF7\u8F93\u5165\u5BFC\u5165\u5BC6\u7801");
+        return;
+      }
+      if (!confirm("\u5BFC\u5165\u5C06\u8986\u76D6\u5F53\u524D\u5BC6\u5E93\u6587\u4EF6\uFF08\u65E7\u5E93\u81EA\u52A8\u5907\u4EFD\u4E3A .pre-import\uFF09\uFF0C\u786E\u5B9A\u7EE7\u7EED\uFF1F")) return;
+      const r = this.importEncryptedBackup(p, path.join(path.dirname(this.cfg.dbPath || ""), f));
+      if (r && r.ok) {
+        showMessage("\u5BFC\u5165\u6210\u529F\uFF0C\u8BF7\u91CD\u542F\u601D\u6E90\u540E\u89E3\u9501\u9A8C\u8BC1");
+        impPwd.value = "";
+      }
+    });
+    const impRow = document.createElement("div");
+    impRow.style.cssText = "display:flex;gap:6px;align-items:center;flex-wrap:wrap;";
+    impRow.appendChild(impSel);
+    impRow.appendChild(impPwd);
+    impRow.appendChild(impBtn);
+    expBox.appendChild(impRow);
+    const expNote = document.createElement("div");
+    expNote.style.cssText = "font-size:12px;color:var(--b3-theme-on-background,#666);";
+    expNote.textContent = "\u63D0\u793A\uFF1A\u5BFC\u51FA\u5BC6\u7801\u4EC5\u672C\u6B21\u8F93\u5165\u4E0D\u4F1A\u4FDD\u5B58\uFF1B\u6362\u673A\u8BF7\u5148\u5BFC\u51FA .sydbk \uFF0C\u65B0\u673A\u5BFC\u5165\u540E\u91CD\u65B0\u6FC0\u6D3B\uFF08\u4E00\u7801\u4E00\u673A\uFF09";
+    expBox.appendChild(expNote);
+    box.appendChild(expBox);
     const secBox = document.createElement("div");
     secBox.style.cssText = "border:1px solid var(--b3-border-color,#333);border-radius:6px;padding:10px;display:flex;flex-direction:column;gap:8px;";
     const secTitle = document.createElement("div");
@@ -12854,10 +13303,12 @@ var EdbPlugin = class extends Plugin {
     if (!url)
       return { ok: true };
     try {
+      /* v1.6.49 激活登记附带工作区名（密库文件名），卖家看板可显示每台设备的工作区明细 */
+      const wsName = this.cfg.dbPath ? String(this.cfg.dbPath).split(/[\\/]/).pop().replace(/\.sydb$/i, "") : "";
       const res = await fetch(url + "/api.php?action=register", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ code, bind: bindCode, fp, n })
+        body: JSON.stringify({ code, bind: bindCode, fp, n, workspace: wsName })
       });
       const j = await res.json();
       if (j.emergency)

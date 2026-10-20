@@ -3,6 +3,9 @@ var __commonJS = (cb, mod) => function __require() {
   return mod || (0, cb[__getOwnPropNames(cb)[0]])((mod = { exports: {} }).exports, mod), mod.exports;
 };
 
+/* v1.6.51 云端授权地址（内置默认，买家零配置；卖家更换服务器需重新打包发布） */
+const EDB_DEFAULT_ONLINE = "https://mirlous.site/siyuan-edb/api.php";
+
 // node_modules/sql.js/dist/sql-wasm.js
 var require_sql_wasm = __commonJS({
   "node_modules/sql.js/dist/sql-wasm.js"(exports2, module2) {
@@ -12541,23 +12544,7 @@ var EdbPlugin = class extends Plugin {
     wdBtnRow.appendChild(wdInfo);
     wdBox.appendChild(wdBtnRow);
     box.appendChild(wdBox);
-    /* v1.6.35 云端授权（可选）：onlineUrl 留空 = 纯离线（默认） */
-    const olBox = document.createElement("div");
-    olBox.style.cssText = "border:1px solid var(--b3-border-color,#333);border-radius:6px;padding:10px;display:flex;flex-direction:column;gap:8px;";
-    const olTitle = document.createElement("div");
-    olTitle.style.cssText = "font-size:14px;font-weight:bold;";
-    olTitle.textContent = "\u2601\uFE0F " + (this.t("onlineTitle") || "\u4E91\u7AEF\u6388\u6743\uFF08\u53EF\u9009\uFF09");
-    const olUrl = document.createElement("input");
-    olUrl.className = "b3-text-field";
-    olUrl.placeholder = "https://\u4F60\u7684\u57DF\u540D/\u9879\u76EE\u6587\u4EF6\u5939 \uFF08\u5982 https://mirlous.site/siyuan-edb\uFF0C\u7559\u7A7A = \u7EAF\u79BB\u7EBF\uFF09";
-    olUrl.value = this.cfg.onlineUrl || "";
-    const olHint = document.createElement("div");
-    olHint.textContent = this.t("onlineHint") || "\u586B\u5165\u670D\u52A1\u5668\u5730\u5740\u540E\uFF1A\u6FC0\u6D3B\u65F6\u8054\u7F51\u767B\u8BB0\u4E00\u6B21\uFF08\u9632\u4E00\u7801\u591A\u673A\u3001\u9632\u6539\u516C\u94A5\u81EA\u9020\u7801\uFF09\uFF0C\u542F\u52A8\u65F6\u6821\u9A8C\u5B98\u65B9\u7248\u672C\u6307\u7EB9\uFF08\u9632\u63D2\u4EF6\u6587\u4EF6\u88AB\u7BE1\u6539\uFF09\u3002\u7559\u7A7A = \u5B8C\u5168\u79BB\u7EBF\uFF08\u9ED8\u8BA4\uFF09\u3002";
-    olHint.style.cssText = "font-size:12px;color:var(--b3-theme-on-background,#666);";
-    olBox.appendChild(olTitle);
-    olBox.appendChild(mkRow(this.t("onlineUrlLabel") || "\u670D\u52A1\u5668\u5730\u5740", olUrl));
-    olBox.appendChild(olHint);
-    box.appendChild(olBox);
+    /* v1.6.51 云端授权地址已内置默认（EDB_DEFAULT_ONLINE），买家无需配置，此设置区不再显示 */
     const vwBox = document.createElement("div");
     vwBox.style.cssText = "border:1px solid var(--b3-border-color,#333);border-radius:6px;padding:10px;display:flex;flex-direction:column;gap:8px;";
     const vwTitle = document.createElement("div");
@@ -12666,7 +12653,7 @@ var EdbPlugin = class extends Plugin {
       this.cfg.webdavPass = wdPass.value;
       this.cfg.webdavAutoSync = wdAuto.checked;
       this.cfg.webdavAutoMin = Math.max(10, parseInt(wdAutoMin.value, 10) || 30);
-      this.cfg.onlineUrl = olUrl.value.trim();
+      /* v1.6.51 onlineUrl 已内置默认，不再从面板读取 */
       const vwEnabled = vwEnable.checked;
       this.cfg.viewerEnabled = vwEnabled;
       this.cfg.viewerPort = Math.max(1024, parseInt(vwPort.value, 10) || 18989);
@@ -13291,15 +13278,19 @@ var EdbPlugin = class extends Plugin {
       }, 2500);
     }
     /* v1.6.35 云端启动校验（异步，不阻塞）；v1.6.42 运行期每 10 分钟轮询（撤销/封禁实时生效） */
-    if (this.cfg.onlineUrl && this.licState) {
+    if (this.edbOnlineUrl() && this.licState) {
       setTimeout(() => { this.onlineCheck(); }, 800);
       if (!this._checkTimer)
         this._checkTimer = setInterval(() => { this.onlineCheck(); }, 10 * 60 * 1000);
     }
   }
+  /** v1.6.51 云端地址：config 显式值优先，否则用内置默认（买家无需任何配置） */
+  edbOnlineUrl() {
+    return String(this.cfg.onlineUrl || EDB_DEFAULT_ONLINE || "").trim();
+  }
   /** v1.6.35 云端登记（激活时联网一次）：防一码多机 / 防改公钥自造码；服务器 emergency 时放行 */
   async onlineRegister(code, bindCode, fp, n) {
-    const url = String(this.cfg.onlineUrl || "").replace(/\/+$/, "").replace(/\/api\.php$/i, "");
+    const url = String(this.edbOnlineUrl()).replace(/\/+$/, "").replace(/\/api\.php$/i, "");
     if (!url)
       return { ok: true };
     try {
@@ -13325,7 +13316,7 @@ var EdbPlugin = class extends Plugin {
     if (this._checking)
       return;
     this._checking = true;
-    const url = String(this.cfg.onlineUrl || "").replace(/\/+$/, "").replace(/\/api\.php$/i, "");
+    const url = String(this.edbOnlineUrl()).replace(/\/+$/, "").replace(/\/api\.php$/i, "");
     if (!url || !this.licState) {
       this._checking = false;
       return;
@@ -13548,7 +13539,7 @@ var EdbPlugin = class extends Plugin {
     }
     /* v1.6.35 云端登记：配置了 onlineUrl 时，激活必须联网登记成功（防一码多机 / 防改公钥自造码）。
      * 服务器返回 emergency=1 时放行（卖家维护期降级）；网络失败 = 严格拦截，提示重试。 */
-    if (this.cfg.onlineUrl) {
+    if (this.edbOnlineUrl()) {
       const reg = await this.onlineRegister(String(code).trim(), String(bindCode).trim(), fp, r.n);
       if (!reg.ok) {
         showMessage("\u4E91\u7AEF\u6388\u6743\u5E73\u53F0\u62D2\u7EDD\u6B64\u6FC0\u6D3B\uFF1A" + (reg.msg || "\u672A\u77E5\u539F\u56E0") + "\u3002\u8BF7\u8054\u7CFB\u5356\u5BB6\u3002");
@@ -13571,7 +13562,7 @@ var EdbPlugin = class extends Plugin {
     this.cfg.bindMismatch = false;
     this.cfg.revoked = false; /* v1.6.41 新码激活清除撤销标记（恢复激活） */
     /* v1.6.42 重新激活后恢复云端轮询（撤销时定时器已被清理） */
-    if (this.cfg.onlineUrl && !this._checkTimer)
+    if (this.edbOnlineUrl() && !this._checkTimer)
       this._checkTimer = setInterval(() => { this.onlineCheck(); }, 10 * 60 * 1000);
     try {
       await this.saveConfig();

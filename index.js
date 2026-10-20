@@ -6728,7 +6728,9 @@ var EdbPlugin = class extends Plugin {
       onlineUrl: "",
       onlineLastCheck: 0,
       /* v1.6.52 离线超时锁库：超过该天数未连上云端 → 授权失效（防断网规避撤销/到期） */
-      onlineGraceDays: 3
+      onlineGraceDays: 3,
+      /* v1.6.53 单篇独立加密：docId → {salt, hash}（整库解锁后仍需本篇独立密码） */
+      docLocks: {}
     };
     this.state = null;
     this.syncTimer = null;
@@ -8166,11 +8168,23 @@ var EdbPlugin = class extends Plugin {
     try {
       const unlocked = this.isUnlocked();
       const domSet = this.openDocIdsFromDom();
+      if (!this._docUnlocked)
+        this._docUnlocked = new Set();
+      const excl = new Set(this.cfg.excludedDocs || []);
       let needMask = false;
+      let docLockId = null;
       if (!unlocked) {
-        const excl = new Set(this.cfg.excludedDocs || []);
         for (const id in domSet) {
           if (this.cfg.watchlist.includes(id) && !excl.has(id)) {
+            needMask = true;
+            break;
+          }
+        }
+      } else {
+        /* v1.6.53 单篇独立加密：整库已解锁，但该文档设了独立密码且本会话未验证 → 本篇遮罩 */
+        for (const id in domSet) {
+          if (this.cfg.docLocks && this.cfg.docLocks[id] && !this._docUnlocked.has(id)) {
+            docLockId = id;
             needMask = true;
             break;
           }
@@ -8178,20 +8192,50 @@ var EdbPlugin = class extends Plugin {
       }
       let mask = document.getElementById("edb-unlock-mask");
       if (needMask) {
+        const curKey = (docLockId || "vault") + "|" + (unlocked ? "u" : "l");
         if (!mask) {
           mask = document.createElement("div");
           mask.id = "edb-unlock-mask";
           mask.style.cssText = "position:absolute;left:0;top:0;right:0;bottom:0;background:rgba(40,40,40,.5);z-index:2147483000;display:flex;align-items:center;justify-content:center;backdrop-filter:blur(5px);";
-          const inner = document.createElement("div");
-          inner.style.cssText = "background:#fff;color:#333;padding:24px 40px;border-radius:12px;font-size:16px;box-shadow:0 10px 40px rgba(0,0,0,.3);text-align:center;line-height:1.9;";
-          inner.textContent = "\u{1F512} \u5BC6\u5E93\u5DF2\u9501\u5B9A\n\u8BF7\u5148\u5728\u5BC6\u5E93\u9762\u677F\u89E3\u9501\u540E\u518D\u67E5\u770B\u6587\u6863";
-          mask.appendChild(inner);
           const host = document.querySelector(".layout__center") || document.body;
           if (host) {
             if (getComputedStyle(host).position === "static")
               host.style.position = "relative";
             host.appendChild(mask);
           }
+        }
+        if (mask._lockKey !== curKey) {
+          mask._lockKey = curKey;
+          mask.innerHTML = "";
+          const inner = document.createElement("div");
+          inner.style.cssText = "background:#fff;color:#333;padding:24px 40px;border-radius:12px;font-size:16px;box-shadow:0 10px 40px rgba(0,0,0,.3);text-align:center;line-height:1.9;";
+          if (docLockId) {
+            inner.innerHTML = "\u{1F512} \u8BE5\u6587\u6863\u5DF2\u5355\u7BC7\u52A0\u5BC6<br>\u8BF7\u8F93\u5165\u672C\u7BC7\u72EC\u7ACB\u5BC6\u7801\u67E5\u770B";
+            const inp = document.createElement("input");
+            inp.type = "password";
+            inp.style.cssText = "margin-top:10px;padding:6px 10px;font-size:14px;width:220px;border:1px solid #ccc;border-radius:6px;";
+            const btn = document.createElement("button");
+            btn.textContent = "\u89E3\u9501\u67E5\u770B";
+            btn.style.cssText = "margin-top:8px;padding:6px 18px;background:#3370ff;color:#fff;border:none;border-radius:6px;cursor:pointer;";
+            const doVerify = () => {
+              if (this.verifyDocLock(docLockId, inp.value)) {
+                this._docUnlocked.add(docLockId);
+                mask.remove();
+                this.applyDocMask();
+              } else {
+                inp.value = "";
+                inp.placeholder = "\u5BC6\u7801\u9519\u8BEF\uFF0C\u8BF7\u91CD\u8BD5";
+              }
+            };
+            btn.addEventListener("click", doVerify);
+            inp.addEventListener("keydown", (ev) => { if (ev.key === "Enter") doVerify(); });
+            inner.appendChild(inp);
+            inner.appendChild(document.createElement("br"));
+            inner.appendChild(btn);
+          } else {
+            inner.textContent = "\u{1F512} \u5BC6\u5E93\u5DF2\u9501\u5B9A\n\u8BF7\u5148\u5728\u5BC6\u5E93\u9762\u677F\u89E3\u9501\u540E\u518D\u67E5\u770B\u6587\u6863";
+          }
+          mask.appendChild(inner);
         }
       } else if (mask) {
         mask.remove();
@@ -8200,6 +8244,122 @@ var EdbPlugin = class extends Plugin {
     } catch (e) {
       console.error("[siyuan-edb]", e);
     }
+  }
+  /** v1.6.53 单篇独立加密：验证文档独立密码（scrypt，不存明文） */
+  verifyDocLock(id, pwd) {
+    const l = this.cfg.docLocks && this.cfg.docLocks[id];
+    if (!l || !l.salt || !l.hash)
+      return false;
+    try {
+      const h = crypto3.scryptSync(String(pwd || ""), Buffer.from(l.salt, "hex"), 32).toString("hex");
+      return h === l.hash;
+    } catch (e) {
+      return false;
+    }
+  }
+  /** v1.6.53 加密分享导出：文档 Markdown 加密打包为单文件 HTML（对方输密码即可查看，无需插件） */
+  exportShareHtml(docId, pwd) {
+    if (!this.isUnlocked() || !this.state) {
+      showMessage(this.t("needUnlock"));
+      return { ok: false };
+    }
+    if (String(pwd || "").length < 6) {
+      showMessage("\u5206\u4EAB\u5BC6\u7801\u81F3\u5C11 6 \u4F4D");
+      return { ok: false };
+    }
+    const id = String(docId || "").trim();
+    if (!id) {
+      showMessage("\u8BF7\u586B\u5199\u6587\u6863 ID");
+      return { ok: false };
+    }
+    const doc = core.getDoc(this.state.db, id);
+    if (!doc || !doc.markdown) {
+      showMessage("\u5E93\u5185\u65E0\u6B64\u6587\u6863\uFF0C\u8BF7\u5148\u540C\u6B65");
+      return { ok: false };
+    }
+    try {
+      const md = String(doc.markdown || "");
+      if (!md.trim()) {
+        showMessage("\u6587\u6863\u5185\u5BB9\u4E3A\u7A7A");
+        return { ok: false };
+      }
+      const salt = crypto3.randomBytes(16);
+      const key = crypto3.pbkdf2Sync(String(pwd), salt, 100000, 32, "sha256");
+      const iv = crypto3.randomBytes(12);
+      const c = crypto3.createCipheriv("aes-256-gcm", key, iv);
+      const ct = Buffer.concat([c.update(Buffer.from(md, "utf8")), c.final()]);
+      const tag = c.getAuthTag();
+      const b64 = (b) => Buffer.from(b).toString("base64");
+      const title = (doc.title || id).replace(/[<>"&]/g, "");
+      const html = [
+        "<!doctype html><html lang=zh-CN><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><title>" + title + "</title>",
+        "<style>body{font-family:-apple-system,'PingFang SC','Microsoft YaHei',sans-serif;background:#f5f6f8;margin:0;padding:0;color:#222}",
+        ".box{max-width:640px;margin:60px auto;background:#fff;border-radius:12px;padding:36px;box-shadow:0 6px 30px rgba(0,0,0,.08)}",
+        "h1{font-size:20px;margin:0 0 6px}input{width:100%;padding:10px 12px;font-size:15px;border:1px solid #d0d3d9;border-radius:8px;margin:8px 0;box-sizing:border-box}",
+        "button{width:100%;padding:11px;font-size:15px;background:#3370ff;color:#fff;border:none;border-radius:8px;cursor:pointer}",
+        "button:active{opacity:.85}.err{color:#d23f31;font-size:13px;min-height:18px;margin-top:6px}",
+        ".content{max-width:760px;margin:30px auto;background:#fff;border-radius:12px;padding:36px;box-shadow:0 6px 30px rgba(0,0,0,.08);white-space:pre-wrap;word-break:break-word;line-height:1.75;display:none}",
+        ".hint{color:#8a919e;font-size:12px;margin-top:14px;text-align:center}</style></head><body>",
+        "<div class=box id=box><h1>" + title + "</h1><p style='color:#8a919e;font-size:13px'>\u8FD9\u4EFD\u6587\u6863\u5DF2\u52A0\u5BC6\uFF0C\u8BF7\u8F93\u5165\u5206\u4EAB\u5BC6\u7801\u89E3\u9501\u67E5\u770B</p>",
+        "<input type=password id=pwd placeholder='\u8F93\u5165\u5206\u4EAB\u5BC6\u7801' autofocus>",
+        "<button onclick=unlock()>\u89E3\u9501\u67E5\u770B</button><div class=err id=err></div></div>",
+        "<div class=content id=content></div>",
+        "<div class=hint>" + title + " \u00B7 \u5BC6\u5E93\u52A0\u5BC6\u5206\u4EAB</div>",
+        "<script>var S=\"" + b64(salt) + "\",I=\"" + b64(iv) + "\",T=\"" + b64(tag) + "\",C=\"" + b64(ct) + "\";",
+        "function b2a(b){return Uint8Array.from(atob(b),function(c){return c.charCodeAt(0)});}",
+        "async function unlock(){var p=document.getElementById('pwd').value;var e=document.getElementById('err');",
+        "if(!p){e.textContent='\u8BF7\u8F93\u5165\u5BC6\u7801';return;}",
+        "try{var km=await crypto.subtle.importKey('raw',new TextEncoder().encode(p),'PBKDF2',false,['deriveBits']);",
+        "var kb=await crypto.subtle.deriveBits({name:'PBKDF2',salt:b2a(S),iterations:100000,hash:'SHA-256'},km,256);",
+        "var key=await crypto.subtle.importKey('raw',kb,{name:'AES-GCM'},false,['decrypt']);",
+        "var iv=b2a(I);var ct=b2a(C);var tag=b2a(T);var full=new Uint8Array(ct.length+tag.length);full.set(ct);full.set(tag,ct.length);",
+        "var pt=await crypto.subtle.decrypt({name:'AES-GCM',iv:iv,tagLength:128},key,full);",
+        "document.getElementById('box').style.display='none';var c=document.getElementById('content');c.style.display='block';c.textContent=new TextDecoder().decode(pt);",
+        "}catch(x){e.textContent='\u5BC6\u7801\u9519\u8BEF\u6216\u6587\u4EF6\u5DF2\u635F\u574F';}}",
+        "document.getElementById('pwd').addEventListener('keydown',function(ev){if(ev.key==='Enter')unlock();});",
+        "</script></body></html>"
+      ].join("");
+      const dest = path.join(path.dirname(this.cfg.dbPath), "share-" + id.slice(0, 8) + ".html");
+      fs.writeFileSync(dest, html);
+      showMessage("\u2705 \u5DF2\u5BFC\u51FA\u52A0\u5BC6\u5206\u4EAB\uFF1A" + dest + "\uFF08\u5C06\u6B64\u6587\u4EF6+\u5BC6\u7801\u53D1\u7ED9\u5BF9\u65B9\u5373\u53EF\u67E5\u770B\uFF09");
+      return { ok: true, dest };
+    } catch (e) {
+      showMessage("\u5BFC\u51FA\u5931\u8D25\uFF1A" + (e && e.message));
+      return { ok: false };
+    }
+  }
+  /** v1.6.53 设置单篇独立密码（无密码则移除） */
+  setDocLock(id, pwd) {
+    const docId = String(id || "").trim();
+    if (!docId) {
+      showMessage("\u8BF7\u586B\u5199\u6587\u6863 ID");
+      return false;
+    }
+    if (!pwd) {
+      if (this.cfg.docLocks && this.cfg.docLocks[docId])
+        delete this.cfg.docLocks[docId];
+      try {
+        this.saveConfig();
+      } catch (e) {
+      }
+      showMessage("\u5DF2\u79FB\u9664\u8BE5\u6587\u6863\u7684\u5355\u7BC7\u52A0\u5BC6");
+      return true;
+    }
+    if (String(pwd).length < 6) {
+      showMessage("\u5355\u7BC7\u5BC6\u7801\u81F3\u5C11 6 \u4F4D");
+      return false;
+    }
+    const salt = crypto3.randomBytes(16);
+    const hash = crypto3.scryptSync(String(pwd), salt, 32).toString("hex");
+    if (!this.cfg.docLocks)
+      this.cfg.docLocks = {};
+    this.cfg.docLocks[docId] = { salt: salt.toString("hex"), hash };
+    try {
+      this.saveConfig();
+    } catch (e) {
+    }
+    showMessage("\u5DF2\u8BBE\u7F6E\u5355\u7BC7\u52A0\u5BC6\uFF1A" + docId);
+    return true;
   }
   /** 防拍照水印角标：解锁且当前文档已入库 → 右下角浅色激活码尾号 */
   applyWatermark(unlocked, domSet) {
@@ -12096,6 +12256,144 @@ var EdbPlugin = class extends Plugin {
     expNote.textContent = "\u63D0\u793A\uFF1A\u5BFC\u51FA\u5BC6\u7801\u4EC5\u672C\u6B21\u8F93\u5165\u4E0D\u4F1A\u4FDD\u5B58\uFF1B\u6362\u673A\u8BF7\u5148\u5BFC\u51FA .sydbk \uFF0C\u65B0\u673A\u5BFC\u5165\u540E\u91CD\u65B0\u6FC0\u6D3B\uFF08\u4E00\u7801\u4E00\u673A\uFF09";
     expBox.appendChild(expNote);
     box.appendChild(expBox);
+    /* v1.6.53 单篇独立加密管理：为指定文档设置二次密码（整库解锁后仍需本篇密码） */
+    const docBox = document.createElement("div");
+    docBox.style.cssText = "border:1px solid var(--b3-border-color,#333);border-radius:6px;padding:10px;display:flex;flex-direction:column;gap:8px;";
+    const docTitle = document.createElement("div");
+    docTitle.style.cssText = "font-size:14px;font-weight:bold;";
+    docTitle.textContent = "\u{1F510} \u5355\u7BC7\u52A0\u5BC6\uFF08\u6587\u6863\u72EC\u7ACB\u5BC6\u7801\uFF09";
+    docBox.appendChild(docTitle);
+    const curDoc = document.createElement("div");
+    curDoc.style.cssText = "font-size:12px;color:var(--b3-theme-on-background,#666);cursor:pointer;";
+    try {
+      const cur = Object.keys(this.openDocIdsFromDom() || {}).slice(0, 3);
+      curDoc.textContent = "\u5F53\u524D\u6253\u5F00\u6587\u6863\uFF1A" + (cur.length ? cur.join(", ") + "\uFF08\u70B9\u51FB\u586B\u5165\u7B2C\u4E00\u4E2A\uFF09" : "\u65E0");
+      curDoc.onclick = () => {
+        const cur2 = Object.keys(this.openDocIdsFromDom() || {});
+        if (cur2.length) docIdInput.value = cur2[0];
+      };
+    } catch (e) {
+    }
+    docBox.appendChild(curDoc);
+    const docIdInput = document.createElement("input");
+    docIdInput.className = "b3-text-field";
+    docIdInput.placeholder = "\u6587\u6863 ID\uFF08\u6253\u5F00\u540E\u4ECE\u4E0A\u65B9\u70B9\u51FB\u5F53\u524D\u6587\u6863\u586B\u5165\uFF09";
+    const docPwd = document.createElement("input");
+    docPwd.className = "b3-text-field";
+    docPwd.type = "password";
+    docPwd.placeholder = "\u672C\u7BC7\u72EC\u7ACB\u5BC6\u7801\uFF08\u81F3\u5C11 6 \u4F4D\uFF09";
+    const docPwd2 = document.createElement("input");
+    docPwd2.className = "b3-text-field";
+    docPwd2.type = "password";
+    docPwd2.placeholder = "\u786E\u8BA4\u5BC6\u7801";
+    const docSetBtn = document.createElement("button");
+    docSetBtn.textContent = "\u8BBE\u7F6E\u5BC6\u7801";
+    docSetBtn.className = "b3-button";
+    docSetBtn.addEventListener("click", () => {
+      const id = docIdInput.value.trim();
+      if (!id) {
+        showMessage("\u8BF7\u586B\u5199\u6587\u6863 ID");
+        return;
+      }
+      if (docPwd.value !== docPwd2.value) {
+        showMessage("\u4E24\u6B21\u5BC6\u7801\u4E0D\u4E00\u81F4");
+        return;
+      }
+      const ok = this.setDocLock(id, docPwd.value);
+      if (ok) {
+        docPwd.value = "";
+        docPwd2.value = "";
+      }
+    });
+    const docRow = document.createElement("div");
+    docRow.style.cssText = "display:flex;gap:6px;align-items:center;flex-wrap:wrap;";
+    docRow.appendChild(docIdInput);
+    docRow.appendChild(docPwd);
+    docRow.appendChild(docPwd2);
+    docRow.appendChild(docSetBtn);
+    docBox.appendChild(docRow);
+    const docList = document.createElement("div");
+    docList.style.cssText = "display:flex;flex-direction:column;gap:4px;font-size:12px;color:var(--b3-theme-on-background,#666);";
+    const refreshDocList = () => {
+      docList.innerHTML = "";
+      const locks = this.cfg.docLocks || {};
+      const ids = Object.keys(locks);
+      if (!ids.length) {
+        docList.textContent = "\uFF08\u5C1A\u65E0\u5355\u7BC7\u52A0\u5BC6\u7684\u6587\u6863\uFF09";
+        return;
+      }
+      for (const id of ids) {
+        const row = document.createElement("div");
+        row.style.cssText = "display:flex;align-items:center;gap:8px;";
+        const sp = document.createElement("span");
+        sp.style.cssText = "font-family:monospace;";
+        sp.textContent = id;
+        const rm = document.createElement("button");
+        rm.textContent = "\u79FB\u9664";
+        rm.className = "b3-button";
+        rm.style.cssText = "font-size:12px;padding:2px 8px;";
+        rm.addEventListener("click", () => {
+          if (!confirm("\u79FB\u9664\u8BE5\u6587\u6863\u7684\u5355\u7BC7\u52A0\u5BC6\uFF1F")) return;
+          delete this.cfg.docLocks[id];
+          try {
+            this.saveConfig();
+          } catch (e) {
+          }
+          refreshDocList();
+        });
+        row.appendChild(sp);
+        row.appendChild(rm);
+        docList.appendChild(row);
+      }
+    };
+    refreshDocList();
+    docBox.appendChild(docList);
+    box.appendChild(docBox);
+    /* v1.6.53 加密分享导出：文档内容加密为单文件 HTML（对方输密码查看，无需插件） */
+    const shareBox = document.createElement("div");
+    shareBox.style.cssText = "border:1px solid var(--b3-border-color,#333);border-radius:6px;padding:10px;display:flex;flex-direction:column;gap:8px;";
+    const shareTitle = document.createElement("div");
+    shareTitle.style.cssText = "font-size:14px;font-weight:bold;";
+    shareTitle.textContent = "\u{1F4E4} \u52A0\u5BC6\u5206\u4EAB\u5BFC\u51FA\uFF08\u5E26\u5BC6\u7801 HTML\uFF09";
+    shareBox.appendChild(shareTitle);
+    const shareId = document.createElement("input");
+    shareId.className = "b3-text-field";
+    shareId.placeholder = "\u6587\u6863 ID\uFF08\u540C\u5355\u7BC7\u52A0\u5BC6\uFF0C\u53EF\u70B9\u51FB\u4E0A\u65B9\u5F53\u524D\u6253\u5F00\u6587\u6863\u586B\u5165\uFF09";
+    const sharePwd = document.createElement("input");
+    sharePwd.className = "b3-text-field";
+    sharePwd.type = "password";
+    sharePwd.placeholder = "\u5206\u4EAB\u5BC6\u7801\uFF08\u81F3\u5C11 6 \u4F4D\uFF0C\u53D1\u7ED9\u5BF9\u65B9\u65F6\u4E00\u8D77\u544A\u77E5\uFF09";
+    const sharePwd2 = document.createElement("input");
+    sharePwd2.className = "b3-text-field";
+    sharePwd2.type = "password";
+    sharePwd2.placeholder = "\u786E\u8BA4\u5BC6\u7801";
+    const shareBtn = document.createElement("button");
+    shareBtn.textContent = "\u5BFC\u51FA\u52A0\u5BC6\u5206\u4EAB";
+    shareBtn.className = "b3-button";
+    shareBtn.addEventListener("click", () => {
+      const id = shareId.value.trim();
+      if (sharePwd.value !== sharePwd2.value) {
+        showMessage("\u4E24\u6B21\u5BC6\u7801\u4E0D\u4E00\u81F4");
+        return;
+      }
+      const r = this.exportShareHtml(id, sharePwd.value);
+      if (r && r.ok) {
+        sharePwd.value = "";
+        sharePwd2.value = "";
+      }
+    });
+    const shareRow = document.createElement("div");
+    shareRow.style.cssText = "display:flex;gap:6px;align-items:center;flex-wrap:wrap;";
+    shareRow.appendChild(shareId);
+    shareRow.appendChild(sharePwd);
+    shareRow.appendChild(sharePwd2);
+    shareRow.appendChild(shareBtn);
+    shareBox.appendChild(shareRow);
+    const shareNote = document.createElement("div");
+    shareNote.style.cssText = "font-size:12px;color:var(--b3-theme-on-background,#666);";
+    shareNote.textContent = "\u63D0\u793A\uFF1A\u5BFC\u51FA\u4E3A\u5355\u6587\u4EF6 .html\uFF08\u5B58\u5728\u5BC6\u5E93\u540C\u76EE\u5F55\uFF09\uFF0C\u5BF9\u65B9\u7528\u6D4F\u89C8\u5668\u6253\u5F00\u8F93\u5165\u5BC6\u7801\u5373\u53EF\u67E5\u770B\uFF0C\u65E0\u9700\u5B89\u88C5\u63D2\u4EF6\u3002\u76EE\u524D\u4E3A\u7EAF\u6587\u672C\u6B63\u6587\uFF08\u56FE\u7247\u89C6\u9891\u4E0D\u5305\u542B\uFF09";
+    shareBox.appendChild(shareNote);
+    box.appendChild(shareBox);
     const secBox = document.createElement("div");
     secBox.style.cssText = "border:1px solid var(--b3-border-color,#333);border-radius:6px;padding:10px;display:flex;flex-direction:column;gap:8px;";
     const secTitle = document.createElement("div");

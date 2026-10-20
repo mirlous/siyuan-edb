@@ -8210,12 +8210,12 @@ var EdbPlugin = class extends Plugin {
           const inner = document.createElement("div");
           inner.style.cssText = "background:#fff;color:#333;padding:24px 40px;border-radius:12px;font-size:16px;box-shadow:0 10px 40px rgba(0,0,0,.3);text-align:center;line-height:1.9;";
           if (docLockId) {
-            inner.innerHTML = "\u{1F512} \u8BE5\u6587\u6863\u5DF2\u5355\u7BC7\u52A0\u5BC6<br>\u8BF7\u8F93\u5165\u672C\u7BC7\u72EC\u7ACB\u5BC6\u7801\u67E5\u770B";
+            inner.innerHTML = "\u{1F512} " + this.t("doclockMaskTitle").replace("<", "").replace(">", "") + "<br>" + "\u8BF7\u8F93\u5165\u5BC6\u7801";
             const inp = document.createElement("input");
             inp.type = "password";
             inp.style.cssText = "margin-top:10px;padding:6px 10px;font-size:14px;width:220px;border:1px solid #ccc;border-radius:6px;";
             const btn = document.createElement("button");
-            btn.textContent = "\u89E3\u9501\u67E5\u770B";
+            btn.textContent = this.t("doclockUnlockBtn");
             btn.style.cssText = "margin-top:8px;padding:6px 18px;background:#3370ff;color:#fff;border:none;border-radius:6px;cursor:pointer;";
             const doVerify = () => {
               if (this.verifyDocLock(docLockId, inp.value)) {
@@ -8224,7 +8224,7 @@ var EdbPlugin = class extends Plugin {
                 this.applyDocMask();
               } else {
                 inp.value = "";
-                inp.placeholder = "\u5BC6\u7801\u9519\u8BEF\uFF0C\u8BF7\u91CD\u8BD5";
+                inp.placeholder = this.t("doclockWrongPh");
               }
             };
             btn.addEventListener("click", doVerify);
@@ -8233,7 +8233,7 @@ var EdbPlugin = class extends Plugin {
             inner.appendChild(document.createElement("br"));
             inner.appendChild(btn);
           } else {
-            inner.textContent = "\u{1F512} \u5BC6\u5E93\u5DF2\u9501\u5B9A\n\u8BF7\u5148\u5728\u5BC6\u5E93\u9762\u677F\u89E3\u9501\u540E\u518D\u67E5\u770B\u6587\u6863";
+            inner.textContent = "\u{1F512} " + this.t("maskLocked");
           }
           mask.appendChild(inner);
         }
@@ -8264,23 +8264,23 @@ var EdbPlugin = class extends Plugin {
       return { ok: false };
     }
     if (String(pwd || "").length < 6) {
-      showMessage("\u5206\u4EAB\u5BC6\u7801\u81F3\u5C11 6 \u4F4D");
+      showMessage(this.t("doclockPwdShort"));
       return { ok: false };
     }
     const id = String(docId || "").trim();
     if (!id) {
-      showMessage("\u8BF7\u586B\u5199\u6587\u6863 ID");
+      showMessage(this.t("doclockNeedId"));
       return { ok: false };
     }
     const doc = core.getDoc(this.state.db, id);
     if (!doc || !doc.markdown) {
-      showMessage("\u5E93\u5185\u65E0\u6B64\u6587\u6863\uFF0C\u8BF7\u5148\u540C\u6B65");
+      showMessage(this.t("shareNoDoc"));
       return { ok: false };
     }
     try {
       const md = String(doc.markdown || "");
       if (!md.trim()) {
-        showMessage("\u6587\u6863\u5185\u5BB9\u4E3A\u7A7A");
+        showMessage(this.t("shareEmpty"));
         return { ok: false };
       }
       const salt = crypto3.randomBytes(16);
@@ -8321,10 +8321,10 @@ var EdbPlugin = class extends Plugin {
       ].join("");
       const dest = path.join(path.dirname(this.cfg.dbPath), "share-" + id.slice(0, 8) + ".html");
       fs.writeFileSync(dest, html);
-      showMessage("\u2705 \u5DF2\u5BFC\u51FA\u52A0\u5BC6\u5206\u4EAB\uFF1A" + dest + "\uFF08\u5C06\u6B64\u6587\u4EF6+\u5BC6\u7801\u53D1\u7ED9\u5BF9\u65B9\u5373\u53EF\u67E5\u770B\uFF09");
+      showMessage("\u2705 " + this.t("shareDone") + dest + this.t("shareDoneHint"));
       return { ok: true, dest };
     } catch (e) {
-      showMessage("\u5BFC\u51FA\u5931\u8D25\uFF1A" + (e && e.message));
+      showMessage(this.t("shareFail") + (e && e.message));
       return { ok: false };
     }
   }
@@ -8332,7 +8332,7 @@ var EdbPlugin = class extends Plugin {
   setDocLock(id, pwd) {
     const docId = String(id || "").trim();
     if (!docId) {
-      showMessage("\u8BF7\u586B\u5199\u6587\u6863 ID");
+      showMessage(this.t("doclockNeedId"));
       return false;
     }
     if (!pwd) {
@@ -8342,11 +8342,11 @@ var EdbPlugin = class extends Plugin {
         this.saveConfig();
       } catch (e) {
       }
-      showMessage("\u5DF2\u79FB\u9664\u8BE5\u6587\u6863\u7684\u5355\u7BC7\u52A0\u5BC6");
+      showMessage(this.t("doclockRemoved"));
       return true;
     }
     if (String(pwd).length < 6) {
-      showMessage("\u5355\u7BC7\u5BC6\u7801\u81F3\u5C11 6 \u4F4D");
+      showMessage(this.t("doclockPwdShort"));
       return false;
     }
     const salt = crypto3.randomBytes(16);
@@ -8358,7 +8358,7 @@ var EdbPlugin = class extends Plugin {
       this.saveConfig();
     } catch (e) {
     }
-    showMessage("\u5DF2\u8BBE\u7F6E\u5355\u7BC7\u52A0\u5BC6\uFF1A" + docId);
+    showMessage(this.t("doclockSetOk") + docId);
     return true;
   }
   /** 防拍照水印角标：解锁且当前文档已入库 → 右下角浅色激活码尾号 */
@@ -9678,12 +9678,12 @@ var EdbPlugin = class extends Plugin {
         if (!this.isLicensed()) {
           const offlineLock = this.edbOnlineUrl() && this.cfg.onlineLastCheck && (this.nowTs() - this.cfg.onlineLastCheck) > (this.cfg.onlineGraceDays || 3) * 864e5;
           const expMsg = this.cfg.revoked
-            ? "\u23F3 \u6388\u6743\u5DF2\u88AB\u5356\u5BB6\u64A4\u9500\uFF1A\u5BC6\u5E93\u6570\u636E\u5B8C\u6574\u4FDD\u7559\uFF0C\u8BF7\u8054\u7CFB\u5356\u5BB6\u91CD\u65B0\u6FC0\u6D3B\u540E\u6062\u590D\u67E5\u770B\u3002"
+            ? "\u23F3 " + this.t("licRevoked")
             : offlineLock
-              ? "\u23F3 \u957F\u671F\u672A\u8054\u7F51\u9A8C\u8BC1\uFF08\u8D85\u8FC7 " + (this.cfg.onlineGraceDays || 3) + " \u5929\uFF09\uFF1A\u5BC6\u5E93\u6570\u636E\u5B8C\u6574\u4FDD\u7559\uFF0C\u8BF7\u8054\u7F51\u540E\u91CD\u65B0\u89E3\u9501\u9A8C\u8BC1\u3002"
+              ? "\u23F3 " + this.t("offlineLockMsg").replace("{0}", this.cfg.onlineGraceDays || 3)
               : !this.licState
-                ? "\u23F3 \u8BD5\u7528\u5DF2\u7ED3\u675F\uFF1A\u5BC6\u5E93\u6570\u636E\u5B8C\u6574\u4FDD\u7559\u3002\u8D2D\u4E70\u6FC0\u6D3B\u7801\u5728\u300C\u{1F511} \u6388\u6743\u6FC0\u6D3B\u300D\u8F93\u5165\u5373\u53EF\u89E3\u9501\uFF08\u6708 9.9 \u5143 / \u534A\u5E74 29.9 / \u5E74 49.9 / \u6C38\u4E45 99\uFF09\uFF0C\u8054\u7CFB\u5356\u5BB6\u8D2D\u4E70\u3002"
-                : "\u23F3 \u6388\u6743\u5DF2\u5230\u671F\uFF1A\u5BC6\u5E93\u6570\u636E\u5B8C\u6574\u4FDD\u7559\u3002\u8BF7\u8D2D\u4E70\u65B0\u6FC0\u6D3B\u7801\uFF0C\u5728\u300C\u{1F511} \u6388\u6743\u6FC0\u6D3B\u300D\u8F93\u5165\u540E\u81EA\u52A8\u7EED\u8D39\u6062\u590D\u89E3\u9501\u3002";
+                ? "\u23F3 " + this.t("trialOverMsg")
+                : "\u23F3 " + this.t("licExpired");
           setTimeout(() => showMessage(expMsg), 1500);
         }
         const chk = this.integrityCheck();
@@ -12261,13 +12261,13 @@ var EdbPlugin = class extends Plugin {
     docBox.style.cssText = "border:1px solid var(--b3-border-color,#333);border-radius:6px;padding:10px;display:flex;flex-direction:column;gap:8px;";
     const docTitle = document.createElement("div");
     docTitle.style.cssText = "font-size:14px;font-weight:bold;";
-    docTitle.textContent = "\u{1F510} \u5355\u7BC7\u52A0\u5BC6\uFF08\u6587\u6863\u72EC\u7ACB\u5BC6\u7801\uFF09";
+    docTitle.textContent = this.t("doclockTitle");
     docBox.appendChild(docTitle);
     const curDoc = document.createElement("div");
     curDoc.style.cssText = "font-size:12px;color:var(--b3-theme-on-background,#666);cursor:pointer;";
     try {
       const cur = Object.keys(this.openDocIdsFromDom() || {}).slice(0, 3);
-      curDoc.textContent = "\u5F53\u524D\u6253\u5F00\u6587\u6863\uFF1A" + (cur.length ? cur.join(", ") + "\uFF08\u70B9\u51FB\u586B\u5165\u7B2C\u4E00\u4E2A\uFF09" : "\u65E0");
+      curDoc.textContent = this.t("doclockCur") + (cur.length ? cur.join(", ") + this.t("doclockCurClick") : this.t("doclockCurNone"));
       curDoc.onclick = () => {
         const cur2 = Object.keys(this.openDocIdsFromDom() || {});
         if (cur2.length) docIdInput.value = cur2[0];
@@ -12277,26 +12277,26 @@ var EdbPlugin = class extends Plugin {
     docBox.appendChild(curDoc);
     const docIdInput = document.createElement("input");
     docIdInput.className = "b3-text-field";
-    docIdInput.placeholder = "\u6587\u6863 ID\uFF08\u6253\u5F00\u540E\u4ECE\u4E0A\u65B9\u70B9\u51FB\u5F53\u524D\u6587\u6863\u586B\u5165\uFF09";
+    docIdInput.placeholder = this.t("doclockIdPh");
     const docPwd = document.createElement("input");
     docPwd.className = "b3-text-field";
     docPwd.type = "password";
-    docPwd.placeholder = "\u672C\u7BC7\u72EC\u7ACB\u5BC6\u7801\uFF08\u81F3\u5C11 6 \u4F4D\uFF09";
+    docPwd.placeholder = this.t("doclockPwdPh");
     const docPwd2 = document.createElement("input");
     docPwd2.className = "b3-text-field";
     docPwd2.type = "password";
-    docPwd2.placeholder = "\u786E\u8BA4\u5BC6\u7801";
+    docPwd2.placeholder = this.t("doclockPwd2Ph");
     const docSetBtn = document.createElement("button");
-    docSetBtn.textContent = "\u8BBE\u7F6E\u5BC6\u7801";
+    docSetBtn.textContent = this.t("doclockSet");
     docSetBtn.className = "b3-button";
     docSetBtn.addEventListener("click", () => {
       const id = docIdInput.value.trim();
       if (!id) {
-        showMessage("\u8BF7\u586B\u5199\u6587\u6863 ID");
+        showMessage(this.t("doclockNeedId"));
         return;
       }
       if (docPwd.value !== docPwd2.value) {
-        showMessage("\u4E24\u6B21\u5BC6\u7801\u4E0D\u4E00\u81F4");
+        showMessage(this.t("doclockPwdMismatch"));
         return;
       }
       const ok = this.setDocLock(id, docPwd.value);
@@ -12319,7 +12319,7 @@ var EdbPlugin = class extends Plugin {
       const locks = this.cfg.docLocks || {};
       const ids = Object.keys(locks);
       if (!ids.length) {
-        docList.textContent = "\uFF08\u5C1A\u65E0\u5355\u7BC7\u52A0\u5BC6\u7684\u6587\u6863\uFF09";
+        docList.textContent = this.t("doclockEmpty");
         return;
       }
       for (const id of ids) {
@@ -12329,11 +12329,11 @@ var EdbPlugin = class extends Plugin {
         sp.style.cssText = "font-family:monospace;";
         sp.textContent = id;
         const rm = document.createElement("button");
-        rm.textContent = "\u79FB\u9664";
+        rm.textContent = this.t("doclockRemove");
         rm.className = "b3-button";
         rm.style.cssText = "font-size:12px;padding:2px 8px;";
         rm.addEventListener("click", () => {
-          if (!confirm("\u79FB\u9664\u8BE5\u6587\u6863\u7684\u5355\u7BC7\u52A0\u5BC6\uFF1F")) return;
+          if (!confirm(this.t("doclockRemoveAsk"))) return;
           delete this.cfg.docLocks[id];
           try {
             this.saveConfig();
@@ -12354,26 +12354,26 @@ var EdbPlugin = class extends Plugin {
     shareBox.style.cssText = "border:1px solid var(--b3-border-color,#333);border-radius:6px;padding:10px;display:flex;flex-direction:column;gap:8px;";
     const shareTitle = document.createElement("div");
     shareTitle.style.cssText = "font-size:14px;font-weight:bold;";
-    shareTitle.textContent = "\u{1F4E4} \u52A0\u5BC6\u5206\u4EAB\u5BFC\u51FA\uFF08\u5E26\u5BC6\u7801 HTML\uFF09";
+    shareTitle.textContent = this.t("shareTitle");
     shareBox.appendChild(shareTitle);
     const shareId = document.createElement("input");
     shareId.className = "b3-text-field";
-    shareId.placeholder = "\u6587\u6863 ID\uFF08\u540C\u5355\u7BC7\u52A0\u5BC6\uFF0C\u53EF\u70B9\u51FB\u4E0A\u65B9\u5F53\u524D\u6253\u5F00\u6587\u6863\u586B\u5165\uFF09";
+    shareId.placeholder = this.t("shareIdPh");
     const sharePwd = document.createElement("input");
     sharePwd.className = "b3-text-field";
     sharePwd.type = "password";
-    sharePwd.placeholder = "\u5206\u4EAB\u5BC6\u7801\uFF08\u81F3\u5C11 6 \u4F4D\uFF0C\u53D1\u7ED9\u5BF9\u65B9\u65F6\u4E00\u8D77\u544A\u77E5\uFF09";
+    sharePwd.placeholder = this.t("sharePwdPh");
     const sharePwd2 = document.createElement("input");
     sharePwd2.className = "b3-text-field";
     sharePwd2.type = "password";
-    sharePwd2.placeholder = "\u786E\u8BA4\u5BC6\u7801";
+    sharePwd2.placeholder = this.t("sharePwd2Ph");
     const shareBtn = document.createElement("button");
-    shareBtn.textContent = "\u5BFC\u51FA\u52A0\u5BC6\u5206\u4EAB";
+    shareBtn.textContent = this.t("shareBtn");
     shareBtn.className = "b3-button";
     shareBtn.addEventListener("click", () => {
       const id = shareId.value.trim();
       if (sharePwd.value !== sharePwd2.value) {
-        showMessage("\u4E24\u6B21\u5BC6\u7801\u4E0D\u4E00\u81F4");
+        showMessage(this.t("sharePwdMismatch"));
         return;
       }
       const r = this.exportShareHtml(id, sharePwd.value);
@@ -12391,7 +12391,7 @@ var EdbPlugin = class extends Plugin {
     shareBox.appendChild(shareRow);
     const shareNote = document.createElement("div");
     shareNote.style.cssText = "font-size:12px;color:var(--b3-theme-on-background,#666);";
-    shareNote.textContent = "\u63D0\u793A\uFF1A\u5BFC\u51FA\u4E3A\u5355\u6587\u4EF6 .html\uFF08\u5B58\u5728\u5BC6\u5E93\u540C\u76EE\u5F55\uFF09\uFF0C\u5BF9\u65B9\u7528\u6D4F\u89C8\u5668\u6253\u5F00\u8F93\u5165\u5BC6\u7801\u5373\u53EF\u67E5\u770B\uFF0C\u65E0\u9700\u5B89\u88C5\u63D2\u4EF6\u3002\u76EE\u524D\u4E3A\u7EAF\u6587\u672C\u6B63\u6587\uFF08\u56FE\u7247\u89C6\u9891\u4E0D\u5305\u542B\uFF09";
+    shareNote.textContent = this.t("shareNote");
     shareBox.appendChild(shareNote);
     box.appendChild(shareBox);
     const secBox = document.createElement("div");

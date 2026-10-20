@@ -1,5 +1,9 @@
 # Changelog
 
+## v1.6.54 (2026-10-20)
+
+- **🌐 English i18n completed**: All new features (doc-level encryption, encrypted share export, offline lock, trial purchase guide, revocation messages) now show full English UI and prompts for English users.
+
 ## v1.6.53 (2026-10-20)
 
 - **🔐 单篇独立加密**：可为指定文档设置二次密码——整库解锁后仍需输入本篇密码才能查看，真正做到"单篇级"保密。

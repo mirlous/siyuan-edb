@@ -1,5 +1,10 @@
 # Changelog
 
+## v1.6.55 (2026-10-20)
+
+- **🛒 购买激活码（扫码点单半自动）**：面板内置购买区——扫码点单付款 → 填微信支付单号 → 卖家核对后自动发码，买家面板直接拿到激活码。
+- **🧾 卖家面板「待核对订单」**：一键查看买家购买请求（套餐/支付单号/时间），核对收款后填码发码。
+
 ## v1.6.54 (2026-10-20)
 
 - **🌐 English i18n completed**: All new features (doc-level encryption, encrypted share export, offline lock, trial purchase guide, revocation messages) now show full English UI and prompts for English users.

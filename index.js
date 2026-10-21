@@ -10915,7 +10915,7 @@ var EdbPlugin = class extends Plugin {
   /** 当前插件版本（与 plugin.json 同步，发布时手工更新） */
   curVersion() {
     /* v1.6.63 必须与 plugin.json 的 version 保持一致（每次发版两处同步改） */
-    return "1.6.64";
+    return "1.6.65";
   }
   versionAtLeast(latest, cur) {
     const p = (s) => String(s || "").split(".").map((x) => parseInt(x, 10) || 0);
@@ -14117,7 +14117,7 @@ var EdbPlugin = class extends Plugin {
     if (!info)
       return false;
     const hw = this.hwId();
-    if (info.k && hw && !hw.startsWith(info.k))
+    if (info.k && hw && !hw.toUpperCase().startsWith(String(info.k).toUpperCase()))
       return false;
     return this.nowTs() < info.exp;
   }
@@ -14152,7 +14152,7 @@ var EdbPlugin = class extends Plugin {
       if (!info)
         return;
       const hw = this.hwId();
-      if (info.k && hw && !hw.startsWith(info.k))
+      if (info.k && hw && !hw.toUpperCase().startsWith(String(info.k).toUpperCase()))
         return;
       this.cfg.trialLease = String(j.lease);
       this.cfg.trialLeaseExp = info.exp;
@@ -14195,7 +14195,7 @@ var EdbPlugin = class extends Plugin {
     if (!info)
       throw new Error("租约验签失败（可能被篡改）");
     const hw = this.hwId();
-    if (info.k && !hw.startsWith(info.k))
+    if (info.k && !hw.toUpperCase().startsWith(String(info.k).toUpperCase()))
       throw new Error("租约与当前设备不匹配");
     this.cfg.trialLease = String(j.lease);
     this.cfg.trialLeaseExp = Number(j.exp) || info.exp;

@@ -68,7 +68,7 @@
   "notVaultFile": "该文件不是密库文件",
   "restoredNote": "恢复的文档会创建在原笔记本下",
   "licTitle": "授权激活",
-  "licContact": "购买激活码请联系微信：nglzhy（月 9.9 / 半年 29.9 / 年 49.9 / 永久 99 元）",
+  "licContact": "在使用过程中遇到问题或有好想法都可以联系微信：nglzhy",
   "licStatusNone": "未激活 · 此插件为付费授权使用，购买激活码请加微信：nglzhy",
   "licStatusOk": "已激活 · 有效期至",
   "licStatusForever": "已激活 · 永久使用",

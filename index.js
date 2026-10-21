@@ -6541,7 +6541,7 @@ var FALLBACK = {
   settingSaved: "\u8BBE\u7F6E\u5DF2\u4FDD\u5B58",
   newVault: "\u65B0\u5EFA\u5BC6\u5E93",
   licTitle: "\u6388\u6743\u6FC0\u6D3B",
-  licContact: "\u8D2D\u4E70\u6FC0\u6D3B\u7801\u8BF7\u8054\u7CFB\u5FAE\u4FE1\uFF1Anglzhy\uFF08\u6708 9.9 / \u534A\u5E74 29.9 / \u5E74 49.9 / \u6C38\u4E45 99 \u5143\uFF09",
+  licContact: "\u5728\u4F7F\u7528\u8FC7\u7A0B\u4E2D\u9047\u5230\u95EE\u9898\u6216\u6709\u597D\u60F3\u6CD5\u90FD\u53EF\u4EE5\u8054\u7CFB\u5FAE\u4FE1\uFF1Anglzhy",
   licStatusNone: "\u672A\u6FC0\u6D3B \xB7 \u6B64\u63D2\u4EF6\u4E3A\u4ED8\u8D39\u6388\u6743\u4F7F\u7528\uFF0C\u8D2D\u4E70\u6FC0\u6D3B\u7801\u8BF7\u52A0\u5FAE\u4FE1\uFF1Anglzhy",
   licStatusOk: "\u5DF2\u6FC0\u6D3B \xB7 \u6709\u6548\u671F\u81F3",
   licStatusForever: "\u5DF2\u6FC0\u6D3B \xB7 \u6C38\u4E45\u4F7F\u7528",
@@ -12820,7 +12820,8 @@ var EdbPlugin = class extends Plugin {
     totpBox.appendChild(totpStatus);
     totpBox.appendChild(totpRow);
     totpBox.appendChild(totpArea);
-    box.appendChild(totpBox);
+    /* v1.6.57 安全设置区块（TOTP/防篡改）不对买家展示，功能保留（已开启者仍生效），仅隐藏设置入口 */
+    // box.appendChild(totpBox);
     const tamperBox = document.createElement("div");
     tamperBox.style.cssText = "border:1px solid var(--b3-border-color,#333);border-radius:6px;padding:10px;display:flex;flex-direction:column;gap:8px;";
     const tamperTitle = document.createElement("div");
@@ -12869,7 +12870,7 @@ var EdbPlugin = class extends Plugin {
     tamperBox._chk = tamperChk;
     tamperBox._min = tamperMin;
     tamperBox._upd = updInput;
-    box.appendChild(tamperBox);
+    // box.appendChild(tamperBox);
     const vdBox = document.createElement("div");
     vdBox.style.cssText = "border:1px solid var(--b3-border-color,#333);border-radius:6px;padding:10px;display:flex;flex-direction:column;gap:8px;";
     const vdTitle = document.createElement("div");

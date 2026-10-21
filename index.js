@@ -10906,7 +10906,8 @@ var EdbPlugin = class extends Plugin {
   }
   /** 当前插件版本（与 plugin.json 同步，发布时手工更新） */
   curVersion() {
-    return "1.4.0";
+    /* v1.6.62 必须与 plugin.json 的 version 保持一致（每次发版两处同步改） */
+    return "1.6.62";
   }
   versionAtLeast(latest, cur) {
     const p = (s) => String(s || "").split(".").map((x) => parseInt(x, 10) || 0);
@@ -13788,13 +13789,32 @@ var EdbPlugin = class extends Plugin {
         body: JSON.stringify({ code: this.licState.n, fp: this.licState.fp, activatedAt: this.licState.activatedAt || 0, expAt: this.licState.expAt || 0 })
       });
       const j = await res.json();
-      this.cfg.onlineLastCheck = Date.now();
-      /* v1.6.40 服务器时间锚点：在线时校准本地时间（防改系统时间绕过到期）；离线用最后一次锚点+clockRollback 兜底 */
-      if (j.serverTime)
-        this.cfg.srvTime = { s: Number(j.serverTime), l: Date.now() };
-      try {
-        await this.saveConfig();
-      } catch (e) {
+      /* v1.6.62 降频落盘：原先每 10 分钟校验后都 saveConfig() → petal 内 config.json 变化 → 思源监听到数据变更会整插件 reload
+         （实测 temp\siyuan.log 每 10 分钟一条 dataChanges=[siyuan-edb]）。改为：
+           ① 本地时钟相对服务器锚点漂移 >2 分钟（含用户改系统时间）才刷新锚点并落盘；
+           ② 距上次落盘 >6 小时才更新 onlineLastCheck 并落盘（离线锁宽限 3 天，足够）。
+         注意 srvTime 只在写盘时更新，保证 {s,l} 是同一时刻的一对（nowTs() 外推仍然准确）。 */
+      const nowMs = Date.now();
+      const prevSrvS = this.cfg.srvTime && Number(this.cfg.srvTime.s) || 0;
+      const prevSaveL = this.cfg.srvTime && Number(this.cfg.srvTime.l) || 0;
+      let _dirty = false;
+      if (j.serverTime) {
+        const srvMs = Number(j.serverTime) || 0;
+        const expect = prevSrvS && prevSaveL ? prevSrvS + (nowMs - prevSaveL) : 0;
+        if (!expect || Math.abs(srvMs - expect) > 12e4) {
+          this.cfg.srvTime = { s: srvMs, l: nowMs };
+          _dirty = true;
+        }
+      }
+      if (!this.cfg.onlineLastCheck || nowMs - Number(this.cfg.onlineLastCheck) > 6 * 36e5) {
+        this.cfg.onlineLastCheck = nowMs;
+        _dirty = true;
+      }
+      if (_dirty) {
+        try {
+          await this.saveConfig();
+        } catch (e) {
+        }
       }
       if (j.revoked) {
         showMessage("\u26D4 \u6B64\u6FC0\u6D3B\u7801\u5DF2\u88AB\u5356\u5BB6\u64A4\u9500\uFF0C\u8BF7\u8054\u7CFB\u5356\u5BB6\u3002\u5FAE\u4FE1\uFF1Anglzhy");
@@ -13826,9 +13846,15 @@ var EdbPlugin = class extends Plugin {
         return;
       }
       if (j.official && j.official.sha) {
+        /* v1.6.62 官方指纹比对改为「同版本才比对」：服务器 official.json 落后（此前停在 1.6.43）时，
+           老逻辑会让所有新版本买家每 10 分钟被误报"插件被修改"。只有服务器声明的版本与本机一致时才校验哈希；
+           版本不同 = 官方清单未更新，跳过（不误伤）。 */
         try {
           const self = await this.loadSelfHash();
-          if (self && self !== j.official.sha) {
+          const cur = String(this.curVersion() || "").trim();
+          const ov = String(j.official.version || "").trim();
+          const sameVer = !!ov && !!cur && cur === ov;
+          if (self && j.official.sha !== self && sameVer) {
             showMessage("\u26A0 \u68C0\u6D4B\u5230\u672C\u5730\u63D2\u4EF6\u6587\u4EF6\u4E0E\u5B98\u65B9\u7248\u672C\u4E0D\u4E00\u81F4\uFF0C\u53EF\u80FD\u88AB\u4FEE\u6539\u3002\u8BF7\u4ECE\u5B98\u65B9\u6E20\u9053\u91CD\u65B0\u5B89\u88C5\uFF0C\u5FAE\u4FE1\uFF1Anglzhy\u3002");
           }
         } catch (e) {

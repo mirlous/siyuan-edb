@@ -12820,8 +12820,7 @@ var EdbPlugin = class extends Plugin {
     totpBox.appendChild(totpStatus);
     totpBox.appendChild(totpRow);
     totpBox.appendChild(totpArea);
-    /* v1.6.57 安全设置区块（TOTP/防篡改）不对买家展示，功能保留（已开启者仍生效），仅隐藏设置入口 */
-    // box.appendChild(totpBox);
+    box.appendChild(totpBox);
     const tamperBox = document.createElement("div");
     tamperBox.style.cssText = "border:1px solid var(--b3-border-color,#333);border-radius:6px;padding:10px;display:flex;flex-direction:column;gap:8px;";
     const tamperTitle = document.createElement("div");
@@ -12870,7 +12869,7 @@ var EdbPlugin = class extends Plugin {
     tamperBox._chk = tamperChk;
     tamperBox._min = tamperMin;
     tamperBox._upd = updInput;
-    // box.appendChild(tamperBox);
+    box.appendChild(tamperBox);
     const vdBox = document.createElement("div");
     vdBox.style.cssText = "border:1px solid var(--b3-border-color,#333);border-radius:6px;padding:10px;display:flex;flex-direction:column;gap:8px;";
     const vdTitle = document.createElement("div");

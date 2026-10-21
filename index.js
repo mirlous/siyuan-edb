@@ -6722,6 +6722,9 @@ var EdbPlugin = class extends Plugin {
       trialStart: 0,
       trialH: "",
       trialTampered: false,
+      /* v1.6.63 试用锚点：trialSrv=云端首次试用时间(ms)，trialSyncAt=上次同步时间(ms) */
+      trialSrv: 0,
+      trialSyncAt: 0,
       authTampered: false,
       lastSeen: 0,
       idleLockMin: 15,
@@ -10906,8 +10909,8 @@ var EdbPlugin = class extends Plugin {
   }
   /** 当前插件版本（与 plugin.json 同步，发布时手工更新） */
   curVersion() {
-    /* v1.6.62 必须与 plugin.json 的 version 保持一致（每次发版两处同步改） */
-    return "1.6.62";
+    /* v1.6.63 必须与 plugin.json 的 version 保持一致（每次发版两处同步改） */
+    return "1.6.63";
   }
   versionAtLeast(latest, cur) {
     const p = (s) => String(s || "").split(".").map((x) => parseInt(x, 10) || 0);
@@ -13697,13 +13700,26 @@ var EdbPlugin = class extends Plugin {
       }
     }
     if (!this.licState && !this.cfg.clockRollback) {
-      if (!this.cfg.trialStart) {
+      /* v1.6.63 试用锚点：本地 / 本机镜像（跨工作区、跨重装）/ 云端锚点 三处取最早，防删配置重置试用 */
+      const eff0 = this.refreshTrialEff();
+      let changed0 = false;
+      if (!eff0) {
         this.cfg.trialStart = Date.now();
+        changed0 = true;
+      } else if (eff0 !== Number(this.cfg.trialStart)) {
+        this.cfg.trialStart = eff0;
+        changed0 = true;
+      }
+      if (changed0) {
         try {
           await this.saveConfig();
         } catch (e) {
         }
+        this.refreshTrialEff();
       }
+      if (this.cfg.trialStart)
+        this.writeTrialMirror(this.cfg.trialStart);
+      this.syncTrialAnchor().catch(() => {});
     }
     if (this.licState && this.licState.expAt && this.cfg.licWarnShown !== String(this.licState.expAt)) {
       const left = this.licState.expAt - this.nowTs();
@@ -13903,21 +13919,113 @@ var EdbPlugin = class extends Plugin {
     }
     return this.isTrialValid();
   }
+  /* ============ v1.6.63 试用锚点（本地 / 本机镜像 / 云端 三处取最早） ============ */
+  /** 本机镜像文件路径（用户目录，跨工作区/跨重装同机保留） */
+  trialMirrorPath() {
+    try {
+      const os = require("os");
+      const fp = lic.deviceFingerprint();
+      const h = crypto2.createHash("sha256").update(String(fp)).digest("hex").slice(0, 16);
+      return path.join(os.homedir(), ".siyuan-edb", "trial-" + h + ".json");
+    } catch (e) {
+      return "";
+    }
+  }
+  readTrialMirror() {
+    try {
+      const p = this.trialMirrorPath();
+      if (!p || !fs.existsSync(p))
+        return 0;
+      const j = JSON.parse(fs.readFileSync(p, "utf8"));
+      const st = Number(j && j.t) || 0;
+      if (!st)
+        return 0;
+      if (j.h && j.h !== lic.authHmac("trial", st))
+        return 0;
+      return st;
+    } catch (e) {
+      return 0;
+    }
+  }
+  writeTrialMirror(start) {
+    try {
+      const st = Number(start) || 0;
+      const p = this.trialMirrorPath();
+      if (!p || !st)
+        return;
+      fs.mkdirSync(path.dirname(p), { recursive: true });
+      fs.writeFileSync(p, JSON.stringify({ t: st, h: lic.authHmac("trial", st), v: "" }), "utf8");
+    } catch (e) {
+    }
+  }
+  /** 计算生效试用起点（三者取最早）并缓存 */
+  refreshTrialEff() {
+    const vals = [Number(this.cfg.trialStart) || 0, this.readTrialMirror(), Number(this.cfg.trialSrv) || 0].filter((x) => x > 0);
+    this._trialEff = vals.length ? Math.min.apply(null, vals) : 0;
+    return this._trialEff;
+  }
+  /** 云端试用锚点同步（12 小时节流；失败静默，离线不影响试用） */
+  async syncTrialAnchor(force) {
+    if (this.licState)
+      return;
+    const fp = lic.deviceFingerprint();
+    if (!fp)
+      return;
+    const now = Date.now();
+    if (!force && this.cfg.trialSyncAt && now - this.cfg.trialSyncAt < 12 * 36e5)
+      return;
+    const base = String(this.edbOnlineUrl() || "").replace(/\/+$/, "").replace(/\/api\.php$/i, "");
+    if (!base)
+      return;
+    try {
+      const res = await fetch(base + "/api.php?action=trial", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ fp, trialStart: this.refreshTrialEff() || 0, v: this.curVersion() })
+      });
+      const j = await res.json();
+      if (!j || !j.ok || !j.firstAt)
+        return;
+      const srv = Number(j.firstAt) || 0;
+      let changed = false;
+      if (srv > 0 && srv !== Number(this.cfg.trialSrv)) {
+        this.cfg.trialSrv = srv;
+        changed = true;
+      }
+      this.cfg.trialSyncAt = now;
+      const eff = this.refreshTrialEff();
+      if (eff > 0 && eff !== Number(this.cfg.trialStart)) {
+        this.cfg.trialStart = eff;
+        changed = true;
+      }
+      if (changed) {
+        try {
+          await this.saveConfig();
+        } catch (e) {
+        }
+        this.writeTrialMirror(this.cfg.trialStart);
+        this.refreshPanel();
+      }
+    } catch (e) {
+    }
+  }
   /** 7 天试用是否有效 */
   isTrialValid() {
     if (this.cfg.clockRollback)
       return false;
     if (this.cfg.trialTampered)
       return false;
-    if (!this.cfg.trialStart)
+    const st = this._trialEff || this.refreshTrialEff();
+    if (!st)
       return false;
-    return this.nowTs() - this.cfg.trialStart < 7 * 864e5;
+    return this.nowTs() - st < 7 * 864e5;
   }
   /** 试用剩余天数（向上取整） */
   trialDaysLeft() {
-    if (!this.cfg.trialStart)
+    const st = this._trialEff || this.refreshTrialEff();
+    if (!st)
       return 0;
-    const left = 7 * 864e5 - (this.nowTs() - this.cfg.trialStart);
+    const left = 7 * 864e5 - (this.nowTs() - st);
     return Math.max(0, Math.ceil(left / 864e5));
   }
   /** v1.6.34: 剩余毫秒 → "X 天 X 小时 X 分钟"（分钟向上取整，至少 1） */
@@ -13936,9 +14044,10 @@ var EdbPlugin = class extends Plugin {
   }
   /** v1.6.34: 试用剩余时间（精确到分钟） */
   trialTimeLeft() {
-    if (!this.cfg.trialStart)
+    const st = this._trialEff || this.refreshTrialEff();
+    if (!st)
       return "0 分钟";
-    return this.fmtLeft(7 * 864e5 - (Date.now() - this.cfg.trialStart));
+    return this.fmtLeft(7 * 864e5 - (this.nowTs() - st));
   }
   /** 时钟回拨防护 + 最近活动时间（每秒/每同步更新一次） */
   clockGuard() {

@@ -6481,7 +6481,6 @@ var VIEWER_HTML = `<!DOCTYPE html>
 </script>
 </body>
 </html>`;
-var EDB_ICON = "\u{1F6E1}\uFE0F";
 var FALLBACK = {
   menuAdd: "\u52A0\u5165\u5BC6\u5E93",
   menuRemove: "\u79FB\u51FA\u5BC6\u5E93",
@@ -8048,7 +8047,7 @@ var EdbPlugin = class extends Plugin {
       /* v1.6.45: 移出黑名单中的文档不算"已入库"——菜单显示"加入"而非"移出" */
       const isIn = this.cfg.watchlist.includes(docId) && !(this.cfg.excludedDocs || []).includes(docId);
       menu.addItem({
-        icon: EDB_ICON,
+        icon: "iconKey",
         label: isIn ? this.t("menuRemove") : this.t("menuAdd"),
         click: async () => {
           if (isIn)
@@ -8498,7 +8497,7 @@ var EdbPlugin = class extends Plugin {
     const anyIn = this.cfg.watchlist.length > 0;
     if (marked || inCount > 0 || anyIn) {
       menu.addItem({
-        icon: EDB_ICON,
+        icon: "iconKey",
         label: this.t("nbRemove") + (inCount > 0 ? "（\u5DF2\u5165\u5E93 " + inCount + " \u7BC7\uFF09" : ""),
         click: async () => {
           try {
@@ -8515,7 +8514,7 @@ var EdbPlugin = class extends Plugin {
       });
     } else {
       menu.addItem({
-        icon: EDB_ICON,
+        icon: "iconKey",
         label: this.t("nbAdd"),
         click: async () => {
           try {

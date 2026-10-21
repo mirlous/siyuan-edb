@@ -6481,6 +6481,7 @@ var VIEWER_HTML = `<!DOCTYPE html>
 </script>
 </body>
 </html>`;
+var EDB_ICON = "<img src='data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABQAAAAUCAYAAACNiR0NAAAEZUlEQVR42l2UXYid1RWGn7X2/r5zzszkxIkmOGrbBKnY/EBH0yqCxlToRX8Ea2cstCl4lQsp/lERRQ8D3kljMRe96YUi+HMmXrS9qYUSYxUMobYitqnaYsqIqTHNzJzJme98+9treXEyEn3XxYLNWouX9928cvRoL5659R8+L4uZL+HIyQeujUX6nrn/NAbdJl78Lko8cvrD9pt371+oLp7t+1zY+upOkYsfX/77g9vC5noXrjdbk/dny3vLVpxKybHGaLUjqXYvov4T19csy6valH89/caOUwcPHkwA8vt/3/Noanw2BP1qk+3rZRkvKcrAaGSkOtOZDOY42ZAiitcjV8/OxFQJBsNhGkWNH4j7ByHqW/KHU/d4LErqOpNGRpPMzTy3J4IM10z/dGRJ3n9nhZyd6Utb7Lt9hj3fnrbzq42rCBokFGWk3Y7klAl3HLz+oVSZptpwcxyRdifox/8d6mN3n5C0nrn1h5ezc/YSqmHm2Sff5/wgy95btmmqTXE8Z/NUZRulXEXcAyJBEHBHgCDOoYff5epdXRZ+O0s1yGSDfT+Y4Vv7tnHfj9/kmj1dbvjOVtYGjQQREQWyBzV8XO5kh6IVOP3RiP+cPM/tP/8aw9XMynJDNTQ+Xhqx8/pptu/scvzoJ5SlgguC4IAIqJuAgwuoQpOMLZe1uGrHJK+/cgYzMBdSNoqW8K93VvhkacjuvdPUtYGMdzcQY5AEtMRBEHJ2Nk2XHPjF1Tz39Hv8Zc8U1boDzmQ38vbxZbZfM8ltd8ywupzQILiDjH+gaSh0mQDuODgA2ZxWW+huKUkpk+qGJmXq9YTidLe0yDgGCArgqhCCrqq7nIxlcHB3AHE0wGClwUyI0QkRYmDcy8BgJeEZlM+3PBYBJHyoTc0rUXXM27kgMlRVxt1xA8tjNmZQBGFUZSwbomMzcFxDINX5da0H+uJovfk0liqOubvjDoPVeuxaUGKhhCCoOrEUqjWjHmWQsbaiyKhKdb0entcDNx5ecpOnJrotyUZ2Ab9g+3DQsLrccO5szfLZzP/POMO1DO7kC1Fibs3U5o56o/0De3/9VnDv6akT1fG1tu2f3By3j9abJmf0KzsmmdoUEYNOO1KWShGEqU3Kd+evYOtMm7rOud0pYqr5n1TlXS/95o2B9Ho9XVhYsP7f7r8ydu2PsZTdg3NVE6PGzoSCAMgF8R1EyMkZDpvcahehiHF9bSV//2ezh4/2+3NBADaOPnfskZmJK86/1JoMN698uu5mZiIaxrcMVHEzFyFv2tyJ2Thrld41t+vQn/v9uTA/v5gDwLFjx7znPb13+xODb1x37QuXXT7RCaXe1O5ETaPGRQVVBCQXraDd6Y7mRl6rzsmPfvLNQyf6Phfmd48D+gsBu8EU4MV3772laPO4md3mDk1ttCcLcval3OivXn5s6fDi4mLu+1y4OO3ly7GPI33mdGPoyHv332mSfxmD7sjJn/GhPj0/+9RHAD3v6YKMCWzgM2VqYFAoMoyUAAAAAElFTkSuQmCC' style='width:14px;height:14px;vertical-align:-3px;border-radius:3px;' />";
 var FALLBACK = {
   menuAdd: "\u52A0\u5165\u5BC6\u5E93",
   menuRemove: "\u79FB\u51FA\u5BC6\u5E93",
@@ -8047,7 +8048,7 @@ var EdbPlugin = class extends Plugin {
       /* v1.6.45: 移出黑名单中的文档不算"已入库"——菜单显示"加入"而非"移出" */
       const isIn = this.cfg.watchlist.includes(docId) && !(this.cfg.excludedDocs || []).includes(docId);
       menu.addItem({
-        icon: "iconKey",
+        icon: EDB_ICON,
         label: isIn ? this.t("menuRemove") : this.t("menuAdd"),
         click: async () => {
           if (isIn)
@@ -8497,7 +8498,7 @@ var EdbPlugin = class extends Plugin {
     const anyIn = this.cfg.watchlist.length > 0;
     if (marked || inCount > 0 || anyIn) {
       menu.addItem({
-        icon: "iconKey",
+        icon: EDB_ICON,
         label: this.t("nbRemove") + (inCount > 0 ? "（\u5DF2\u5165\u5E93 " + inCount + " \u7BC7\uFF09" : ""),
         click: async () => {
           try {
@@ -8514,7 +8515,7 @@ var EdbPlugin = class extends Plugin {
       });
     } else {
       menu.addItem({
-        icon: "iconKey",
+        icon: EDB_ICON,
         label: this.t("nbAdd"),
         click: async () => {
           try {

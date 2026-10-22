@@ -6696,6 +6696,8 @@ var EdbPlugin = class extends Plugin {
       watchlist: [],
       /* v1.6.69 文档→笔记本 映射持久缓存（菜单/隐藏判断用，避免重启后 docBoxMap 空导致误判） */
       docBox: {},
+      /* v1.6.70 单篇加入密库时是否连同子文档树一起加密（默认开，符合"文档分支=一个整体"的直觉） */
+      includeSubDocs: true,
       autoSync: true,
       lastSyncAt: 0,
       keepPlain: false,
@@ -8089,6 +8091,19 @@ var EdbPlugin = class extends Plugin {
           label: this.t("menuBurnShare") || "\u{1F525} \u9605\u540E\u5373\u711A\u5206\u4EAB\uFF08\u4E00\u6B21\u6027\u94FE\u63A5\uFF09",
           click: () => {
             this.createBurnShare(docId).catch((e) => console.error("[siyuan-edb]", e));
+          }
+        });
+        /* v1.6.70 手动补全子文档（此前只加父文档的用户可一键补齐） */
+        menu.addItem({
+          icon: "iconList",
+          label: "\u{1F4DA} \u8865\u5168\u5B50\u6587\u6863\u5165\u5E93",
+          click: async () => {
+            try {
+              const r = await this.addMissingSubDocs(docId);
+              showMessage(r.added > 0 ? "\u2705 \u5DF2\u8865\u5165\u5B50\u6587\u6863 " + r.added + " \u7BC7" : (r.total > 0 ? "\u5B50\u6587\u6863\u5DF2\u5168\u90E8\u5728\u5E93\uFF08" + r.total + " \u7BC7\uFF09" : "\u8BE5\u6587\u6863\u6CA1\u6709\u5B50\u6587\u6863"));
+            } catch (e) {
+              showMessage(this.t("addFail") + "\uFF1A" + (e && e.message ? e.message : e));
+            }
           }
         });
       }
@@ -9587,62 +9602,187 @@ var EdbPlugin = class extends Plugin {
         if (!ok)
           return;
       }
+      const box = await this.boxOfDoc(docId);
+      let added = 0;
       if (!this.cfg.watchlist.includes(docId)) {
         this.cfg.watchlist.push(docId);
         /* v1.6.45: 重新加入 → 移出黑名单移除 */
         this.cfg.excludedDocs = (this.cfg.excludedDocs || []).filter((x) => x !== docId);
-        await this.saveConfig();
+        if (box)
+          this.rememberDocBox(docId, box);
+        added++;
       }
-      await this.syncNow();
-      if (routed && routed.name && routed.text)
-        this.learnFingerprint(routed.name, routed.text);
-      this.refreshPanel();
-      showMessage(this.t("addOk") + (routed && routed.name ? " \u2192 " + routed.name : ""));
+      /* v1.6.70 连同子文档树一起加入（文档分支视为整体；此前只加父文档 → 子文档仍是明文且显示在树上） */
+      let subAdded = 0;
+      if (this.cfg.includeSubDocs !== false && box) {
+        const subs = await this.listSubDocIds(box, docId);
+        for (const sid of subs) {
+          if (!this.cfg.watchlist.includes(sid)) {
+            this.cfg.watchlist.push(sid);
+            this.cfg.excludedDocs = (this.cfg.excludedDocs || []).filter((x) => x !== sid);
+            this.rememberDocBox(sid, box);
+            subAdded++;
+          }
+        }
+      }
+      if (added || subAdded) {
+        await this.saveConfig();
+        await this.syncNow();
+        if (routed && routed.name && routed.text)
+          this.learnFingerprint(routed.name, routed.text);
+        this.refreshPanel();
+        this.applyNotebookVisibility();
+        showMessage("\u2705 " + this.t("addOk") + (subAdded > 0 ? "\uFF08\u542B\u5B50\u6587\u6863 " + subAdded + " \u7BC7\uFF09" : ""));
+      } else {
+        showMessage(this.t("addOk"));
+      }
     } catch (e) {
       console.error("[siyuan-edb]", e);
       showMessage(this.t("addFail") + "\uFF1A" + (e && e.message ? e.message : e));
     }
   }
+  /** v1.6.70 取文档所属笔记本（缓存优先，SQL 兜底） */
+  async boxOfDoc(docId) {
+    try {
+      if (this.docBoxMap[docId])
+        return this.docBoxMap[docId];
+      if (this.cfg.docBox && this.cfg.docBox[docId])
+        return this.cfg.docBox[docId];
+      const r = await fetchSyncPost("/api/query/sql", { stmt: "SELECT box_id FROM blocks WHERE id = '" + String(docId).replace(/'/g, "''") + "'" });
+      const row = ((r && r.data) || [])[0];
+      if (row && row.box_id) {
+        this.rememberDocBox(docId, row.box_id);
+        return row.box_id;
+      }
+    } catch (e) {
+    }
+    return "";
+  }
+  /** v1.6.70 列出某文档的全部子孙文档 id（SiYuan 存储：data/<box>/<docId>/ 下递归 .sy） */
+  async listSubDocIds(box, docId) {
+    const out = [];
+    try {
+      const dataDir = await this.wsDataDir();
+      const base = path.join(dataDir, String(box), String(docId));
+      const walk = (dir) => {
+        let ents = null;
+        try {
+          ents = fs.readdirSync(dir, { withFileTypes: true });
+        } catch (e) {
+          return;
+        }
+        for (const ent of ents) {
+          const p = path.join(dir, ent.name);
+          if (ent.isDirectory())
+            walk(p);
+          else if (ent.name.endsWith(".sy"))
+            out.push(ent.name.slice(0, -3));
+        }
+      };
+      if (fs.existsSync(base))
+        walk(base);
+    } catch (e) {
+      console.error("[siyuan-edb] listSubDocIds", e);
+    }
+    return [...new Set(out)].filter((x) => x !== docId);
+  }
+  /** v1.6.70 补全单个文档的子文档（已入库但只加过父文档时修复用） */
+  async addMissingSubDocs(docId) {
+    const box = await this.boxOfDoc(docId);
+    if (!box)
+      return { added: 0, total: 0 };
+    const subs = await this.listSubDocIds(box, docId);
+    let added = 0;
+    for (const sid of subs) {
+      if (!this.cfg.watchlist.includes(sid)) {
+        this.cfg.watchlist.push(sid);
+        this.cfg.excludedDocs = (this.cfg.excludedDocs || []).filter((x) => x !== sid);
+        this.rememberDocBox(sid, box);
+        added++;
+      }
+    }
+    if (added) {
+      await this.saveConfig();
+      await this.syncNow();
+      this.refreshPanel();
+      this.applyNotebookVisibility();
+    }
+    return { added, total: subs.length };
+  }
+  /** v1.6.70 补全所有已入库文档的子文档（维护按钮用） */
+  async addMissingSubDocsAll() {
+    let added = 0, scanned = 0, docsWithSub = 0;
+    for (const docId of [...(this.cfg.watchlist || [])]) {
+      try {
+        const r = await this.addMissingSubDocs(docId);
+        scanned++;
+        if (r.total > 0)
+          docsWithSub++;
+        added += r.added;
+      } catch (e) {
+      }
+    }
+    return { added, scanned, docsWithSub };
+  }
   async removeFromVault(docId) {
+    /* v1.6.70 文档分支视为整体：移出父文档时把已入库的子文档一并移出（避免子文档残留在库里被隐藏、无法管理） */
+    const box = await this.boxOfDoc(docId);
+    let subs = [];
+    if (box)
+      subs = await this.listSubDocIds(box, docId);
+    const targetsAll = [...new Set([docId, ...subs.filter((x) => this.cfg.watchlist.includes(x))])];
     if (this.state) {
-      const okc = await this.confirmBox(this.t("removeConfirm") || "\u79FB\u51FA\u540E\uFF1A\u2460 \u6587\u6863\u4E0D\u518D\u81EA\u52A8\u52A0\u5BC6\u540C\u6B65 \u2461 \u9644\u4EF6\u8FD8\u539F\u56DE\u601D\u6E90 assets \u2462 \u5E93\u5185\u8BB0\u5F55\u8FDB\u5165\u56DE\u6536\u7AD9\uFF08\u53EF\u6062\u590D\uFF09\u3002\u786E\u5B9A\u79FB\u51FA\uFF1F");
+      const extra = targetsAll.length > 1 ? "\n\n\u6CE8\u610F\uFF1A\u8BE5\u6587\u6863\u4E0B\u8FD8\u6709 " + (targetsAll.length - 1) + " \u7BC7\u5B50\u6587\u6863\u5DF2\u5165\u5E93\uFF0C\u5C06\u4E00\u5E76\u79FB\u51FA\u3002" : "";
+      const okc = await this.confirmBox((this.t("removeConfirm") || "\u79FB\u51FA\u540E\uFF1A\u2460 \u6587\u6863\u4E0D\u518D\u81EA\u52A8\u52A0\u5BC6\u540C\u6B65 \u2461 \u9644\u4EF6\u8FD8\u539F\u56DE\u601D\u6E90 assets \u2462 \u5E93\u5185\u8BB0\u5F55\u8FDB\u5165\u56DE\u6536\u7AD9\uFF08\u53EF\u6062\u590D\uFF09\u3002\u786E\u5B9A\u79FB\u51FA\uFF1F") + extra);
       if (!okc)
         return;
     }
-    this.cfg.watchlist = this.cfg.watchlist.filter((x) => x !== docId);
+    const idSet = new Set(targetsAll);
+    this.cfg.watchlist = this.cfg.watchlist.filter((x) => !idSet.has(x));
     /* v1.6.45: 移出黑名单（防库记录残留时重启自动回库） */
-    this.cfg.excludedDocs = [...new Set([...(this.cfg.excludedDocs || []), docId])];
+    this.cfg.excludedDocs = [...new Set([...(this.cfg.excludedDocs || []), ...targetsAll])];
     // v1.6.11: 移出期间显示动态等待（还原大视频等资产耗时）
     this.setBusy(this.t("removeBusy") || "\u6B63\u5728\u79FB\u51FA\u6587\u6863...");
     try {
-    if (this.state) {
-      try {
-        const n = await this.restoreDocAssets(docId);
-        if (n > 0)
-          console.log("[siyuan-edb] \u79FB\u51FA\u65F6\u5DF2\u8FD8\u539F\u8D44\u4EA7", n, docId);
-      } catch (e) {
-        console.error("[siyuan-edb] \u8FD8\u539F\u8D44\u4EA7\u5931\u8D25", e);
+      if (this.state) {
+        for (const id0 of targetsAll) {
+          try {
+            const n = await this.restoreDocAssets(id0);
+            if (n > 0)
+              console.log("[siyuan-edb] \u79FB\u51FA\u65F6\u5DF2\u8FD8\u539F\u8D44\u4EA7", n, id0);
+          } catch (e) {
+            console.error("[siyuan-edb] \u8FD8\u539F\u8D44\u4EA7\u5931\u8D25", e);
+          }
+          try {
+            core.removeDoc(this.state.db, id0);
+          } catch (e) {
+          }
+          try {
+            core.clearRevisions(this.state.db, id0);
+          } catch (e) {
+          }
+          try {
+            core.audit(this.state.db, "remove", id0, "\u79FB\u51FA\u5BC6\u5E93\uFF08\u8D44\u4EA7\u8FDB\u56DE\u6536\u7AD9\uFF09");
+          } catch (e) {
+          }
+          this.forgetDocBox(id0);
+        }
       }
-      try {
-        core.removeDoc(this.state.db, docId);
-      } catch (e) {
-      }
-      core.clearRevisions(this.state.db, docId);
-      core.audit(this.state.db, "remove", docId, "\u79FB\u51FA\u5BC6\u5E93\uFF08\u8D44\u4EA7\u8FDB\u56DE\u6536\u7AD9\uFF09");
-    }
-    await this.saveConfig();
-    this.flushVault();
+      await this.saveConfig();
+      this.flushVault();
     } finally {
       this.clearBusy();
     }
     try {
       this.refreshPanel();
+      this.applyNotebookVisibility();
     } catch (e) {
-      console.error("[siyuan-edb] \u79FB\u51FA\u540e\u9762\u677f\u5237\u65b0\u5931\u8d25", e);
+      console.error("[siyuan-edb] \u79FB\u51FA\u540E\u9762\u677F\u5237\u65B0\u5931\u8D25", e);
     }
-    showMessage(this.t("removeOk"));
+    showMessage(this.t("removeOk") + (targetsAll.length > 1 ? "\uFF08\u542B\u5B50\u6587\u6863 " + (targetsAll.length - 1) + " \u7BC7\uFF09" : ""));
     await this.maybeAutoCompact();
   }
+
   /** 把指定文档在库内的全部资产解密写回思源 assets 目录（已存在文件跳过，不覆盖） */
   /** v1.6.25: 收集某文档引用的全部资产（名下 + 该文档 .sy 引用 + 库记录兜底）。
    *  原实现仅 getAssetsByDoc(docId) 按「名下」过滤——思源文档可引用任意 assets 文件，
@@ -11076,7 +11216,7 @@ var EdbPlugin = class extends Plugin {
   /** 当前插件版本（与 plugin.json 同步，发布时手工更新） */
   curVersion() {
     /* v1.6.63 必须与 plugin.json 的 version 保持一致（每次发版两处同步改） */
-    return "1.6.69";
+    return "1.6.70";
   }
   versionAtLeast(latest, cur) {
     const p = (s) => String(s || "").split(".").map((x) => parseInt(x, 10) || 0);
@@ -12311,6 +12451,15 @@ var EdbPlugin = class extends Plugin {
     keepRow.appendChild(keepPlain);
     keepRow.appendChild(document.createTextNode(this.t("settingKeepPlain")));
     box.appendChild(keepRow);
+    /* v1.6.70 加入文档时连同子文档（默认开） */
+    const subChk = document.createElement("input");
+    subChk.type = "checkbox";
+    subChk.checked = this.cfg.includeSubDocs !== false;
+    const subRow = document.createElement("label");
+    subRow.style.cssText = "display:flex;align-items:center;gap:8px;font-size:13px;";
+    subRow.appendChild(subChk);
+    subRow.appendChild(document.createTextNode("\u52A0\u5165\u6587\u6863\u65F6\u8FDE\u540C\u5B50\u6587\u6863\u4E00\u8D77\u52A0\u5BC6\uFF08\u63A8\u8350\uFF09"));
+    box.appendChild(subRow);
     const bakBox = document.createElement("div");
     bakBox.style.cssText = "border:1px solid var(--b3-border-color,#333);border-radius:6px;padding:10px;display:flex;flex-direction:column;gap:8px;";
     const bakTitle = document.createElement("div");
@@ -12410,6 +12559,13 @@ var EdbPlugin = class extends Plugin {
       this.applyNotebookVisibility();
       this.applyDocMask();
       showMessage("\u2705 \u5DF2\u91CD\u65B0\u5E94\u7528\u6587\u6863\u6811\u9690\u85CF/\u906E\u7F69");
+    }));
+    /* v1.6.70 补全所有已入库文档的子文档（修复"只加了父文档"的历史数据） */
+    repRow.appendChild(mkRepBtn("\u{1F4DA} \u8865\u5168\u6240\u6709\u5B50\u6587\u6863", async () => {
+      repInfo.textContent = "\u6B63\u5728\u626B\u63CF\u5B50\u6587\u6863\u2026";
+      const r = await this.addMissingSubDocsAll();
+      repInfo.textContent = "\u5B50\u6587\u6863\u8865\u5168\u5B8C\u6210\uFF1A\u626B\u63CF " + r.scanned + " \u7BC7\u6587\u6863\uFF0C\u65B0\u589E\u5165\u5E93 " + r.added + " \u7BC7\uFF08\u5176\u4E2D " + r.docsWithSub + " \u7BC7\u6709\u5B50\u6587\u6863\uFF09";
+      showMessage(r.added > 0 ? "\u2705 \u5DF2\u8865\u5165 " + r.added + " \u7BC7\u5B50\u6587\u6863" : "\u2705 \u5B50\u6587\u6863\u5DF2\u5168\u90E8\u5728\u5E93");
     }));
     repBox.appendChild(repRow);
     const repTip = document.createElement("div");
@@ -13356,6 +13512,7 @@ var EdbPlugin = class extends Plugin {
       }
       this.cfg.autoSync = autoSync.checked;
       this.cfg.keepPlain = keepPlain.checked;
+      this.cfg.includeSubDocs = subChk.checked;
       this.cfg.backupEnabled = bakEnable.checked;
       this.cfg.backupDir = bakDir.value.trim();
       this.cfg.backupIntervalMin = Math.max(1, parseInt(bakInterval.value, 10) || 360);

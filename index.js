@@ -10925,7 +10925,7 @@ var EdbPlugin = class extends Plugin {
   /** 当前插件版本（与 plugin.json 同步，发布时手工更新） */
   curVersion() {
     /* v1.6.63 必须与 plugin.json 的 version 保持一致（每次发版两处同步改） */
-    return "1.6.67";
+    return "1.6.68";
   }
   versionAtLeast(latest, cur) {
     const p = (s) => String(s || "").split(".").map((x) => parseInt(x, 10) || 0);
@@ -13959,14 +13959,19 @@ var EdbPlugin = class extends Plugin {
       if (licBefore === void 0 || licBefore !== this._licUiState)
         this.refreshPanel();
     } catch (e) {
-      /* v1.6.67 校验失败：记录连续失败次数（宽限期内仍可用，面板可见） */
-      this.cfg.checkFailN = (Number(this.cfg.checkFailN) || 0) + 1;
+      /* v1.6.68 校验失败：记录连续失败次数（宽限期内仍可用，面板可见）。
+         注意降频落盘：离线时每 10 分钟失败一次，若每次都写 config 会触发插件重载（v1.6.62 踩过），
+         只在第 1/3/10 次或每 30 次时落盘+刷新，其余仅内存更新。 */
+      const _fn = (Number(this.cfg.checkFailN) || 0) + 1;
+      this.cfg.checkFailN = _fn;
       this.cfg.checkLastErr = String((e && e.message) || e || "network").slice(0, 80);
-      try {
-        await this.saveConfig();
-      } catch (e2) {
+      if (_fn <= 3 || _fn === 10 || _fn % 30 === 0) {
+        try {
+          await this.saveConfig();
+        } catch (e2) {
+        }
+        this.refreshPanel();
       }
-      this.refreshPanel();
     } finally {
       if (_to) {
         try {

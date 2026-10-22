@@ -6694,6 +6694,8 @@ var EdbPlugin = class extends Plugin {
     this.cfg = {
       dbPath: DEFAULT_DB_PATH,
       watchlist: [],
+      /* v1.6.69 文档→笔记本 映射持久缓存（菜单/隐藏判断用，避免重启后 docBoxMap 空导致误判） */
+      docBox: {},
       autoSync: true,
       lastSyncAt: 0,
       keepPlain: false,
@@ -8141,13 +8143,8 @@ var EdbPlugin = class extends Plugin {
   }
   applyNotebookVisibility() {
     try {
-      if (!this.cfg || !Array.isArray(this.cfg.notebookInVault) || !this.cfg.notebookInVault.length) {
-        this.hideLostAssets();
-        return;
-      }
-      /* v1.6.45: 多库归属——notebookInVault 元素可为 {id, v}(v=所属库) 或旧式纯 id(v=-1 未知) */
       const nbMap = new Map();
-      (this.cfg.notebookInVault || []).forEach((e) => {
+      (this.cfg && Array.isArray(this.cfg.notebookInVault) ? this.cfg.notebookInVault : []).forEach((e) => {
         const bid = typeof e === "string" ? e : e && e.id;
         const v = typeof e === "string" ? -1 : e && typeof e.v === "number" ? e.v : -1;
         if (bid)
@@ -8155,19 +8152,24 @@ var EdbPlugin = class extends Plugin {
       });
       const activeUnlocked = this.isUnlocked();
       const activeV = this.cfg.activeVault;
+      const wl = new Set(this.cfg.watchlist || []);
+      const excl = new Set(this.cfg.excludedDocs || []);
+      /* v1.6.69：锁定时不仅隐藏"整本加入"的笔记本行，也隐藏"单篇加入密库"的文档行（防左侧文档树泄露标题） */
       document.querySelectorAll("[data-node-id]").forEach((el) => {
         const bid = el.getAttribute("data-node-id");
-        if (!nbMap.has(bid))
+        if (!bid)
           return;
-        const v = nbMap.get(bid);
-        let want;
-        if (v === -1)
+        let want = null;
+        if (nbMap.has(bid)) {
+          const v = nbMap.get(bid);
+          if (v === -1 || v === activeV)
+            want = activeUnlocked ? "" : "none";
+          else
+            want = "none";
+        } else if (wl.has(bid) && !excl.has(bid)) {
           want = activeUnlocked ? "" : "none";
-        else if (v === activeV)
-          want = activeUnlocked ? "" : "none";
-        else
-          want = "none";
-        if (el.style.display !== want)
+        }
+        if (want !== null && el.style.display !== want)
           el.style.display = want;
       });
       /* v1.6.45: 隐藏 设置→资源→丢失的资源文件 中的密库加密资产条目（防泄露库内文件名） */
@@ -8511,9 +8513,11 @@ var EdbPlugin = class extends Plugin {
       if (boxIds.includes(this.docBoxMap[id]) && this.cfg.watchlist.includes(id) && !excl.has(id))
         inCount++;
     }
-    /* v1.6.45: 兜底——docBoxMap 映射不可靠时（SQL 未填充），只要有任何文档在密库就显示"移出"，绝不隐藏 */
-    const anyIn = this.cfg.watchlist.length > 0;
-    if (marked || inCount > 0 || anyIn) {
+    /* v1.6.69：去掉"只要有任意文档在库就所有笔记本都显示移出"的兜底（这是"所有分类都显示整本移出"的根因）；
+       只按"整本标记"或"本笔记本确有已入库文档"判断。docBoxMap 冷启动时先异步补齐，菜单下次打开即准。 */
+    if (!marked && inCount === 0 && this.cfg.watchlist.length > 0 && Object.keys(this.docBoxMap).length === 0)
+      this.refreshDocBoxes().catch(() => {});
+    if (marked || inCount > 0) {
       menu.addItem({
         icon: "iconKey",
         label: this.t("nbRemove") + (inCount > 0 ? "（\u5DF2\u5165\u5E93 " + inCount + " \u7BC7\uFF09" : ""),
@@ -8536,8 +8540,15 @@ var EdbPlugin = class extends Plugin {
         label: this.t("nbAdd"),
         click: async () => {
           try {
-            const n = await this.addNotebookToVault(boxIds);
-            showMessage(n > 0 ? this.t("nbAddOk").replace("{0}", n) : this.t("nbEmpty"));
+            const r = await this.addNotebookToVault(boxIds);
+            const added = r && typeof r === "object" ? r.added : r;
+            const total = r && typeof r === "object" ? r.total : added;
+            if (added > 0)
+              showMessage(this.t("nbAddOk").replace("{0}", added));
+            else if (total > 0)
+              showMessage(this.t("nbAllIn").replace("{0}", total));
+            else
+              showMessage(this.t("nbEmpty"));
           } catch (e) {
             console.error("[siyuan-edb]", e);
             showMessage(this.t("addFail") + "\uff1a" + (e && e.message ? e.message : e));
@@ -8606,13 +8617,33 @@ var EdbPlugin = class extends Plugin {
       for (const id of merged) {
         if (id && !seen.has(id)) {
           seen.add(id);
-          if (!this.cfg.watchlist.includes(id))
+          if (!this.cfg.watchlist.includes(id)) {
             ids.push(id);
+            this.rememberDocBox(id, box);
+          } else {
+            this.rememberDocBox(id, box);
+          }
         }
       }
     }
-    if (!ids.length)
-      return 0;
+    const totalFound = seen.size;
+    if (!totalFound)
+      return { added: 0, total: 0 };
+    if (!ids.length) {
+      /* v1.6.69: 该笔记本下文档已全部在库 → 仍记录"整本"标记（隐藏/菜单用），并明确提示，不再误报"没有已入库文档" */
+      const nbMap0 = new Map();
+      (this.cfg.notebookInVault || []).forEach((e) => {
+        const bid = typeof e === "string" ? e : e && e.id;
+        const v = typeof e === "string" ? -1 : e && typeof e.v === "number" ? e.v : -1;
+        if (bid)
+          nbMap0.set(bid, v);
+      });
+      boxIds.forEach((b) => nbMap0.set(b, this.cfg.activeVault));
+      this.cfg.notebookInVault = [...nbMap0.entries()].map((kv) => ({ id: kv[0], v: kv[1] }));
+      await this.saveConfig();
+      this.applyNotebookVisibility();
+      return { added: 0, total: totalFound, allIn: true };
+    }
     this.cfg.watchlist = this.cfg.watchlist.concat(ids);
     /* v1.6.45: 重新加入 → 从移出黑名单移除（黑名单为独立持久化字段，防库记录残留时自动回库） */
     this.cfg.excludedDocs = (this.cfg.excludedDocs || []).filter((x) => !ids.includes(x));
@@ -8644,7 +8675,8 @@ var EdbPlugin = class extends Plugin {
     }
     this.refreshPanel();
     await this.maybeAutoCompact();
-    return ids.length;
+    this.applyNotebookVisibility();
+    return { added: ids.length, total: totalFound };
   }
   /** 整本笔记本移出密库：找出该笔记本下已入库文档 → 还原资产 → 从库内移除（记录进回收站） */
   async removeNotebookFromVault(boxIds) {
@@ -8720,7 +8752,7 @@ var EdbPlugin = class extends Plugin {
           } catch (e) {
           }
         }
-        delete this.docBoxMap[docId];
+        this.forgetDocBox(docId);
       }
       this.cfg.watchlist = this.cfg.watchlist.filter((d) => !ids.has(d));
       /* v1.6.45: 移出 → 加入移出黑名单（独立持久化；即使库记录/删除失败残留，重启也不再自动加回） */
@@ -8747,6 +8779,7 @@ var EdbPlugin = class extends Plugin {
     }
     this.refreshPanel();
     await this.maybeAutoCompact();
+    this.applyNotebookVisibility();
     return targets.length;
   }
   docElId(el) {
@@ -8781,7 +8814,7 @@ var EdbPlugin = class extends Plugin {
             this.cfg.watchlist = this.cfg.watchlist.filter((x) => x !== id);
             /* v1.6.45: 移出黑名单（防库记录残留时重启自动回库） */
             this.cfg.excludedDocs = [...new Set([...(this.cfg.excludedDocs || []), id])];
-            delete this.docBoxMap[id];
+            this.forgetDocBox(id);
             if (this.state) {
               try {
                 core.removeDoc(this.state.db, id);
@@ -8864,21 +8897,133 @@ var EdbPlugin = class extends Plugin {
     }
     return false;
   }
-  /** 刷新已入库文档 → 笔记本 映射（供同步事件过滤） */
+  /** 刷新已入库文档 → 笔记本 映射（供同步事件过滤 / 菜单 / 隐藏判断）
+   *  v1.6.69：先吃 cfg.docBox 持久缓存，再查 SQL 补齐并回写缓存（重启后菜单不再误判） */
   async refreshDocBoxes() {
     try {
+      if (!this.cfg.docBox || typeof this.cfg.docBox !== "object")
+        this.cfg.docBox = {};
+      for (const id of this.cfg.watchlist) {
+        if (!this.docBoxMap[id] && this.cfg.docBox[id])
+          this.docBoxMap[id] = this.cfg.docBox[id];
+      }
       const ids = this.cfg.watchlist.filter((x) => !this.docBoxMap[x]);
       if (!ids.length)
         return;
-      const res = await fetchSyncPost("/api/query/sql", { stmt: "SELECT id, box_id FROM blocks WHERE id IN ('" + ids.join("','") + "')" });
-      const rows = res && res.data || [];
-      for (const r of rows) {
-        if (r && r.id && r.box_id)
-          this.docBoxMap[r.id] = r.box_id;
+      let changed = false;
+      for (let i = 0; i < ids.length; i += 200) {
+        const chunk = ids.slice(i, i + 200);
+        let rows = [];
+        try {
+          const res = await fetchSyncPost("/api/query/sql", { stmt: "SELECT id, box_id FROM blocks WHERE id IN ('" + chunk.join("','") + "')" });
+          rows = res && res.data || [];
+        } catch (e) {
+          rows = [];
+        }
+        for (const r of rows) {
+          if (r && r.id && r.box_id) {
+            this.docBoxMap[r.id] = r.box_id;
+            this.cfg.docBox[r.id] = r.box_id;
+            changed = true;
+          }
+        }
+        /* SQL 查不到时用 .sy 文件系统兜底（新库/索引未建时，整本入库场景常见） */
+        const miss = chunk.filter((x) => !this.docBoxMap[x]);
+        if (miss.length) {
+          try {
+            const dataDir = await this.wsDataDir();
+            const boxes = await fetchSyncPost("/api/notebook/lsNotebooks");
+            const list = (boxes && boxes.data && boxes.data.notebooks) || [];
+            for (const nb of list) {
+              const dir = path.join(dataDir, String(nb.id));
+              if (!fs.existsSync(dir))
+                continue;
+              for (const id of miss) {
+                if (this.docBoxMap[id])
+                  continue;
+                if (fs.existsSync(path.join(dir, id + ".sy"))) {
+                  this.docBoxMap[id] = nb.id;
+                  this.cfg.docBox[id] = nb.id;
+                  changed = true;
+                }
+              }
+            }
+          } catch (e) {
+          }
+        }
+      }
+      if (changed) {
+        try {
+          await this.saveConfig();
+        } catch (e) {
+        }
+        this.applyNotebookVisibility();
       }
     } catch (e) {
       console.error("[siyuan-edb]", e);
     }
+  }
+  /** v1.6.69 记录/遗忘文档→笔记本 映射（持久化，供菜单与隐藏判断） */
+  rememberDocBox(docId, boxId) {
+    try {
+      if (!docId || !boxId)
+        return;
+      this.docBoxMap[docId] = boxId;
+      if (!this.cfg.docBox)
+        this.cfg.docBox = {};
+      this.cfg.docBox[docId] = boxId;
+    } catch (e) {
+    }
+  }
+  forgetDocBox(docId) {
+    try {
+      delete this.docBoxMap[docId];
+      if (this.cfg.docBox)
+        delete this.cfg.docBox[docId];
+    } catch (e) {
+    }
+  }
+  /** v1.6.69 维护：只检查索引（不改数据） */
+  async checkVaultIndex() {
+    const wl = [...new Set(this.cfg.watchlist || [])];
+    await this.refreshDocBoxes();
+    const mapped = wl.filter((id) => this.docBoxMap[id]).length;
+    return { total: wl.length, mapped, missing: wl.length - mapped, notebooks: new Set(Object.values(this.docBoxMap)).size, excl: (this.cfg.excludedDocs || []).length };
+  }
+  /** v1.6.69 维护：重建 文档→笔记本 映射 + 清理失效缓存/整本标记 */
+  async repairVaultIndex() {
+    const out = { total: 0, mapped: 0, missing: 0, notebooks: 0, cleaned: 0 };
+    try {
+      const wl = [...new Set(this.cfg.watchlist || [])];
+      out.total = wl.length;
+      this.docBoxMap = {};
+      if (!this.cfg.docBox || typeof this.cfg.docBox !== "object")
+        this.cfg.docBox = {};
+      await this.refreshDocBoxes();
+      out.mapped = wl.filter((id) => this.docBoxMap[id]).length;
+      out.missing = out.total - out.mapped;
+      for (const k in this.cfg.docBox) {
+        if (!wl.includes(k)) {
+          delete this.cfg.docBox[k];
+          out.cleaned++;
+        }
+      }
+      const boxes = new Set(Object.values(this.docBoxMap));
+      const before = (this.cfg.notebookInVault || []).length;
+      this.cfg.notebookInVault = (this.cfg.notebookInVault || []).filter((e) => {
+        const bid = typeof e === "string" ? e : e && e.id;
+        return bid && boxes.has(bid);
+      });
+      out.cleaned += before - this.cfg.notebookInVault.length;
+      out.notebooks = boxes.size;
+      await this.saveConfig();
+      this.applyNotebookVisibility();
+      this.applyDocMask();
+      this.refreshPanel();
+    } catch (e) {
+      console.error("[siyuan-edb]", e);
+    }
+    return out;
   }
   /** 工作区 data 目录（思源资产根目录为 <data>/assets）
    *  多来源兜底：app.ws → window.siyuan.config → storagePath 上推（= 工作区/data/storage/petal/<name>）
@@ -9186,7 +9331,7 @@ var EdbPlugin = class extends Plugin {
         updated_at: Date.now()
       });
       if (info.notebook_id)
-        this.docBoxMap[docId] = info.notebook_id;
+        this.rememberDocBox(docId, info.notebook_id);
       const changed = await this.syncDocAssets(docId, info.markdown);
       this.cfg.lastSyncAt = Date.now();
       await this.saveConfig();
@@ -9797,6 +9942,12 @@ var EdbPlugin = class extends Plugin {
     this._viewerState = null;
     this.state = null;
     this.refreshPanel();
+    /* v1.6.69：锁库后立即重新应用"文档树隐藏 + 正文遮罩"，不等 3 秒观察器（此前要等下一轮才隐藏） */
+    try {
+      this.applyNotebookVisibility();
+      this.applyDocMask();
+    } catch (e) {
+    }
   }
   async changePassword(newPwd, hint) {
     if (!this.isUnlocked())
@@ -9875,7 +10026,7 @@ var EdbPlugin = class extends Plugin {
             updated_at: Date.now()
           });
           if (info.notebook_id)
-            this.docBoxMap[docId] = info.notebook_id;
+            this.rememberDocBox(docId, info.notebook_id);
           if (await this.syncDocAssets(docId, info.markdown))
             changed = true;
           changed = true;
@@ -9909,7 +10060,7 @@ var EdbPlugin = class extends Plugin {
             this.cfg.watchlist = this.cfg.watchlist.filter((x) => x !== docId);
             /* v1.6.45: 文档已删除自动移出 → 也进黑名单（防 docs 残留重启回库） */
             this.cfg.excludedDocs = [...new Set([...(this.cfg.excludedDocs || []), docId])];
-            delete this.docBoxMap[docId];
+            this.forgetDocBox(docId);
             changed = true;
           } else {
             console.log("[siyuan-edb] \u6587\u6863\u5B58\u5728\u4F46\u5BFC\u51FA\u5931\u8D25\uFF0C\u4FDD\u7559\u5F85\u91CD\u8BD5", docId);
@@ -10925,7 +11076,7 @@ var EdbPlugin = class extends Plugin {
   /** 当前插件版本（与 plugin.json 同步，发布时手工更新） */
   curVersion() {
     /* v1.6.63 必须与 plugin.json 的 version 保持一致（每次发版两处同步改） */
-    return "1.6.68";
+    return "1.6.69";
   }
   versionAtLeast(latest, cur) {
     const p = (s) => String(s || "").split(".").map((x) => parseInt(x, 10) || 0);
@@ -12216,6 +12367,56 @@ var EdbPlugin = class extends Plugin {
     bakBox.appendChild(mkRow(this.t("backupKeep"), bakKeep));
     bakBox.appendChild(bakBtnRow);
     box.appendChild(bakBox);
+    /* v1.6.69 维护与修复（解决"该笔记本下没有已入库的文档"、菜单误显示、锁定后文档树仍可见） */
+    const repBox = document.createElement("div");
+    repBox.style.cssText = "border:1px solid var(--b3-border-color,#333);border-radius:6px;padding:10px;display:flex;flex-direction:column;gap:8px;";
+    const repTitle = document.createElement("div");
+    repTitle.style.cssText = "font-size:14px;font-weight:bold;";
+    repTitle.textContent = "\u{1F6E0} \u7EF4\u62A4\u4E0E\u4FEE\u590D";
+    repBox.appendChild(repTitle);
+    const repInfo = document.createElement("div");
+    repInfo.style.cssText = "font-size:12px;color:var(--b3-theme-on-background,#666);white-space:pre-wrap;";
+    repInfo.textContent = "\u5BC6\u5E93\u6587\u6863\uFF1A" + (this.cfg.watchlist || []).length + " \u7BC7 \xB7 \u5DF2\u8BC6\u522B\u7B14\u8BB0\u672C\uFF1A" + new Set(Object.values(this.docBoxMap)).size + " \u4E2A \xB7 \u6574\u672C\u6807\u8BB0\uFF1A" + (this.cfg.notebookInVault || []).length + " \u4E2A";
+    repBox.appendChild(repInfo);
+    const repRow = document.createElement("div");
+    repRow.style.cssText = "display:flex;gap:6px;flex-wrap:wrap;";
+    const mkRepBtn = (label, fn) => {
+      const b = document.createElement("button");
+      b.className = "b3-button";
+      b.textContent = label;
+      b.addEventListener("click", async () => {
+        b.disabled = true;
+        try {
+          await fn();
+        } catch (e) {
+          showMessage("\u5931\u8D25\uFF1A" + (e && e.message ? e.message : e));
+        } finally {
+          b.disabled = false;
+        }
+      });
+      return b;
+    };
+    repRow.appendChild(mkRepBtn("\u{1F50D} \u68C0\u67E5\u7D22\u5F15", async () => {
+      const r = await this.checkVaultIndex();
+      repInfo.textContent = "\u68C0\u67E5\u7ED3\u679C\uFF1A\u5BC6\u5E93\u6587\u6863 " + r.total + " \u7BC7\uFF0C\u5DF2\u8BC6\u522B " + r.mapped + " \u7BC7\uFF0C\u7F3A\u5931\u6620\u5C04 " + r.missing + " \u7BC7\uFF0C\u7B14\u8BB0\u672C " + r.notebooks + " \u4E2A\uFF0C\u79FB\u51FA\u9ED1\u540D\u5355 " + r.excl + " \u7BC7";
+      showMessage(r.missing > 0 ? "\u26A0 \u6709 " + r.missing + " \u7BC7\u6587\u6863\u672A\u8BC6\u522B\u6240\u5C5E\u7B14\u8BB0\u672C\uFF0C\u53EF\u70B9\u300C\u91CD\u5EFA\u7D22\u5F15\u300D" : "\u2705 \u7D22\u5F15\u6B63\u5E38");
+    }));
+    repRow.appendChild(mkRepBtn("\u{1F527} \u91CD\u5EFA\u7D22\u5F15", async () => {
+      const r = await this.repairVaultIndex();
+      repInfo.textContent = "\u91CD\u5EFA\u5B8C\u6210\uFF1A\u6587\u6863 " + r.total + " \u7BC7\uFF0C\u5DF2\u8BC6\u522B " + r.mapped + " \uFF0C\u7F3A\u5931 " + r.missing + " \uFF0C\u6E05\u7406\u7F13\u5B58/\u6807\u8BB0 " + r.cleaned + " \u6761\uFF0C\u7B14\u8BB0\u672C " + r.notebooks + " \u4E2A";
+      showMessage("\u2705 \u5BC6\u5E93\u7D22\u5F15\u5DF2\u91CD\u5EFA");
+    }));
+    repRow.appendChild(mkRepBtn("\u{1F441} \u91CD\u65B0\u5E94\u7528\u9690\u85CF", async () => {
+      this.applyNotebookVisibility();
+      this.applyDocMask();
+      showMessage("\u2705 \u5DF2\u91CD\u65B0\u5E94\u7528\u6587\u6863\u6811\u9690\u85CF/\u906E\u7F69");
+    }));
+    repBox.appendChild(repRow);
+    const repTip = document.createElement("div");
+    repTip.style.cssText = "font-size:12px;color:var(--b3-theme-on-background,#888);";
+    repTip.textContent = "\u9047\u5230\u300C\u8BE5\u7B14\u8BB0\u672C\u4E0B\u6CA1\u6709\u5DF2\u5165\u5E93\u7684\u6587\u6863\u300D\u3001\u300C\u83DC\u5355\u663E\u793A\u6574\u672C\u79FB\u51FA\u4F46\u786E\u5B9E\u6CA1\u5165\u5E93\u300D\u3001\u300C\u9501\u5B9A\u540E\u6587\u6863\u6811\u4ECD\u663E\u793A\u6807\u9898\u300D\u65F6\uFF0C\u5148\u70B9\u300C\u91CD\u5EFA\u7D22\u5F15\u300D\uFF1B\u4ECD\u5F02\u5E38\u518D\u53CD\u9988\u3002";
+    repBox.appendChild(repTip);
+    box.appendChild(repBox);
     /* v1.6.50 加密备份导出/导入（带密码单文件 .sydbk，换机迁移用） */
     const expBox = document.createElement("div");
     expBox.style.cssText = "border:1px solid var(--b3-border-color,#333);border-radius:6px;padding:10px;display:flex;flex-direction:column;gap:8px;";
@@ -13158,7 +13359,7 @@ var EdbPlugin = class extends Plugin {
       this.cfg.backupEnabled = bakEnable.checked;
       this.cfg.backupDir = bakDir.value.trim();
       this.cfg.backupIntervalMin = Math.max(1, parseInt(bakInterval.value, 10) || 360);
-      this.cfg.backupKeep = Math.max(1, parseInt(bakKeep.value, 10) || 10);
+      this.cfg.backupKeep = Math.min(100, Math.max(1, parseInt(bakKeep.value, 10) || 10));
       this.cfg.idleLockMin = Math.max(0, parseInt(idleLock.value, 10) || 0);
       this.cfg.autoRules = this.parseAutoRules(ruleText.value);
       this.cfg.smartSplit = smartCb.checked;
@@ -13352,7 +13553,7 @@ var EdbPlugin = class extends Plugin {
     /* v1.6.45: 新建加入 → 黑名单移除 */
     this.cfg.excludedDocs = (this.cfg.excludedDocs || []).filter((x) => x !== newId);
     if (notebook)
-      this.docBoxMap[newId] = notebook;
+      this.rememberDocBox(newId, notebook);
     await this.saveConfig();
     await this.syncNow();
     return { count, zipBytes };

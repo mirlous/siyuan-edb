@@ -6737,8 +6737,15 @@ var EdbPlugin = class extends Plugin {
       /* v1.6.35 云端授权：onlineUrl 为空 = 纯离线（默认）；非空 = 激活联网登记 + 启动校验 */
       onlineUrl: "",
       onlineLastCheck: 0,
-      /* v1.6.52 离线超时锁库：超过该天数未连上云端 → 授权失效（防断网规避撤销/到期） */
-      onlineGraceDays: 3,
+      /* v1.6.52 离线超时锁库；v1.6.67 改为按套餐宽限（M7/H10/Y15/F30），此值为兜底、云端可下发覆盖 */
+      onlineGraceDays: 14,
+      /* v1.6.67 云端下发宽限天数（check 响应 grace）+ 校验失败计数 + 时钟水位线 */
+      srvGraceDays: 0,
+      checkFailN: 0,
+      checkLastErr: "",
+      checkLastOkAt: 0,
+      maxSeenTs: 0,
+      maxSeenSavedAt: 0,
       /* v1.6.53 单篇独立加密：docId → {salt, hash}（整库解锁后仍需本篇独立密码） */
       docLocks: {}
     };
@@ -6751,6 +6758,9 @@ var EdbPlugin = class extends Plugin {
     this.openDocs = {};
     this.noPwd = false;
     this.licState = null;
+    /* v1.6.67 先放后锁：首次云端校验出结果前不按"上次成功校验久远"锁库 */
+    this._checkResolved = false;
+    this._licUiState = void 0;
   }
   async onload() {
     try {
@@ -9686,11 +9696,11 @@ var EdbPlugin = class extends Plugin {
         showMessage(this.t("unlocked"));
         /* v1.6.50 到期续费闭环：解锁成功但授权异常 → 明确提示（密库数据完整保留，续费后自动恢复） */
         if (!this.isLicensed()) {
-          const offlineLock = this.edbOnlineUrl() && this.cfg.onlineLastCheck && (this.nowTs() - this.cfg.onlineLastCheck) > (this.cfg.onlineGraceDays || 3) * 864e5;
+          const offlineLock = this.edbOnlineUrl() && this._checkResolved && this.cfg.onlineLastCheck && (this.nowTs() - this.cfg.onlineLastCheck) > this.onlineGraceMs();
           const expMsg = this.cfg.revoked
             ? "\u23F3 " + this.t("licRevoked")
             : offlineLock
-              ? "\u23F3 " + this.t("offlineLockMsg").replace("{0}", this.cfg.onlineGraceDays || 3)
+              ? "\u23F3 " + this.t("offlineLockMsg").replace("{0}", this.onlineGraceDaysEff())
               : !this.licState
                 ? "\u23F3 " + this.t("trialOverMsg")
                 : "\u23F3 " + this.t("licExpired");
@@ -10915,7 +10925,7 @@ var EdbPlugin = class extends Plugin {
   /** 当前插件版本（与 plugin.json 同步，发布时手工更新） */
   curVersion() {
     /* v1.6.63 必须与 plugin.json 的 version 保持一致（每次发版两处同步改） */
-    return "1.6.66";
+    return "1.6.67";
   }
   versionAtLeast(latest, cur) {
     const p = (s) => String(s || "").split(".").map((x) => parseInt(x, 10) || 0);
@@ -11198,6 +11208,15 @@ var EdbPlugin = class extends Plugin {
         });
       }
       elc.appendChild(tb);
+    }
+    /* v1.6.67 云端校验状态（连续失败次数可见；宽限期内仍可用） */
+    if (this.licState && Number(this.cfg.checkFailN) > 0) {
+      const wf = document.createElement("div");
+      wf.style.cssText = "padding:4px 10px;font-size:12px;color:#e6a23c;";
+      const okAt = Number(this.cfg.checkLastOkAt) || 0;
+      const lastOkTxt = okAt ? new Date(okAt).toLocaleString() : "从未成功";
+      wf.textContent = "\u26A0 \u4E91\u7AEF\u6821\u9A8C\u8FDE\u7EED\u5931\u8D25 " + Number(this.cfg.checkFailN) + " \u6B21\uFF08\u5BBD\u9650 " + this.onlineGraceDaysEff() + " \u5929\u5185\u4ECD\u53EF\u6B63\u5E38\u4F7F\u7528\uFF1B\u4E0A\u6B21\u6210\u529F\uFF1A" + lastOkTxt + "\uFF09";
+      elc.appendChild(wf);
     }
     const vaults = this.vaultList();
     {
@@ -13833,15 +13852,34 @@ var EdbPlugin = class extends Plugin {
     const url = String(this.edbOnlineUrl()).replace(/\/+$/, "").replace(/\/api\.php$/i, "");
     if (!url || !this.licState) {
       this._checking = false;
+      this._checkResolved = true;
       return;
     }
+    let _to = null;
     try {
+      /* v1.6.67 校验请求加 8s 超时：避免网络差时长期卡在"未校验"状态 */
+      const ctrl = typeof AbortController !== "undefined" ? new AbortController() : null;
+      if (ctrl)
+        _to = setTimeout(() => { try { ctrl.abort(); } catch (e) {} }, 8000);
       const res = await fetch(url + "/api.php?action=check", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
+        signal: ctrl ? ctrl.signal : void 0,
         body: JSON.stringify({ code: this.licState.n, fp: this.licState.fp, activatedAt: this.licState.activatedAt || 0, expAt: this.licState.expAt || 0 })
       });
       const j = await res.json();
+      /* v1.6.67 校验成功：清零失败计数、记录成功时间、采纳云端下发宽限（1~120 天） */
+      this.cfg.checkFailN = 0;
+      this.cfg.checkLastOkAt = Date.now();
+      this.cfg.checkLastErr = "";
+      let _graceDirty = false;
+      if (j && j.grace) {
+        const g = Number(j.grace) || 0;
+        if (g >= 1 && g <= 120 && g !== Number(this.cfg.srvGraceDays)) {
+          this.cfg.srvGraceDays = g;
+          _graceDirty = true;
+        }
+      }
       /* v1.6.62 降频落盘：原先每 10 分钟校验后都 saveConfig() → petal 内 config.json 变化 → 思源监听到数据变更会整插件 reload
          （实测 temp\siyuan.log 每 10 分钟一条 dataChanges=[siyuan-edb]）。改为：
            ① 本地时钟相对服务器锚点漂移 >2 分钟（含用户改系统时间）才刷新锚点并落盘；
@@ -13863,6 +13901,8 @@ var EdbPlugin = class extends Plugin {
         this.cfg.onlineLastCheck = nowMs;
         _dirty = true;
       }
+      if (_graceDirty)
+        _dirty = true;
       if (_dirty) {
         try {
           await this.saveConfig();
@@ -13913,8 +13953,28 @@ var EdbPlugin = class extends Plugin {
         } catch (e) {
         }
       }
+      /* v1.6.67 先放后锁：成功校验后刷新一次面板（解除启动时"离线锁库"的残留显示） */
+      const licBefore = this._licUiState;
+      this._licUiState = this.isLicensed();
+      if (licBefore === void 0 || licBefore !== this._licUiState)
+        this.refreshPanel();
     } catch (e) {
+      /* v1.6.67 校验失败：记录连续失败次数（宽限期内仍可用，面板可见） */
+      this.cfg.checkFailN = (Number(this.cfg.checkFailN) || 0) + 1;
+      this.cfg.checkLastErr = String((e && e.message) || e || "network").slice(0, 80);
+      try {
+        await this.saveConfig();
+      } catch (e2) {
+      }
+      this.refreshPanel();
     } finally {
+      if (_to) {
+        try {
+          clearTimeout(_to);
+        } catch (e) {
+        }
+      }
+      this._checkResolved = true;
       this._checking = false;
     }
   }
@@ -13938,21 +13998,41 @@ var EdbPlugin = class extends Plugin {
       return Date.now() - st.l + st.s;
     return Date.now();
   }
+  /** v1.6.67 生效离线宽限（天）：云端下发 > 套餐映射 > 配置兜底 */
+  onlineGraceDaysEff() {
+    const map = { M: 7, H: 10, Y: 15, F: 30 };
+    let d = 0;
+    const plan = this.licState && this.licState.t;
+    if (plan && map[plan])
+      d = map[plan];
+    if (!d)
+      d = Number(this.cfg.onlineGraceDays) || 14;
+    const srv = Number(this.cfg.srvGraceDays) || 0;
+    if (srv >= 1 && srv <= 120)
+      d = srv;
+    return d;
+  }
+  onlineGraceMs() {
+    return this.onlineGraceDaysEff() * 864e5;
+  }
   /** 是否在授权有效期内（含试用模式） */
   isLicensed() {
     if (this.cfg.revoked)
-      return false;
-    /* v1.6.52 离线超时锁库：超过宽限期未连上云端 → 授权失效（防断网规避撤销/到期）；联网校验成功后自动恢复 */
-    if (this.edbOnlineUrl() && this.cfg.onlineLastCheck && this.nowTs() - this.cfg.onlineLastCheck > (this.cfg.onlineGraceDays || 3) * 864e5)
       return false;
     if (this.cfg.clockRollback)
       return false;
     if (this.cfg.bindMismatch)
       return false;
     if (this.licState) {
-      if (this.licState.expAt === 0)
-        return true;
-      return this.nowTs() < this.licState.expAt;
+      /* 到期：本地签名数据硬判，离线也精确执行（不受联网/宽限影响） */
+      if (this.licState.expAt !== 0 && this.nowTs() >= this.licState.expAt)
+        return false;
+      /* v1.6.67 先放后锁：启动后首次云端校验出结果前，不因"上次成功校验过久"锁库；
+         出结果（_checkResolved=true）后才按宽限判定，只有云端明确 revoked 才立刻锁。 */
+      if (this._checkResolved && this.edbOnlineUrl() && this.cfg.onlineLastCheck
+          && this.nowTs() - this.cfg.onlineLastCheck > this.onlineGraceMs())
+        return false;
+      return true;
     }
     return this.isTrialValid();
   }
@@ -14271,7 +14351,10 @@ var EdbPlugin = class extends Plugin {
   clockGuard() {
     try {
       const now = Date.now();
-      if (this.cfg.lastSeen && now < this.cfg.lastSeen - 5 * 6e4) {
+      /* v1.6.67 时钟水位线：取 maxSeenTs/lastSeen 的最大值（只增不减），
+         防"回拨"也防"启动前把钟调回旧时间"；水位线每 6 小时落盘一次（重启后仍有效）。 */
+      const mark = Math.max(Number(this.cfg.maxSeenTs) || 0, Number(this.cfg.lastSeen) || 0);
+      if (mark && now < mark - 5 * 6e4) {
         if (!this.cfg.clockRollback) {
           this.cfg.clockRollback = true;
           console.warn("[siyuan-edb] \u68C0\u6D4B\u5230\u7CFB\u7EDF\u65F6\u949F\u56DE\u62E8\uFF0C\u6388\u6743/\u8BD5\u7528\u5DF2\u51BB\u7ED3");
@@ -14282,7 +14365,7 @@ var EdbPlugin = class extends Plugin {
         }
       } else {
         if (this.cfg.clockRollback) {
-          if (now >= this.cfg.lastSeen) {
+          if (now >= mark) {
             this.cfg.clockRollback = false;
             this.saveConfig().catch(() => {
             });
@@ -14291,6 +14374,13 @@ var EdbPlugin = class extends Plugin {
         }
       }
       this.cfg.lastSeen = Math.max(this.cfg.lastSeen || 0, now);
+      this.cfg.maxSeenTs = Math.max(mark, now);
+      /* 水位线定期落盘（6 小时一次；失败不重试） */
+      if (!this.cfg.maxSeenSavedAt || now - Number(this.cfg.maxSeenSavedAt) > 6 * 36e5) {
+        this.cfg.maxSeenSavedAt = now;
+        this.saveConfig().catch(() => {
+        });
+      }
     } catch (e) {
     }
   }

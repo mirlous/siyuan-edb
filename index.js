@@ -10915,7 +10915,7 @@ var EdbPlugin = class extends Plugin {
   /** 当前插件版本（与 plugin.json 同步，发布时手工更新） */
   curVersion() {
     /* v1.6.63 必须与 plugin.json 的 version 保持一致（每次发版两处同步改） */
-    return "1.6.65";
+    return "1.6.66";
   }
   versionAtLeast(latest, cur) {
     const p = (s) => String(s || "").split(".").map((x) => parseInt(x, 10) || 0);
@@ -14078,6 +14078,14 @@ var EdbPlugin = class extends Plugin {
     this._hwId = crypto2.createHash("sha256").update(parts.join("|")).digest("hex").slice(0, 32).toUpperCase();
     return this._hwId;
   }
+  /** 设备键哈希前缀（= 服务端 substr(sha256("edb-hw:"+hw),0,16)，租约 payload 里的 k 就是这个） */
+  hwKeyPrefix() {
+    try {
+      return crypto2.createHash("sha256").update("edb-hw:" + String(this.hwId()).toLowerCase()).digest("hex").slice(0, 16);
+    } catch (e) {
+      return "";
+    }
+  }
   trialPubPem() {
     return Buffer.from(EDB_TRIAL_PUB_PEM_B64, "base64").toString("utf8");
   }
@@ -14116,8 +14124,7 @@ var EdbPlugin = class extends Plugin {
     const info = this.trialLeaseInfo();
     if (!info)
       return false;
-    const hw = this.hwId();
-    if (info.k && hw && !hw.toUpperCase().startsWith(String(info.k).toUpperCase()))
+    if (info.k && this.hwKeyPrefix() !== String(info.k).toLowerCase())
       return false;
     return this.nowTs() < info.exp;
   }
@@ -14151,8 +14158,7 @@ var EdbPlugin = class extends Plugin {
       const info = this.verifyTrialLease(j && j.lease);
       if (!info)
         return;
-      const hw = this.hwId();
-      if (info.k && hw && !hw.toUpperCase().startsWith(String(info.k).toUpperCase()))
+      if (info.k && this.hwKeyPrefix() !== String(info.k).toLowerCase())
         return;
       this.cfg.trialLease = String(j.lease);
       this.cfg.trialLeaseExp = info.exp;
@@ -14194,8 +14200,7 @@ var EdbPlugin = class extends Plugin {
     const info = this.verifyTrialLease(j.lease);
     if (!info)
       throw new Error("租约验签失败（可能被篡改）");
-    const hw = this.hwId();
-    if (info.k && !hw.toUpperCase().startsWith(String(info.k).toUpperCase()))
+    if (info.k && this.hwKeyPrefix() !== String(info.k).toLowerCase())
       throw new Error("租约与当前设备不匹配");
     this.cfg.trialLease = String(j.lease);
     this.cfg.trialLeaseExp = Number(j.exp) || info.exp;

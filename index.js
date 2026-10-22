@@ -6698,6 +6698,8 @@ var EdbPlugin = class extends Plugin {
       docBox: {},
       /* v1.6.70 单篇加入密库时是否连同子文档树一起加密（默认开，符合"文档分支=一个整体"的直觉） */
       includeSubDocs: true,
+      /* v1.6.71 历史数据（只加了父文档）是否已做过一次性子文档补全 */
+      subDocsFixed: false,
       autoSync: true,
       lastSyncAt: 0,
       keepPlain: false,
@@ -6792,6 +6794,11 @@ var EdbPlugin = class extends Plugin {
     setTimeout(() => {
       this.tryAutoUnlock().catch((e) => console.error("[siyuan-edb]", e));
     }, 800);
+    /* v1.6.71 历史数据一次性自动补全子文档（锁定时不跑，解锁后会再触发） */
+    setTimeout(() => {
+      this.autoFixSubDocsOnce().catch(() => {
+      });
+    }, 3200);
     this._watchTimer = setInterval(async () => {
       try {
         this.clockGuard();
@@ -8070,7 +8077,7 @@ var EdbPlugin = class extends Plugin {
       const isIn = this.cfg.watchlist.includes(docId) && !(this.cfg.excludedDocs || []).includes(docId);
       menu.addItem({
         icon: "iconKey",
-        label: isIn ? this.t("menuRemove") : this.t("menuAdd"),
+        label: isIn ? this.t("menuRemove") : this.t("menuAdd") + (this.cfg.includeSubDocs !== false ? "\uFF08\u542B\u5B50\u6587\u6863\uFF09" : ""),
         click: async () => {
           if (isIn)
             this.removeFromVault(docId);
@@ -8091,19 +8098,6 @@ var EdbPlugin = class extends Plugin {
           label: this.t("menuBurnShare") || "\u{1F525} \u9605\u540E\u5373\u711A\u5206\u4EAB\uFF08\u4E00\u6B21\u6027\u94FE\u63A5\uFF09",
           click: () => {
             this.createBurnShare(docId).catch((e) => console.error("[siyuan-edb]", e));
-          }
-        });
-        /* v1.6.70 手动补全子文档（此前只加父文档的用户可一键补齐） */
-        menu.addItem({
-          icon: "iconList",
-          label: "\u{1F4DA} \u8865\u5168\u5B50\u6587\u6863\u5165\u5E93",
-          click: async () => {
-            try {
-              const r = await this.addMissingSubDocs(docId);
-              showMessage(r.added > 0 ? "\u2705 \u5DF2\u8865\u5165\u5B50\u6587\u6863 " + r.added + " \u7BC7" : (r.total > 0 ? "\u5B50\u6587\u6863\u5DF2\u5168\u90E8\u5728\u5E93\uFF08" + r.total + " \u7BC7\uFF09" : "\u8BE5\u6587\u6863\u6CA1\u6709\u5B50\u6587\u6863"));
-            } catch (e) {
-              showMessage(this.t("addFail") + "\uFF1A" + (e && e.message ? e.message : e));
-            }
           }
         });
       }
@@ -9709,6 +9703,47 @@ var EdbPlugin = class extends Plugin {
     }
     return { added, total: subs.length };
   }
+  /** v1.6.71 一次性自动补全：升级前"只加了父文档"的历史数据，启动后自动补齐子文档（用户无需手动点） */
+  async autoFixSubDocsOnce() {
+    try {
+      if (this.cfg.subDocsFixed)
+        return 0;
+      if (!this.isUnlocked() || !this.isLicensed())
+        return 0;
+      const missing = [];
+      const missSet = new Set();
+      for (const docId of [...(this.cfg.watchlist || [])]) {
+        try {
+          const box = await this.boxOfDoc(docId);
+          if (!box)
+            continue;
+          const subs = await this.listSubDocIds(box, docId);
+          for (const sid of subs) {
+            if (this.cfg.watchlist.includes(sid) || missSet.has(sid))
+              continue;
+            missSet.add(sid);
+            missing.push(sid);
+            this.rememberDocBox(sid, box);
+          }
+        } catch (e) {
+        }
+      }
+      if (missing.length) {
+        this.cfg.watchlist = this.cfg.watchlist.concat(missing);
+        this.cfg.excludedDocs = (this.cfg.excludedDocs || []).filter((x) => !missSet.has(x));
+        await this.saveConfig();
+        await this.syncNow();
+        this.refreshPanel();
+        this.applyNotebookVisibility();
+        showMessage("\u2705 \u5DF2\u81EA\u52A8\u8865\u5168\u5386\u53F2\u5B50\u6587\u6863 " + missing.length + " \u7BC7\uFF08\u4E00\u6B21\u6027\u8FC1\u79FB\uFF09");
+      }
+      this.cfg.subDocsFixed = true;
+      await this.saveConfig();
+      return missing.length;
+    } catch (e) {
+      return 0;
+    }
+  }
   /** v1.6.70 补全所有已入库文档的子文档（维护按钮用） */
   async addMissingSubDocsAll() {
     let added = 0, scanned = 0, docsWithSub = 0;
@@ -9979,6 +10014,11 @@ var EdbPlugin = class extends Plugin {
         if (r.migrated)
           showMessage(this.t("vaultUpgraded") || "\u52A0\u5BC6\u5F15\u64CE\u5DF2\u5347\u7EA7\uFF08MK \u4FE1\u5C01\uFF09\uFF0C\u6570\u636E\u5B8C\u6574");
         showMessage(this.t("unlocked"));
+        /* v1.6.71 解锁后补跑一次历史子文档自动补全（启动时若处于锁定状态会跳过） */
+        setTimeout(() => {
+          this.autoFixSubDocsOnce().catch(() => {
+          });
+        }, 1500);
         /* v1.6.50 到期续费闭环：解锁成功但授权异常 → 明确提示（密库数据完整保留，续费后自动恢复） */
         if (!this.isLicensed()) {
           const offlineLock = this.edbOnlineUrl() && this._checkResolved && this.cfg.onlineLastCheck && (this.nowTs() - this.cfg.onlineLastCheck) > this.onlineGraceMs();
@@ -11216,7 +11256,7 @@ var EdbPlugin = class extends Plugin {
   /** 当前插件版本（与 plugin.json 同步，发布时手工更新） */
   curVersion() {
     /* v1.6.63 必须与 plugin.json 的 version 保持一致（每次发版两处同步改） */
-    return "1.6.70";
+    return "1.6.71";
   }
   versionAtLeast(latest, cur) {
     const p = (s) => String(s || "").split(".").map((x) => parseInt(x, 10) || 0);

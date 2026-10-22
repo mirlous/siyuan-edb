@@ -6869,7 +6869,14 @@ var EdbPlugin = class extends Plugin {
       icon: '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16"><image href="data:image/png;base64,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" width="16" height="16" x="0" y="0"/></svg>',
       title: this.t("panelTitle"),
       position: "right",
-      callback: () => this.openPanelDialog()
+      callback: () => {
+        try {
+          this.openPanelDialog();
+        } catch (e) {
+          this.savePanelError("topbar", e);
+          showMessage("\u6253\u5F00\u9762\u677F\u5931\u8D25\uFF1A" + (e && e.message ? e.message : e));
+        }
+      }
     });
     this.addCommand({
       langKey: "openPanel",
@@ -11280,7 +11287,7 @@ var EdbPlugin = class extends Plugin {
   /** 当前插件版本（与 plugin.json 同步，发布时手工更新） */
   curVersion() {
     /* v1.6.63 必须与 plugin.json 的 version 保持一致（每次发版两处同步改） */
-    return "1.6.73";
+    return "1.6.74";
   }
   versionAtLeast(latest, cur) {
     const p = (s) => String(s || "").split(".").map((x) => parseInt(x, 10) || 0);
@@ -11426,7 +11433,36 @@ var EdbPlugin = class extends Plugin {
     } catch (e) {
     }
   }
+  /** v1.6.74 面板渲染保护：任何异常都不再让面板"空白打不开"，并把错误写进 panel-error.log 便于排查 */
   refreshPanel(el) {
+    try {
+      this._refreshPanel(el);
+    } catch (e) {
+      console.error("[siyuan-edb] refreshPanel 失败", e);
+      this.savePanelError("refreshPanel", e);
+      try {
+        const target = el || this.panelEl;
+        if (target) {
+          target.innerHTML = "";
+          const d = document.createElement("div");
+          d.style.cssText = "padding:12px;font-size:13px;line-height:1.7;color:#d23f31;";
+          d.textContent = "\u9762\u677F\u6E32\u67D3\u5931\u8D25\uFF1A" + (e && e.message ? e.message : e) + "\uFF08\u5DF2\u8BB0\u5F55\u5230 panel-error.log\uFF0C\u53EF\u70B9\u9876\u90E8\u56FE\u6807\u91CD\u8BD5\uFF09";
+          target.appendChild(d);
+        }
+      } catch (e2) {
+      }
+    }
+  }
+  /** v1.6.74 记录面板错误（覆盖式，保留最近一次完整堆栈） */
+  savePanelError(where, e) {
+    try {
+      const msg = new Date().toISOString() + " [" + where + "] " + String((e && e.stack) || (e && e.message) || e) + "\n";
+      this.saveData("panel-error.log", msg).catch(() => {
+      });
+    } catch (e2) {
+    }
+  }
+  _refreshPanel(el) {
     const target = el || this.panelEl;
     if (!target)
       return;
@@ -11579,7 +11615,8 @@ var EdbPlugin = class extends Plugin {
       vb.style.cssText = "display:flex;flex-wrap:wrap;gap:6px;align-items:center;font-size:12px;";
       if (vaults.length) {
         const vl = document.createElement("span");
-        vl.textContent = this.t("vaultCurrent") + "\uFF1A" + vaults[this.cfg.activeVault].name;
+        const _curV = vaults[this.cfg.activeVault] || vaults.find((x) => x.active) || vaults[0];
+        vl.textContent = this.t("vaultCurrent") + "\uFF1A" + (_curV ? _curV.name : "-");
         vl.style.cssText = "font-weight:bold;";
         vb.appendChild(vl);
         for (const v of vaults) {
@@ -11903,13 +11940,45 @@ var EdbPlugin = class extends Plugin {
     this.dialog = this.openDialog(this.t("viewTitle") + "\uFF1A" + (doc.title || docId), box, "680px", "560px");
   }
   openPanelDialog() {
-    const box = document.createElement("div");
-    box.style.cssText = "width:640px;";
-    const inner = document.createElement("div");
-    inner.style.cssText = "max-height:480px;overflow:auto;display:flex;flex-direction:column;gap:8px;";
-    box.appendChild(inner);
-    this.refreshPanel(inner);
-    this.dialog = this.openDialog(this.t("panelTitle"), box, "680px", "600px");
+    try {
+      const box = document.createElement("div");
+      box.style.cssText = "width:640px;";
+      const inner = document.createElement("div");
+      inner.style.cssText = "max-height:480px;overflow:auto;display:flex;flex-direction:column;gap:8px;";
+      box.appendChild(inner);
+      this.refreshPanel(inner);
+      this.dialog = this.openDialog(this.t("panelTitle"), box, "680px", "600px");
+    } catch (e) {
+      /* v1.6.74 兜底：即使面板构建失败也要弹出一个可交互的窗口，避免"点了图标没反应" */
+      console.error("[siyuan-edb] openPanelDialog 失败", e);
+      this.savePanelError("openPanelDialog", e);
+      try {
+        const box2 = document.createElement("div");
+        box2.style.cssText = "width:560px;font-size:13px;line-height:1.8;";
+        const d1 = document.createElement("div");
+        d1.style.cssText = "color:#d23f31;font-weight:bold;";
+        d1.textContent = "\u9762\u677F\u52A0\u8F7D\u5931\u8D25\uFF1A" + (e && e.message ? e.message : e);
+        const d2 = document.createElement("div");
+        d2.style.cssText = "color:var(--b3-theme-on-background,#666);margin-top:6px;";
+        d2.textContent = "\u9519\u8BEF\u5DF2\u8BB0\u5F55\u5230\u63D2\u4EF6\u6570\u636E\u76EE\u5F55\u7684 panel-error.log\u3002\u53EF\u5148\u91CD\u8BD5\uFF1B\u4ECD\u4E0D\u884C\u5C31\u628A\u8BE5\u65E5\u5FD7\u53D1\u7ED9\u5F00\u53D1\u8005\u3002";
+        const retry = document.createElement("button");
+        retry.className = "b3-button b3-button--text";
+        retry.textContent = "\u91CD\u8BD5\u6253\u5F00\u9762\u677F";
+        retry.addEventListener("click", () => {
+          try {
+            this.dialog && this.dialog.destroy && this.dialog.destroy();
+          } catch (e2) {
+          }
+          this.dialog = null;
+          setTimeout(() => this.openPanelDialog(), 30);
+        });
+        box2.appendChild(d1);
+        box2.appendChild(d2);
+        box2.appendChild(retry);
+        this.dialog = this.openDialog(this.t("panelTitle"), box2, "600px", "auto");
+      } catch (e3) {
+      }
+    }
   }
   /** 库内回收站：移出/删除的资产先进这里（软删除、数据块保留），可选恢复或彻底删除 */
   openTrashDialog() {

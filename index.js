@@ -11280,7 +11280,7 @@ var EdbPlugin = class extends Plugin {
   /** 当前插件版本（与 plugin.json 同步，发布时手工更新） */
   curVersion() {
     /* v1.6.63 必须与 plugin.json 的 version 保持一致（每次发版两处同步改） */
-    return "1.6.72";
+    return "1.6.73";
   }
   versionAtLeast(latest, cur) {
     const p = (s) => String(s || "").split(".").map((x) => parseInt(x, 10) || 0);
@@ -12993,10 +12993,42 @@ var EdbPlugin = class extends Plugin {
     payQrImg.src = "data:image/png;base64," + (typeof EDB_PAY_QR_B64 !== "undefined" ? EDB_PAY_QR_B64 : "");
     const payQrHint = document.createElement("div");
     payQrHint.style.cssText = "font-size:12px;color:var(--b3-theme-on-background,#666);line-height:1.6;";
-    payQrHint.textContent = "\u70B9\u5355\u7801\u52A0\u8F7D\u4E2D\u2026";
+    payQrHint.textContent = "\u70B9\u5355\u7801\u52A0\u8F7D\u4E2D\u2026\uFF08\u52A0\u8F7D\u5B8C\u6210\u540E\u70B9\u51FB\u4E8C\u7EF4\u7801\u53EF\u653E\u5927\uFF09";
     payQrBox.appendChild(payQrImg);
     payQrBox.appendChild(payQrHint);
     payBox.appendChild(payQrBox);
+    /* v1.6.73 收款码点击放大（弹层；点击空白处 / Esc 关闭） */
+    const showPayQrLarge = () => {
+      try {
+        const old = document.getElementById("edb-qr-overlay");
+        if (old)
+          old.remove();
+        const ov = document.createElement("div");
+        ov.id = "edb-qr-overlay";
+        ov.style.cssText = "position:fixed;inset:0;z-index:99999;background:rgba(0,0,0,.72);display:flex;align-items:center;justify-content:center;flex-direction:column;gap:10px;cursor:zoom-out;";
+        const big = document.createElement("img");
+        big.src = payQrImg.src;
+        big.style.cssText = "max-width:min(86vw,86vh);max-height:86vh;background:#fff;border-radius:8px;padding:8px;box-shadow:0 8px 40px rgba(0,0,0,.5);";
+        const tip = document.createElement("div");
+        tip.style.cssText = "color:#fff;font-size:13px;opacity:.85;";
+        tip.textContent = "\u5FAE\u4FE1\u626B\u7801\u70B9\u5355\u4ED8\u6B3E \xB7 \u70B9\u51FB\u7A7A\u767D\u5904\u5173\u95ED";
+        ov.appendChild(big);
+        ov.appendChild(tip);
+        ov.addEventListener("click", () => ov.remove());
+        const onKey = (ev) => {
+          if (ev.key === "Escape") {
+            ov.remove();
+            document.removeEventListener("keydown", onKey);
+          }
+        };
+        document.addEventListener("keydown", onKey);
+        document.body.appendChild(ov);
+      } catch (e) {
+      }
+    };
+    payQrImg.style.cursor = "zoom-in";
+    payQrImg.title = "\u70B9\u51FB\u653E\u5927\u6536\u6B3E\u7801";
+    payQrImg.addEventListener("click", showPayQrLarge);
     (async () => {
       try {
         const url = String(this.edbOnlineUrl()).replace(/\/+$/, "").replace(/\/api\.php$/i, "");
@@ -13008,9 +13040,9 @@ var EdbPlugin = class extends Plugin {
         const j = await res.json();
         if (j && j.pay_qr) {
           payQrImg.src = j.pay_qr;
-          payQrHint.textContent = j.pay_mode === "auto" ? "\u5168\u81EA\u52A8\u652F\u4ED8\u6A21\u5F0F" : "\u5FAE\u4FE1\u626B\u7801\u70B9\u5355\u4ED8\u6B3E\uFF0C\u4ED8\u6B3E\u540E\u586B\u5355\u53F7";
+          payQrHint.textContent = (j.pay_mode === "auto" ? "\u5168\u81EA\u52A8\u652F\u4ED8\u6A21\u5F0F" : "\u5FAE\u4FE1\u626B\u7801\u70B9\u5355\u4ED8\u6B3E\uFF0C\u4ED8\u6B3E\u540E\u586B\u5355\u53F7") + "\uFF1B\u70B9\u51FB\u4E8C\u7EF4\u7801\u53EF\u653E\u5927";
         } else {
-          payQrHint.textContent = "\u5DF2\u663E\u793A\u5185\u7F6E\u6536\u6B3E\u7801\uFF0C\u626B\u7801\u4ED8\u6B3E\u540E\u586B\u652F\u4ED8\u5355\u53F7";
+          payQrHint.textContent = "\u5DF2\u663E\u793A\u5185\u7F6E\u6536\u6B3E\u7801\uFF0C\u626B\u7801\u4ED8\u6B3E\u540E\u586B\u652F\u4ED8\u5355\u53F7\uFF1B\u70B9\u51FB\u4E8C\u7EF4\u7801\u53EF\u653E\u5927";
         }
       } catch (e) {
         payQrHint.textContent = "\u70B9\u5355\u7801\u52A0\u8F7D\u5931\u8D25\uFF0C\u8BF7\u8054\u7F51\u540E\u5237\u65B0";

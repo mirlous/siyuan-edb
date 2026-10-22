@@ -6700,6 +6700,7 @@ var EdbPlugin = class extends Plugin {
       includeSubDocs: true,
       /* v1.6.71 历史数据（只加了父文档）是否已做过一次性子文档补全 */
       subDocsFixed: false,
+      subDocsFixedV: "",
       autoSync: true,
       lastSyncAt: 0,
       keepPlain: false,
@@ -8924,15 +8925,15 @@ var EdbPlugin = class extends Plugin {
         const chunk = ids.slice(i, i + 200);
         let rows = [];
         try {
-          const res = await fetchSyncPost("/api/query/sql", { stmt: "SELECT id, box_id FROM blocks WHERE id IN ('" + chunk.join("','") + "')" });
+          const res = await fetchSyncPost("/api/query/sql", { stmt: "SELECT id, box FROM blocks WHERE id IN ('" + chunk.join("','") + "')" });
           rows = res && res.data || [];
         } catch (e) {
           rows = [];
         }
         for (const r of rows) {
-          if (r && r.id && r.box_id) {
-            this.docBoxMap[r.id] = r.box_id;
-            this.cfg.docBox[r.id] = r.box_id;
+          if (r && r.id && r.box) {
+            this.docBoxMap[r.id] = r.box;
+            this.cfg.docBox[r.id] = r.box;
             changed = true;
           }
         }
@@ -9628,6 +9629,11 @@ var EdbPlugin = class extends Plugin {
         this.applyNotebookVisibility();
         showMessage("\u2705 " + this.t("addOk") + (subAdded > 0 ? "\uFF08\u542B\u5B50\u6587\u6863 " + subAdded + " \u7BC7\uFF09" : ""));
       } else {
+        /* v1.6.72 已在库也强制同步一次：确保"点了加入但数据没进库"的情况被修复 */
+        try {
+          await this.syncNow();
+        } catch (e2) {
+        }
         showMessage(this.t("addOk"));
       }
     } catch (e) {
@@ -9642,11 +9648,11 @@ var EdbPlugin = class extends Plugin {
         return this.docBoxMap[docId];
       if (this.cfg.docBox && this.cfg.docBox[docId])
         return this.cfg.docBox[docId];
-      const r = await fetchSyncPost("/api/query/sql", { stmt: "SELECT box_id FROM blocks WHERE id = '" + String(docId).replace(/'/g, "''") + "'" });
+      const r = await fetchSyncPost("/api/query/sql", { stmt: "SELECT box FROM blocks WHERE id = '" + String(docId).replace(/'/g, "''") + "'" });
       const row = ((r && r.data) || [])[0];
-      if (row && row.box_id) {
-        this.rememberDocBox(docId, row.box_id);
-        return row.box_id;
+      if (row && row.box) {
+        this.rememberDocBox(docId, row.box);
+        return row.box;
       }
     } catch (e) {
     }
@@ -9678,6 +9684,22 @@ var EdbPlugin = class extends Plugin {
     } catch (e) {
       console.error("[siyuan-edb] listSubDocIds", e);
     }
+    /* v1.6.72 SQL 兜底：按文档 path 前缀找子文档（FS 不可读/路径异常时更可靠） */
+    if (!out.length) {
+      try {
+        const pr = await fetchSyncPost("/api/query/sql", { stmt: "SELECT path FROM blocks WHERE id = '" + String(docId).replace(/'/g, "''") + "' AND type = 'd'" });
+        const prow = ((pr && pr.data) || [])[0];
+        if (prow && prow.path) {
+          const prefix = String(prow.path).replace(/\.sy$/i, "") + "/";
+          const r2 = await fetchSyncPost("/api/query/sql", { stmt: "SELECT id FROM blocks WHERE type = 'd' AND box = '" + String(box).replace(/'/g, "''") + "' AND path LIKE '" + prefix.replace(/'/g, "''") + "%'" });
+          for (const row of ((r2 && r2.data) || [])) {
+            if (row && row.id && row.id !== docId)
+              out.push(row.id);
+          }
+        }
+      } catch (e) {
+      }
+    }
     return [...new Set(out)].filter((x) => x !== docId);
   }
   /** v1.6.70 补全单个文档的子文档（已入库但只加过父文档时修复用） */
@@ -9706,7 +9728,8 @@ var EdbPlugin = class extends Plugin {
   /** v1.6.71 一次性自动补全：升级前"只加了父文档"的历史数据，启动后自动补齐子文档（用户无需手动点） */
   async autoFixSubDocsOnce() {
     try {
-      if (this.cfg.subDocsFixed)
+      const curV = String(this.curVersion() || "");
+      if (this.cfg.subDocsFixed && String(this.cfg.subDocsFixedV || "") === curV)
         return 0;
       if (!this.isUnlocked() || !this.isLicensed())
         return 0;
@@ -9738,6 +9761,7 @@ var EdbPlugin = class extends Plugin {
         showMessage("\u2705 \u5DF2\u81EA\u52A8\u8865\u5168\u5386\u53F2\u5B50\u6587\u6863 " + missing.length + " \u7BC7\uFF08\u4E00\u6B21\u6027\u8FC1\u79FB\uFF09");
       }
       this.cfg.subDocsFixed = true;
+      this.cfg.subDocsFixedV = String(this.curVersion() || "");
       await this.saveConfig();
       return missing.length;
     } catch (e) {
@@ -11256,7 +11280,7 @@ var EdbPlugin = class extends Plugin {
   /** 当前插件版本（与 plugin.json 同步，发布时手工更新） */
   curVersion() {
     /* v1.6.63 必须与 plugin.json 的 version 保持一致（每次发版两处同步改） */
-    return "1.6.71";
+    return "1.6.72";
   }
   versionAtLeast(latest, cur) {
     const p = (s) => String(s || "").split(".").map((x) => parseInt(x, 10) || 0);

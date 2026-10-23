@@ -6755,8 +6755,6 @@ var EdbPlugin = class extends Plugin {
       maxSeenSavedAt: 0,
       /* v1.6.53 单篇独立加密：docId → {salt, hash}（整库解锁后仍需本篇独立密码） */
       docLocks: {},
-      /* v1.7.1 笔记本/文档打开口令（仅限制打开，不改变密库密码、不搬数据） */
-      nbLocks: {}
     };
     this.state = null;
     this.syncTimer = null;
@@ -8195,12 +8193,7 @@ var EdbPlugin = class extends Plugin {
         if (!bid)
           return;
         let want = null;
-        /* v1.7.1 打开口令：锁定的笔记本（含其文档）在本次会话未解锁时隐藏 */
-        if (this.cfg.nbLocks && this.cfg.nbLocks[bid] && !(this._nbUnlocked && this._nbUnlocked.has(bid))) {
-          want = "none";
-        } else if (this.cfg.nbLocks && Object.keys(this.cfg.nbLocks).length && this.notebookLockedForDoc(bid)) {
-          want = "none";
-        } else if (otherNbs.has(bid) || otherDocs.has(bid)) {
+        if (otherNbs.has(bid) || otherDocs.has(bid)) {
           want = "none";
         } else if (nbMap.has(bid)) {
           const v = nbMap.get(bid);
@@ -8252,12 +8245,6 @@ var EdbPlugin = class extends Plugin {
             needMask = true;
             break;
           }
-          /* v1.7.1 笔记本打开口令：所属笔记本锁定中 → 同样遮罩 */
-          if (this.notebookLockedForDoc(id)) {
-            docLockId = id;
-            needMask = true;
-            break;
-          }
         }
       }
       let mask = document.getElementById("edb-unlock-mask");
@@ -8288,19 +8275,6 @@ var EdbPlugin = class extends Plugin {
             btn.textContent = this.t("doclockUnlockBtn");
             btn.style.cssText = "margin-top:8px;padding:6px 18px;background:#3370ff;color:#fff;border:none;border-radius:6px;cursor:pointer;";
             const doVerify = () => {
-              /* v1.7.1 笔记本打开口令优先校验（不改密库密码，仅用于放行本次会话） */
-              const _nbBox = this.notebookLockedForDoc(docLockId);
-              if (_nbBox && this.verifyNotebookLock(_nbBox, inp.value)) {
-                if (!this._nbUnlocked)
-                  this._nbUnlocked = new Set();
-                this._nbUnlocked.add(_nbBox);
-                if (mask)
-                  mask.remove();
-                this.applyNotebookVisibility();
-                this.applyDocMask();
-                showMessage("\u2705 \u5DF2\u6253\u5F00\uFF08\u672C\u6B21\u4F1A\u8BDD\uFF09");
-                return;
-              }
               if (this.verifyDocLock(docLockId, inp.value)) {
                 this._docUnlocked.add(docLockId);
                 mask.remove();
@@ -8617,36 +8591,6 @@ var EdbPlugin = class extends Plugin {
         }
       });
     }
-    /* v1.7.1 打开口令（仅限制"打开"，不改密库密码、不搬数据） */
-    const anyLocked = boxIds.some((b) => this.cfg.nbLocks && this.cfg.nbLocks[b]);
-    const anySessionUnlocked = boxIds.some((b) => this._nbUnlocked && this._nbUnlocked.has(b));
-    if (anyLocked && anySessionUnlocked) {
-      menu.addItem({
-        icon: "iconLock",
-        label: "\u{1F512} \u91CD\u65B0\u9501\u5B9A\u8BE5\u7B14\u8BB0\u672C\uFF08\u672C\u6B21\u4F1A\u8BDD\uFF09",
-        click: async () => {
-          boxIds.forEach((b) => this._nbUnlocked && this._nbUnlocked.delete(b));
-          this.applyNotebookVisibility();
-          this.applyDocMask();
-          showMessage("\u5DF2\u91CD\u65B0\u9501\u5B9A");
-        }
-      });
-    } else if (anyLocked) {
-      menu.addItem({
-        icon: "iconLock",
-        label: "\u{1F513} \u8F93\u5165\u5BC6\u7801\u6253\u5F00\u8BE5\u7B14\u8BB0\u672C",
-        click: () => {
-          this.unlockNotebookByPrompt(boxIds).catch((e) => console.error("[siyuan-edb]", e));
-        }
-      });
-    }
-    menu.addItem({
-      icon: "iconLock",
-      label: (anyLocked ? "\u{1F511} \u4FEE\u6539\u8BE5\u7B14\u8BB0\u672C\u6253\u5F00\u5BC6\u7801\u2026" : "\u{1F510} \u4E3A\u8BE5\u7B14\u8BB0\u672C\u8BBE\u7F6E\u6253\u5F00\u5BC6\u7801\u2026"),
-      click: () => {
-        this.setNotebookLock(boxIds).catch((e) => console.error("[siyuan-edb]", e));
-      }
-    });
   }
   /** 整本笔记本入库：查询该笔记本全部文档 ID → 批量加入 watchlist → 一次全量同步 */
   async addNotebookToVault(boxIds) {
@@ -8783,107 +8727,10 @@ var EdbPlugin = class extends Plugin {
     return { added: ids.length, total: totalFound };
   }
   /** v1.7.1 笔记本打开口令：设置/修改（不改密库密码、不搬动任何数据） */
-  async setNotebookLock(boxIds) {
-    const box = boxIds[0];
-    let nbName = box;
-    try {
-      const nb = await fetchSyncPost("/api/notebook/lsNotebooks", {});
-      const arr = (nb && nb.data && nb.data.notebooks) || [];
-      const hit = arr.find((x) => x && x.id === box);
-      if (hit && hit.name)
-        nbName = hit.name;
-    } catch (e) {
-    }
-    const has = !!(this.cfg.nbLocks && this.cfg.nbLocks[box]);
-    const p1 = await this.promptInput(
-      (has ? "\u4FEE\u6539" : "\u8BBE\u7F6E") + "\u7B14\u8BB0\u672C\u6253\u5F00\u5BC6\u7801",
-      "\u7B14\u8BB0\u672C\uFF1A\u300C" + nbName + "\u300D\n\n" +
-      "\u4F5C\u7528\uFF1A\u672A\u8F93\u5165\u6B64\u5BC6\u7801\u65F6\uFF0C\u8BE5\u7B14\u8BB0\u672C\uFF08\u542B\u5168\u90E8\u5B50\u6587\u6863\uFF09\u5728\u6587\u6863\u6811\u4E2D\u9690\u85CF\u3001\u5185\u5BB9\u52A0\u906E\u7F69\u3002\n\n" +
-      "\u4E0D\u5F71\u54CD\uFF1A\u5BC6\u5E93\u5BC6\u7801\u3001\u5DF2\u5165\u5E93\u6570\u636E\u3001\u540C\u6B65\u4E0E\u52A0\u5BC6\u3002\n" +
-      "\u5BC6\u7801\u81F3\u5C11 6 \u4F4D\uFF1B\u7559\u7A7A\u8868\u793A\u53D6\u6D88\u5BC6\u7801\u3002",
-      "password"
-    );
-    if (p1 === null || p1 === void 0)
-      return false;
-    if (!String(p1)) {
-      boxIds.forEach((b) => {
-        if (this.cfg.nbLocks)
-          delete this.cfg.nbLocks[b];
-      });
-      await this.saveConfig();
-      this.applyNotebookVisibility();
-      showMessage("\u2705 \u5DF2\u53D6\u6D88\u8BE5\u7B14\u8BB0\u672C\u7684\u6253\u5F00\u5BC6\u7801");
-      return true;
-    }
-    if (String(p1).length < 6) {
-      showMessage("\u5BC6\u7801\u81F3\u5C11 6 \u4F4D");
-      return false;
-    }
-    const p2 = await this.promptInput("\u786E\u8BA4\u5BC6\u7801", "\u8BF7\u518D\u6B21\u8F93\u5165\u76F8\u540C\u5BC6\u7801", "password");
-    if (String(p2 || "") !== String(p1)) {
-      showMessage("\u4E24\u6B21\u8F93\u5165\u4E0D\u4E00\u81F4\uFF0C\u5DF2\u53D6\u6D88");
-      return false;
-    }
-    if (!this.cfg.nbLocks)
-      this.cfg.nbLocks = {};
-    const salt = crypto3.randomBytes(16);
-    const hash = crypto3.scryptSync(String(p1), salt, 32).toString("hex");
-    boxIds.forEach((b) => {
-      this.cfg.nbLocks[b] = { salt: salt.toString("hex"), hash };
-    });
-    if (!this._nbUnlocked)
-      this._nbUnlocked = new Set();
-    boxIds.forEach((b) => this._nbUnlocked.add(b));
-    await this.saveConfig();
-    this.applyNotebookVisibility();
-    this.applyDocMask();
-    showMessage("\u2705 \u5DF2\u8BBE\u7F6E\u6253\u5F00\u5BC6\u7801\uFF08\u4E0D\u5F71\u54CD\u5BC6\u5E93\u5BC6\u7801\uFF09");
-    return true;
-  }
-  /** v1.7.1 校验笔记本打开口令 */
-  verifyNotebookLock(boxId, pwd) {
-    const l = this.cfg.nbLocks && this.cfg.nbLocks[boxId];
-    if (!l || !l.salt || !l.hash)
-      return false;
-    try {
-      return crypto3.scryptSync(String(pwd || ""), Buffer.from(l.salt, "hex"), 32).toString("hex") === l.hash;
-    } catch (e) {
-      return false;
-    }
-  }
-  /** v1.7.1 弹框输入笔记本口令（本次会话记住） */
-  async unlockNotebookByPrompt(boxIds) {
-    for (const box of boxIds) {
-      if (!(this.cfg.nbLocks && this.cfg.nbLocks[box]))
-        continue;
-      const pwd = await this.promptInput("\u6253\u5F00\u7B14\u8BB0\u672C", "\u8BF7\u8F93\u5165\u8BE5\u7B14\u8BB0\u672C\u7684\u6253\u5F00\u5BC6\u7801\uFF08\u4E0D\u662F\u5BC6\u5E93\u5BC6\u7801\uFF09", "password");
-      if (pwd === null || pwd === void 0)
-        return false;
-      if (!this.verifyNotebookLock(box, pwd)) {
-        showMessage("\u5BC6\u7801\u9519\u8BEF");
-        return false;
-      }
-      if (!this._nbUnlocked)
-        this._nbUnlocked = new Set();
-      this._nbUnlocked.add(box);
-    }
-    this.applyNotebookVisibility();
-    this.applyDocMask();
-    showMessage("\u2705 \u5DF2\u6253\u5F00");
-    return true;
-  }
-  /** v1.7.1 某文档所属笔记本是否处于"锁定且本次会话未解锁" */
-  notebookLockedForDoc(docId) {
-    if (!docId || !this.cfg.nbLocks || !Object.keys(this.cfg.nbLocks).length)
-      return null;
-    const box = (this.docBoxMap && this.docBoxMap[docId]) || (this.cfg.docBox && this.cfg.docBox[docId]);
-    if (!box || !this.cfg.nbLocks[box])
-      return null;
-    if (this._nbUnlocked && this._nbUnlocked.has(box))
-      return null;
-    return box;
-  }
-  /** v1.7.0 笔记本当前绑定的独立库索引（-1 = 未绑定，使用活动库） */
+    /** v1.7.1 校验笔记本打开口令 */
+    /** v1.7.1 弹框输入笔记本口令（本次会话记住） */
+    /** v1.7.1 某文档所属笔记本是否处于"锁定且本次会话未解锁" */
+    /** v1.7.0 笔记本当前绑定的独立库索引（-1 = 未绑定，使用活动库） */
   vaultIndexOfNotebook(boxId) {
     const vs = this.cfg.vaults || [];
     for (let i = 0; i < vs.length; i++) {
@@ -11814,7 +11661,7 @@ var EdbPlugin = class extends Plugin {
   /** 当前插件版本（与 plugin.json 同步，发布时手工更新） */
   curVersion() {
     /* v1.6.63 必须与 plugin.json 的 version 保持一致（每次发版两处同步改） */
-    return "1.7.1";
+    return "1.7.2";
   }
   versionAtLeast(latest, cur) {
     const p = (s) => String(s || "").split(".").map((x) => parseInt(x, 10) || 0);

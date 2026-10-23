@@ -9838,12 +9838,20 @@ var EdbPlugin = class extends Plugin {
         else
           outv = true;
       }
-      if (inv && !outv) {
+      /* v1.6.80 兜底：库内记录的 doc_id 也是"归属文档"，不依赖 .sy 引用索引（与层级无关） */
+      let ownerInVault = false;
+      try {
+        const rr = core.getAsset(this.state.db, name);
+        if (rr && rr.doc_id && wl.has(String(rr.doc_id)))
+          ownerInVault = true;
+      } catch (e) {
+      }
+      if ((inv || ownerInVault) && !outv) {
         out.onlyIn++;
         out.onlyInBytes += st.size;
         if (out.samples.length < 6)
           out.samples.push(name);
-      } else if (inv && outv) {
+      } else if ((inv || ownerInVault) && outv) {
         out.shared++;
         out.sharedBytes += st.size;
       } else {
@@ -9898,13 +9906,16 @@ var EdbPlugin = class extends Plugin {
         else
           outv = true;
       }
-      if (!inv)
+      /* v1.6.80 兜底：库内记录的 doc_id 属于已入库文档时，同样视为"已入库文档的数据" */
+      const rec = inDb.get(name);
+      const ownerInVault = !!(rec && rec.doc_id && wl.has(String(rec.doc_id)));
+      if (!inv && !ownerInVault)
         continue;
       if (outv) {
         res.skippedShared++;
         continue;
       }
-      if (!inDb.has(name)) {
+      if (!rec) {
         res.skippedNotInDb++;
         continue;
       }
@@ -11444,7 +11455,7 @@ var EdbPlugin = class extends Plugin {
   /** 当前插件版本（与 plugin.json 同步，发布时手工更新） */
   curVersion() {
     /* v1.6.63 必须与 plugin.json 的 version 保持一致（每次发版两处同步改） */
-    return "1.6.79";
+    return "1.6.80";
   }
   versionAtLeast(latest, cur) {
     const p = (s) => String(s || "").split(".").map((x) => parseInt(x, 10) || 0);

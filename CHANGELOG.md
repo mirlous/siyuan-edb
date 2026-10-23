@@ -1,5 +1,11 @@
 # Changelog
 
+## v1.6.75 (2026-10-23)
+
+- **🐞 修复面板崩溃「Cannot read properties of undefined (reading 'prepare')」**：`_refreshPanel` 里「已入库文档列表」用 `this.state ? core.getDoc(this.state.db, id)` 判断——当出现"state 对象还在、但 state.db 已丢失"的异常状态时，`state.db` 为 undefined → SQL.js `.prepare` 崩溃 → 整个面板打不开。现改为按 `isUnlocked()`（同时校验 state 与 db）判断，并对每条文档读取加 try/catch，单篇异常不再拖垮面板。
+- **🔬 诊断增强**：`panel-error.log` 现在会附带 `stateType / stateKeys / unlocked / dbPath`，若该异常状态再次出现，可直接看出 state 是怎么变坏的（下个版本据此堵源头）。
+- v1.6.74 的面板保护层（捕获异常、错误弹窗、重试按钮）继续生效。
+
 ## v1.6.74 (2026-10-23)
 
 - **🛟 修复「移出密库后顶部图标点了没反应/打开空白」**：给面板渲染加了保护层——`refreshPanel()` 任何异常都会被捕获并写入插件数据目录的 `panel-error.log`（含完整堆栈），面板改为显示"渲染失败 + 重试"而不是静默空白；顶部图标/命令打开面板也加了兜底，面板构建失败时仍会弹出一个可交互的错误窗口（含"重试打开面板"按钮）。

@@ -11287,7 +11287,7 @@ var EdbPlugin = class extends Plugin {
   /** 当前插件版本（与 plugin.json 同步，发布时手工更新） */
   curVersion() {
     /* v1.6.63 必须与 plugin.json 的 version 保持一致（每次发版两处同步改） */
-    return "1.6.74";
+    return "1.6.75";
   }
   versionAtLeast(latest, cur) {
     const p = (s) => String(s || "").split(".").map((x) => parseInt(x, 10) || 0);
@@ -11439,7 +11439,7 @@ var EdbPlugin = class extends Plugin {
       this._refreshPanel(el);
     } catch (e) {
       console.error("[siyuan-edb] refreshPanel 失败", e);
-      this.savePanelError("refreshPanel", e);
+      this.savePanelError("refreshPanel", e, { stateType: typeof this.state, stateKeys: this.state && typeof this.state === "object" ? Object.keys(this.state) : null, unlocked: this.isUnlocked(), dbPath: this.cfg && this.cfg.dbPath });
       try {
         const target = el || this.panelEl;
         if (target) {
@@ -11453,10 +11453,12 @@ var EdbPlugin = class extends Plugin {
       }
     }
   }
-  /** v1.6.74 记录面板错误（覆盖式，保留最近一次完整堆栈） */
-  savePanelError(where, e) {
+  /** v1.6.74/75 记录面板错误（覆盖式，保留最近一次完整堆栈 + 状态诊断） */
+  savePanelError(where, e, extra) {
     try {
-      const msg = new Date().toISOString() + " [" + where + "] " + String((e && e.stack) || (e && e.message) || e) + "\n";
+      let msg = new Date().toISOString() + " [" + where + "] " + String((e && e.stack) || (e && e.message) || e) + "\n";
+      if (extra)
+        msg += "diagnostics: " + JSON.stringify(extra) + "\n";
       this.saveData("panel-error.log", msg).catch(() => {
       });
     } catch (e2) {
@@ -11782,7 +11784,14 @@ var EdbPlugin = class extends Plugin {
     } else {
       for (const id of this.cfg.watchlist) {
         if ((this.cfg.excludedDocs || []).includes(id)) continue; /* v1.6.45: 黑名单不显示为已入库 */
-        const doc = this.state ? core.getDoc(this.state.db, id) : null;
+        /* v1.6.75 防崩溃：state 可能为真但 state.db 缺失（异常状态），这里必须按 isUnlocked 判断并兜 try/catch */
+        let doc = null;
+        try {
+          if (this.isUnlocked())
+            doc = core.getDoc(this.state.db, id);
+        } catch (e) {
+          console.error("[siyuan-edb] \u9762\u677F\u8BFB\u53D6\u6587\u6863\u5934\u5931\u8D25", id, e);
+        }
         const rowItem = document.createElement("div");
         rowItem.style.cssText = "display:flex;align-items:center;justify-content:space-between;gap:6px;padding:4px 6px;border:1px solid var(--b3-theme-background-light,#ddd);border-radius:4px;";
         const lab = document.createElement("span");
@@ -14029,7 +14038,7 @@ var EdbPlugin = class extends Plugin {
     box.style.cssText = "display:flex;flex-direction:column;gap:10px;width:520px;";
     const title = document.createElement("div");
     title.style.cssText = "font-size:14px;font-weight:bold;";
-    const doc = this.state ? core.getDoc(this.state.db, docId) : null;
+    const doc = this.isUnlocked() ? core.getDoc(this.state.db, docId) : null;
     title.textContent = "\u21C4 " + this.t("vaultMoveToTitle") + "\uFF1A" + (doc ? doc.title : docId);
     const tip = document.createElement("div");
     tip.style.cssText = "font-size:12px;color:var(--b3-theme-on-background,#666);";

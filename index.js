@@ -7016,6 +7016,13 @@ var EdbPlugin = class extends Plugin {
         this.cfg.activeVault = 0;
       }
     }
+    /* v1.7.0 笔记本级独立密码：每个库记录其绑定的笔记本 id */
+    if (Array.isArray(this.cfg.vaults)) {
+      for (const v of this.cfg.vaults) {
+        if (v && !Array.isArray(v.notebooks))
+          v.notebooks = [];
+      }
+    }
     this.applyActiveAliases();
   }
   /** 活动库别名同步：cfg.dbPath / cfg.watchlist 始终指向当前活动库 */
@@ -8171,13 +8178,24 @@ var EdbPlugin = class extends Plugin {
       const activeV = this.cfg.activeVault;
       const wl = new Set(this.cfg.watchlist || []);
       const excl = new Set(this.cfg.excludedDocs || []);
+      /* v1.7.0 属于"其它库"的笔记本/文档必须始终隐藏（否则切到别的库时标题/明文泄露） */
+      const otherNbs = new Set();
+      const otherDocs = new Set();
+      (this.cfg.vaults || []).forEach((v, i) => {
+        if (!v || i === activeV)
+          return;
+        (v.notebooks || []).forEach((b) => otherNbs.add(b));
+        (v.watchlist || []).forEach((d) => otherDocs.add(d));
+      });
       /* v1.6.69：锁定时不仅隐藏"整本加入"的笔记本行，也隐藏"单篇加入密库"的文档行（防左侧文档树泄露标题） */
       document.querySelectorAll("[data-node-id]").forEach((el) => {
         const bid = el.getAttribute("data-node-id");
         if (!bid)
           return;
         let want = null;
-        if (nbMap.has(bid)) {
+        if (otherNbs.has(bid) || otherDocs.has(bid)) {
+          want = "none";
+        } else if (nbMap.has(bid)) {
           const v = nbMap.get(bid);
           if (v === -1 || v === activeV)
             want = activeUnlocked ? "" : "none";
@@ -8573,6 +8591,37 @@ var EdbPlugin = class extends Plugin {
         }
       });
     }
+    /* v1.7.0 笔记本独立密码（独立密库） */
+    const nvIdx = this.vaultIndexOfNotebook(boxIds[0]);
+    if (nvIdx >= 0 && nvIdx !== this.cfg.activeVault) {
+      menu.addItem({
+        icon: "iconKey",
+        label: "\u{1F513} \u5207\u6362\u5230\u8BE5\u7B14\u8BB0\u672C\u7684\u5BC6\u5E93\uFF08\u72EC\u7ACB\u5BC6\u7801\uFF09",
+        click: async () => {
+          try {
+            await this.switchVault(nvIdx);
+          } catch (e) {
+            showMessage("\u5207\u6362\u5931\u8D25\uFF1A" + (e && e.message ? e.message : e));
+          }
+        }
+      });
+    } else if (nvIdx === this.cfg.activeVault) {
+      menu.addItem({
+        icon: "iconKey",
+        label: "\u{1F511} \u4FEE\u6539\u8BE5\u72EC\u7ACB\u5BC6\u5E93\u5BC6\u7801\u2026",
+        click: () => {
+          this.changeVaultPasswordQuick().catch((e) => console.error("[siyuan-edb]", e));
+        }
+      });
+    } else {
+      menu.addItem({
+        icon: "iconKey",
+        label: "\u{1F510} \u4E3A\u8BE5\u7B14\u8BB0\u672C\u8BBE\u7F6E\u72EC\u7ACB\u5BC6\u7801\u2026",
+        click: () => {
+          this.setNotebookPassword(boxIds).catch((e) => console.error("[siyuan-edb]", e));
+        }
+      });
+    }
   }
   /** 整本笔记本入库：查询该笔记本全部文档 ID → 批量加入 watchlist → 一次全量同步 */
   async addNotebookToVault(boxIds) {
@@ -8707,6 +8756,190 @@ var EdbPlugin = class extends Plugin {
     await this.maybeAutoCompact();
     this.applyNotebookVisibility();
     return { added: ids.length, total: totalFound };
+  }
+  /** v1.7.0 笔记本当前绑定的独立库索引（-1 = 未绑定，使用活动库） */
+  vaultIndexOfNotebook(boxId) {
+    const vs = this.cfg.vaults || [];
+    for (let i = 0; i < vs.length; i++) {
+      const nb = vs[i] && vs[i].notebooks;
+      if (Array.isArray(nb) && nb.includes(boxId))
+        return i;
+    }
+    return -1;
+  }
+  /** v1.7.0 收集笔记本下全部文档 id（SQL + .sy 递归兜底，任意层级） */
+  async collectNotebookDocIds(boxIds) {
+    const out = new Set();
+    const dataDir = await this.wsDataDir();
+    for (const box of boxIds) {
+      try {
+        const boxEsc = String(box).replace(/'/g, "''");
+        const r = await fetchSyncPost("/api/query/sql", { stmt: "SELECT id FROM blocks WHERE type = 'd' AND box = '" + boxEsc + "'" });
+        for (const row of (r && r.data) || []) {
+          if (row && row.id)
+            out.add(row.id);
+        }
+      } catch (e) {
+      }
+      try {
+        const boxDir = path.join(dataDir, String(box));
+        const walk = (dir) => {
+          let ents = null;
+          try {
+            ents = fs.readdirSync(dir, { withFileTypes: true });
+          } catch (e) {
+            return;
+          }
+          for (const en of ents) {
+            const p2 = path.join(dir, en.name);
+            if (en.isDirectory())
+              walk(p2);
+            else if (en.name.endsWith(".sy"))
+              out.add(en.name.slice(0, -3));
+          }
+        };
+        if (fs.existsSync(boxDir))
+          walk(boxDir);
+      } catch (e) {
+      }
+    }
+    return [...out];
+  }
+  /** v1.7.0 为笔记本设置独立密码：新建独立密库，把该笔记本文档（含任意层级子文档）迁入 */
+  async setNotebookPassword(boxIds) {
+    if (!this.isLicensed()) {
+      showMessage(this.t("licStatusNone"));
+      return false;
+    }
+    if (!this.isUnlocked()) {
+      const ok = await this.ensureUnlocked();
+      if (!ok)
+        return false;
+    }
+    const box = boxIds[0];
+    let nbName = box;
+    try {
+      const nb = await fetchSyncPost("/api/notebook/lsNotebooks", {});
+      const arr = (nb && nb.data && nb.data.notebooks) || [];
+      const hit = arr.find((x) => x && x.id === box);
+      if (hit && hit.name)
+        nbName = hit.name;
+    } catch (e) {
+    }
+    const p1 = await this.promptInput("\u4E3A\u7B14\u8BB0\u672C\u8BBE\u7F6E\u72EC\u7ACB\u5BC6\u7801", "\u7B14\u8BB0\u672C\uFF1A\u300C" + nbName + "\u300D\n\n\u72EC\u7ACB\u5BC6\u5E93 = \u8BE5\u7B14\u8BB0\u672C\u7684\u6587\u6863/\u9644\u4EF6\u5355\u72EC\u52A0\u5BC6\u3001\u5355\u72EC\u5BC6\u7801\uFF1B\n\u5176\u4ED6\u5E93\u5373\u4F7F\u89E3\u9501\u4E5F\u770B\u4E0D\u5230\u5185\u5BB9\u3002\n\n\u5BC6\u7801\u81F3\u5C11 6 \u4F4D\uFF0C\u5FD8\u8BB0\u540E\u65E0\u6CD5\u6062\u590D\uFF01", "password");
+    if (p1 === null || p1 === void 0)
+      return false;
+    if (!p1 || String(p1).length < 6) {
+      showMessage("\u5BC6\u7801\u81F3\u5C11 6 \u4F4D");
+      return false;
+    }
+    const p2 = await this.promptInput("\u786E\u8BA4\u72EC\u7ACB\u5BC6\u7801", "\u8BF7\u518D\u6B21\u8F93\u5165\u76F8\u540C\u5BC6\u7801", "password");
+    if (String(p2 || "") !== String(p1)) {
+      showMessage("\u4E24\u6B21\u8F93\u5165\u7684\u5BC6\u7801\u4E0D\u4E00\u81F4\uFF0C\u5DF2\u53D6\u6D88");
+      return false;
+    }
+    let vname = await this.promptInput("\u72EC\u7ACB\u5BC6\u5E93\u540D\u79F0", "\u9ED8\u8BA4\uFF1A" + nbName + "\uFF08\u72EC\u7ACB\u5E93\uFF09", "text");
+    vname = String(vname || "").trim() || (nbName + "\uFF08\u72EC\u7ACB\u5E93\uFF09");
+    const baseDir = this.cfg.vaultsDir && String(this.cfg.vaultsDir).trim() ? String(this.cfg.vaultsDir).trim() : path.dirname(this.cfg.dbPath);
+    fs.mkdirSync(baseDir, { recursive: true });
+    const safe = String(vname).replace(/[\\/:*?"<>|]/g, "_");
+    let newPath = path.join(baseDir, safe + ".sydb");
+    let k = 2;
+    while (fs.existsSync(newPath) && this.cfg.dbPath !== newPath)
+      newPath = path.join(baseDir, safe + "-" + k++ + ".sydb");
+    this.setBusy("\u6B63\u5728\u521B\u5EFA\u72EC\u7ACB\u5BC6\u5E93\u2026");
+    let dstState = null;
+    try {
+      dstState = await core.createVault(newPath, String(p1), this.wasmPath(), WASM_B64, "");
+      const srcState = this.state;
+      const srcPath = this.cfg.dbPath;
+      const docIds = await this.collectNotebookDocIds(boxIds);
+      const moved = [];
+      const plain = [];
+      for (const docId of docIds) {
+        const doc = core.getDoc(srcState.db, docId);
+        if (!doc) {
+          plain.push(docId);
+          continue;
+        }
+        try {
+          const assets = core.getAssetsByDoc(srcState.db, docId);
+          for (const a of assets)
+            core.copyAsset(srcPath, srcState, newPath, dstState, a.asset_path, docId);
+          core.upsertDoc(dstState.db, doc);
+          core.removeDoc(srcState.db, docId);
+          core.removeAssetsByDoc(srcState.db, docId);
+          moved.push(docId);
+        } catch (e) {
+          console.error("[siyuan-edb] \u8FC1\u79FB\u6587\u6863\u5230\u72EC\u7ACB\u5E93\u5931\u8D25", docId, e);
+          plain.push(docId);
+        }
+      }
+      core.flushVault(newPath, dstState);
+      core.flushVault(srcPath, srcState);
+      const sv = this.cfg.vaults[this.cfg.activeVault];
+      if (sv) {
+        sv.watchlist = (sv.watchlist || []).filter((x) => !moved.includes(x));
+        sv.notebooks = (sv.notebooks || []).filter((b) => !boxIds.includes(b));
+      }
+      const nv = { name: vname, path: newPath, watchlist: moved.concat(plain), notebooks: boxIds.slice() };
+      this.cfg.vaults.push(nv);
+      const newIdx = this.cfg.vaults.length - 1;
+      this.cfg.activeVault = newIdx;
+      this.cfg.watchlist = nv.watchlist;
+      this.cfg.dbPath = newPath;
+      this.cfg.excludedDocs = (this.cfg.excludedDocs || []).filter((x) => !nv.watchlist.includes(x));
+      const nbMap = new Map();
+      (this.cfg.notebookInVault || []).forEach((e) => {
+        const bid = typeof e === "string" ? e : e && e.id;
+        if (bid && !boxIds.includes(bid))
+          nbMap.set(bid, typeof e === "string" ? -1 : e.v);
+      });
+      boxIds.forEach((b) => nbMap.set(b, newIdx));
+      this.cfg.notebookInVault = [...nbMap.entries()].map((kv) => ({ id: kv[0], v: kv[1] }));
+      this.state = dstState;
+      this.noPwd = false;
+      await this.saveConfig();
+      this.refreshPanel();
+      this.applyNotebookVisibility();
+      this.applyDocMask();
+      showMessage("\u2705 \u7B14\u8BB0\u672C\u300C" + nbName + "\u300D\u5DF2\u8BBE\u7F6E\u72EC\u7ACB\u5BC6\u7801\uFF08\u5DF2\u8FC1\u5165 " + moved.length + " \u7BC7\u6587\u6863" + (plain.length ? "\uFF0C\u53E6\u6709 " + plain.length + " \u7BC7\u5C06\u5728\u540E\u53F0\u9996\u6B21\u52A0\u5BC6" : "") + "\uFF09");
+      if (plain.length) {
+        setTimeout(() => {
+          this.syncNow().catch(() => {
+          });
+        }, 800);
+      }
+      return true;
+    } catch (e) {
+      console.error("[siyuan-edb] \u8BBE\u7F6E\u7B14\u8BB0\u672C\u72EC\u7ACB\u5BC6\u7801\u5931\u8D25", e);
+      showMessage("\u8BBE\u7F6E\u5931\u8D25\uFF1A" + (e && e.message ? e.message : e));
+      return false;
+    } finally {
+      this.clearBusy();
+    }
+  }
+  /** v1.7.0 快速修改当前库密码（独立密库用） */
+  async changeVaultPasswordQuick() {
+    if (!this.isUnlocked()) {
+      showMessage("\u8BF7\u5148\u89E3\u9501\u5F53\u524D\u5E93");
+      return false;
+    }
+    const p1 = await this.promptInput("\u4FEE\u6539\u5F53\u524D\u5E93\u5BC6\u7801", "\u65B0\u5BC6\u7801\uFF08\u81F3\u5C11 6 \u4F4D\uFF09\uFF1B\u5FD8\u8BB0\u540E\u65E0\u6CD5\u6062\u590D", "password");
+    if (p1 === null || p1 === void 0)
+      return false;
+    if (!p1 || String(p1).length < 6) {
+      showMessage("\u5BC6\u7801\u81F3\u5C11 6 \u4F4D");
+      return false;
+    }
+    const p2 = await this.promptInput("\u786E\u8BA4\u65B0\u5BC6\u7801", "\u8BF7\u518D\u6B21\u8F93\u5165", "password");
+    if (String(p2 || "") !== String(p1)) {
+      showMessage("\u4E24\u6B21\u8F93\u5165\u4E0D\u4E00\u81F4");
+      return false;
+    }
+    await this.changePassword(String(p1), this.state && this.state.hint ? this.state.hint : "");
+    showMessage("\u2705 \u5F53\u524D\u5E93\u5BC6\u7801\u5DF2\u4FEE\u6539");
+    return true;
   }
   /** 整本笔记本移出密库：找出该笔记本下已入库文档 → 还原资产 → 从库内移除（记录进回收站） */
   async removeNotebookFromVault(boxIds) {
@@ -11455,7 +11688,7 @@ var EdbPlugin = class extends Plugin {
   /** 当前插件版本（与 plugin.json 同步，发布时手工更新） */
   curVersion() {
     /* v1.6.63 必须与 plugin.json 的 version 保持一致（每次发版两处同步改） */
-    return "1.6.80";
+    return "1.7.0";
   }
   versionAtLeast(latest, cur) {
     const p = (s) => String(s || "").split(".").map((x) => parseInt(x, 10) || 0);

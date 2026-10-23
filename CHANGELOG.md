@@ -1,5 +1,22 @@
 # Changelog
 
+## v1.7.5 (2026-10-23)
+
+### 🕶 锁定后的隐藏改为「时时刻刻」——彻底消除启动瞬间明文闪现
+
+**根因**：此前"隐藏已入库文档/笔记本"完全靠 JS 每 3 秒轮询 `document.querySelectorAll` 后写 `style.display`。思源启动时**先渲染文档树、插件后执行**，中间有几秒窗口期 → 明文标题/正文直接暴露；文档树刷新、切库同样会短暂露出。
+
+**修复**：
+- **静态 CSS 隐藏引擎**：`rebuildHideCss()` 把 `watchlist`（单篇文档 id）与 `notebookInVault`（整本笔记本 id）逐个生成 `[data-node-id="…"]{display:none !important}`，注入 `<head>` 的 `<style id="edb-hide-style">`。
+  CSS 是**声明式**的——文档树节点一被创建浏览器立刻隐藏，**不等 JS、不等定时器**。
+- **插件加载第一刻就注入**：`onload()` 里 `loadConfig()` 之后**立即**调用（早于任何其它逻辑），所以启动瞬间就已经是隐藏状态。
+- **正文也不再闪**：未解锁时对 `.protyle-wysiwyg / .protyle-title / .protyle-breadcrumb` 加 `filter: blur(9px)` + `pointer-events:none`，并通过 `.protyle::after` 显示「🔒 密库已锁定，请先解锁」——同样是 CSS，元素出现即生效，不再等 `applyDocMask()` 建浮层。
+- **其它库的文档/笔记本始终隐藏**（多库隔离），不受解锁状态影响。
+- **MutationObserver 双保险**：监听文档树 DOM 变化，新插入节点立即复算（CSS 已覆盖，这是兜底）。
+- 轮询间隔 3 秒 → **1.2 秒**（仅作兜底，不再是主要手段）。
+- 解锁（自动/手动）、锁库、切库、加入/移出后都会 `rebuildHideCss()`，状态即时同步。
+- `onunload()` 移除注入样式与监听，不留残留。
+
 ## v1.7.4 (2026-10-23)
 
 - **🖼 集市说明新增「使用说明图」**：README（思源集市渲染的插件说明）新增 3 张操作图 ——

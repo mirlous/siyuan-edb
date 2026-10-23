@@ -6778,6 +6778,9 @@ var EdbPlugin = class extends Plugin {
       await this.loadLicense();
     } catch (e) {
     }
+    /* v1.7.5 最关键一步：配置刚读出来就注入隐藏 CSS（不等 DOM、不等定时器），
+       让浏览器从"第一个文档树节点创建时"就把它隐藏，杜绝启动瞬间明文闪现 */
+    this.rebuildHideCss();
     this.refreshDocBoxes();
     this.inferNotebookVault();
     this.applyNotebookVisibility();
@@ -6939,6 +6942,18 @@ var EdbPlugin = class extends Plugin {
     });
   }
   async onunload() {
+    /* v1.7.5 卸载时移除注入的隐藏样式与 DOM 监听，避免残留 */
+    try {
+      this.removeHideCss();
+    } catch (e) {
+    }
+    try {
+      if (this._domObs) {
+        this._domObs.disconnect();
+        this._domObs = null;
+      }
+    } catch (e) {
+    }
     if (this.syncTimer)
       clearTimeout(this.syncTimer);
     if (this._watchTimer) {
@@ -7111,6 +7126,13 @@ var EdbPlugin = class extends Plugin {
         console.warn("[siyuan-edb] \u5B8C\u6574\u6027\u81EA\u68C0\u8B66\u544A", chk.msg);
       this.pendingSync = false;
       this.refreshPanel();
+      /* v1.7.5 自动解锁成功 → 重建隐藏 CSS（去掉正文遮罩、放出文档树） */
+      try {
+        this.rebuildHideCss();
+        this.applyNotebookVisibility();
+        this.applyDocMask();
+      } catch (e) {
+      }
       setTimeout(() => {
         this.syncNow().catch((e) => console.error("[siyuan-edb]", e));
       }, 1200);
@@ -8167,6 +8189,8 @@ var EdbPlugin = class extends Plugin {
   }
   applyNotebookVisibility() {
     try {
+      /* v1.7.5 先重建 CSS（声明式、立即生效），JS 的 style.display 只作为兜底 */
+      this.rebuildHideCss();
       const nbMap = new Map();
       (this.cfg && Array.isArray(this.cfg.notebookInVault) ? this.cfg.notebookInVault : []).forEach((e) => {
         const bid = typeof e === "string" ? e : e && e.id;
@@ -8441,15 +8465,42 @@ var EdbPlugin = class extends Plugin {
     } catch (e) {
     }
   }
-  /** v1.6.45: 每 3 秒同步笔记本显隐（覆盖文档树刷新/解锁状态变化，轻量） */
+  /** v1.7.5 文档树 DOM 变化监听：新插入的节点立即应用隐藏（CSS 已覆盖，这里是双保险） */
+  startDomObserver() {
+    try {
+      if (this._domObs)
+        return;
+      const root = document.querySelector(".layout__dock") || document.body;
+      if (!root || typeof MutationObserver === "undefined")
+        return;
+      let pending = false;
+      this._domObs = new MutationObserver(() => {
+        if (pending)
+          return;
+        pending = true;
+        Promise.resolve().then(() => {
+          pending = false;
+          try {
+            this.applyNotebookVisibility();
+          } catch (e) {
+          }
+        });
+      });
+      this._domObs.observe(root, { childList: true, subtree: true });
+    } catch (e) {
+      console.error("[siyuan-edb] startDomObserver", e);
+    }
+  }
+  /** v1.6.45: 每 1.2 秒同步笔记本显隐（CSS 为主，这是兜底） */
   startNotebookObserver() {
     try {
       if (this._nbTimer)
         clearInterval(this._nbTimer);
+      this.startDomObserver();
       this._nbTimer = setInterval(() => {
       this.applyNotebookVisibility();
       this.applyDocMask();
-    }, 3000);
+    }, 1200);
     } catch (e) {
       console.error("[siyuan-edb]", e);
     }
@@ -8487,6 +8538,95 @@ var EdbPlugin = class extends Plugin {
   }
   /** v1.6.45: 智能隐藏——资源管理「丢失的资源文件」仅隐藏密库加密资产（含回收站），
    *  非密库的丢失文件正常显示，绝不整页清空 */
+  /** v1.7.5 静态 CSS 隐藏引擎：不等 JS 轮询，元素一创建就被浏览器隐藏。
+   *  解决"启动瞬间已入库文档闪几秒"、"文档树刷新后短暂可见"。
+   *  只依赖本地配置（watchlist / notebookInVault / vaults），不需要解锁或联网。 */
+  ensureHideStyleEl() {
+    let st = document.getElementById("edb-hide-style");
+    if (!st) {
+      st = document.createElement("style");
+      st.id = "edb-hide-style";
+      const host = document.head || document.documentElement;
+      if (!host)
+        return null;
+      host.appendChild(st);
+    }
+    return st;
+  }
+  /** 重建隐藏 CSS（幂等，可在任意状态变化后调用） */
+  rebuildHideCss() {
+    try {
+      if (!this.cfg)
+        return;
+      const st = this.ensureHideStyleEl();
+      if (!st)
+        return;
+      const activeV = Number(this.cfg.activeVault) || 0;
+      const activeUnlocked = this.isUnlocked();
+      const excl = new Set(this.cfg.excludedDocs || []);
+      const wl = (this.cfg.watchlist || []).filter((d) => d && !excl.has(d));
+      /* 整本加入的笔记本：记录所属库(v)，只有当前库且已解锁才可见 */
+      const nbItems = [];
+      (this.cfg.notebookInVault || []).forEach((e) => {
+        const bid = typeof e === "string" ? e : e && e.id;
+        const v = typeof e === "string" ? -1 : e && typeof e.v === "number" ? e.v : -1;
+        if (bid)
+          nbItems.push({ id: bid, v });
+      });
+      /* 其它库的笔记本/文档：任何状态都隐藏 */
+      const otherNbs = [];
+      const otherDocs = [];
+      (this.cfg.vaults || []).forEach((v, i) => {
+        if (!v || i === activeV)
+          return;
+        (v.notebooks || []).forEach((b) => b && otherNbs.push(b));
+        (v.watchlist || []).forEach((d) => d && otherDocs.push(d));
+      });
+      const curDocs = [];
+      const curNbs = [];
+      for (const it of nbItems) {
+        const ownCur = it.v === -1 || it.v === activeV;
+        if (ownCur) {
+          if (!activeUnlocked)
+            curNbs.push(it.id);
+        } else {
+          otherNbs.push(it.id);
+        }
+      }
+      if (!activeUnlocked)
+        for (const d of wl) curDocs.push(d);
+      const sel = (ids) => ids.filter(Boolean).map((x) => "[data-node-id=\"" + String(x).replace(/"/g, "") + "\"]").join(",");
+      let css = "";
+      const curSel = sel(curDocs.concat(curNbs));
+      if (curSel)
+        css += curSel + "{display:none !important;}\n";
+      const otherSel = sel(otherDocs.concat(otherNbs));
+      if (otherSel)
+        css += otherSel + "{display:none !important;}\n";
+      /* v1.7.5 未解锁时，编辑器正文/标题一律模糊+遮罩：CSS 在元素出现即刻生效，
+         不再等 applyDocMask 建浮层（那需要 DOM 和定时器，启动瞬间会露明文） */
+      if (!activeUnlocked && wl.length) {
+        css += ".protyle-wysiwyg,.protyle-title,.protyle-breadcrumb{filter:blur(9px) !important;user-select:none !important;pointer-events:none !important;}\n";
+        css += ".protyle{position:relative !important;}\n";
+        css += ".protyle::after{content:\"\u{1F512} \u5BC6\u5E93\u5DF2\u9501\u5B9A\uFF0C\u8BF7\u5148\u89E3\u9501\";position:absolute;inset:0;display:flex;align-items:center;justify-content:center;background:rgba(40,40,40,.45);color:#fff;font-size:18px;z-index:2147483000;backdrop-filter:blur(2px);}\n";
+      }
+      /* 隐藏被锁文档/笔记本里的正文元素（防"点进去看到内容"）——由 JS 遮罩兜底，这里只管树 */
+      if (st.textContent !== css)
+        st.textContent = css;
+      this._hideCssSig = css;
+    } catch (e) {
+      console.error("[siyuan-edb] rebuildHideCss", e);
+    }
+  }
+  /** v1.7.5 移除隐藏 CSS（插件卸载时） */
+  removeHideCss() {
+    try {
+      const st = document.getElementById("edb-hide-style");
+      if (st)
+        st.remove();
+    } catch (e) {
+    }
+  }
   hideLostAssets() {
     try {
       let names = this.cfg.encryptedAssets || [];
@@ -10438,6 +10578,13 @@ var EdbPlugin = class extends Plugin {
         if (!chk.ok)
           showMessage("\u5B8C\u6574\u6027\u81EA\u68C0\u8B66\u544A\uFF1A" + chk.msg);
         this.refreshPanel();
+        /* v1.7.5 手动解锁成功 → 重建隐藏 CSS（放出文档树、移除正文遮罩） */
+        try {
+          this.rebuildHideCss();
+          this.applyNotebookVisibility();
+          this.applyDocMask();
+        } catch (e) {
+        }
         if (this.pendingSync) {
           this.pendingSync = false;
           setTimeout(() => {
@@ -10544,8 +10691,9 @@ var EdbPlugin = class extends Plugin {
     this._viewerState = null;
     this.state = null;
     this.refreshPanel();
-    /* v1.6.69：锁库后立即重新应用"文档树隐藏 + 正文遮罩"，不等 3 秒观察器（此前要等下一轮才隐藏） */
+    /* v1.6.69：锁库后立即重新应用"文档树隐藏 + 正文遮罩"，不等定时器 */
     try {
+      this.rebuildHideCss();
       this.applyNotebookVisibility();
       this.applyDocMask();
     } catch (e) {
@@ -11680,7 +11828,7 @@ var EdbPlugin = class extends Plugin {
   /** 当前插件版本（与 plugin.json 同步，发布时手工更新） */
   curVersion() {
     /* v1.6.63 必须与 plugin.json 的 version 保持一致（每次发版两处同步改） */
-    return "1.7.4";
+    return "1.7.5";
   }
   versionAtLeast(latest, cur) {
     const p = (s) => String(s || "").split(".").map((x) => parseInt(x, 10) || 0);

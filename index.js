@@ -8010,11 +8010,11 @@ var EdbPlugin = class extends Plugin {
     const SKIP = new Set(["assets", "emojis", "icons", "plugins", "public", "snippets", "storage", "templates", "themes", "widgets", "MiKu", "MiKu-backup", ".siyuan"]);
     const idx = new Map();
     const re = /(?:data\/)?assets\/([^"'()<>\\]+)/g;
-    const rootIdOf = (p) => {
-      const rel = path.relative(dataDir, p).split(/[\\/]/);
-      const seg = rel.slice(1).join("/").replace(/\.sy$/, "");
-      return seg.split("/")[0];
-    };
+    /* v1.6.79 修复：引用归属必须用「文档自己的 id」而不是路径首段。
+       SiYuan 的多级子文档路径是 data/<box>/<父id>/<子id>/<本id>.sy，
+       旧实现取首段 → 资产被记到祖父文档名下 → 该 id 不在 watchlist → 判定"库外引用"→ 明文永不清理。
+       （这正是多级子文档加入密库后明文还在的根因） */
+    const rootIdOf = (p) => path.basename(p).replace(/\.sy$/i, "");
     const walk = (dir) => {
       let ents;
       try {
@@ -11444,7 +11444,7 @@ var EdbPlugin = class extends Plugin {
   /** 当前插件版本（与 plugin.json 同步，发布时手工更新） */
   curVersion() {
     /* v1.6.63 必须与 plugin.json 的 version 保持一致（每次发版两处同步改） */
-    return "1.6.78";
+    return "1.6.79";
   }
   versionAtLeast(latest, cur) {
     const p = (s) => String(s || "").split(".").map((x) => parseInt(x, 10) || 0);

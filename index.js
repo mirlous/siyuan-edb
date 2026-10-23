@@ -8685,8 +8685,21 @@ var EdbPlugin = class extends Plugin {
       try {
         await this.cleanPlainAssets(null, { ignoreOpenDocs: true });
       } catch (e) {
-        console.error("[siyuan-edb] \u6574\u672c\u5165\u5e93\u540e\u6e05\u7406\u660e\u6587\u5931\u8d25", e);
+        console.error("[siyuan-edb] \u6574\u672c\u5165\u5e93\u540e\u6e05\u7406\u660E\u6587\u5931\u8d25", e);
       }
+      /* v1.6.78 再补一轮"只清已入库文档明文"（对打开中的文档做注入保护），并延迟重试 */
+      try {
+        await this.cleanVaultDocPlaintext();
+      } catch (e) {
+      }
+      setTimeout(() => {
+        this.cleanVaultDocPlaintext().catch(() => {
+        });
+      }, 4000);
+      setTimeout(() => {
+        this.cleanVaultDocPlaintext().catch(() => {
+        });
+      }, 12000);
     } finally {
       this.clearBusy();
     }
@@ -9632,9 +9645,26 @@ var EdbPlugin = class extends Plugin {
         await this.syncNow();
         if (routed && routed.name && routed.text)
           this.learnFingerprint(routed.name, routed.text);
+        /* v1.6.78 加入完成后立即清理"这些已入库文档"的明文附件，不等计时器 */
+        let cleanDone = 0;
+        try {
+          const cr = await this.cleanVaultDocPlaintext();
+          cleanDone = (cr && cr.done) || 0;
+        } catch (e2) {
+          console.error("[siyuan-edb] \u52A0\u5165\u540E\u6E05\u7406\u660E\u6587\u5931\u8D25", e2);
+        }
+        /* 打开中的文档可能被"注入保护"跳过，延迟再清两次 */
+        setTimeout(() => {
+          this.cleanVaultDocPlaintext().catch(() => {
+          });
+        }, 4000);
+        setTimeout(() => {
+          this.cleanVaultDocPlaintext().catch(() => {
+          });
+        }, 12000);
         this.refreshPanel();
         this.applyNotebookVisibility();
-        showMessage("\u2705 " + this.t("addOk") + (subAdded > 0 ? "\uFF08\u542B\u5B50\u6587\u6863 " + subAdded + " \u7BC7\uFF09" : ""));
+        showMessage("\u2705 " + this.t("addOk") + (subAdded > 0 ? "\uFF08\u542B\u5B50\u6587\u6863 " + subAdded + " \u7BC7\uFF09" : "") + (cleanDone > 0 ? "\uFF0C\u5DF2\u6E05\u660E\u6587 " + cleanDone + " \u4E2A" : ""));
       } else {
         /* v1.6.72 已在库也强制同步一次：确保"点了加入但数据没进库"的情况被修复 */
         try {
@@ -9848,7 +9878,8 @@ var EdbPlugin = class extends Plugin {
     for (const r of rows)
       if (r && r.asset_path)
         inDb.set(r.asset_path, r);
-    const res = { done: 0, bytes: 0, skippedShared: 0, skippedNotInDb: 0, failed: 0 };
+    const domSet = this.openDocIdsFromDom();
+    const res = { done: 0, bytes: 0, skippedShared: 0, skippedNotInDb: 0, skippedOpen: 0, failed: 0 };
     for (const name of [...new Set(this.cfg.encryptedAssets || [])]) {
       const abs = path.join(dataDir, "assets", name);
       let st = null;
@@ -9875,6 +9906,18 @@ var EdbPlugin = class extends Plugin {
       }
       if (!inDb.has(name)) {
         res.skippedNotInDb++;
+        continue;
+      }
+      /* v1.6.78 打开中的文档若尚未把密文注入 DOM，先不删（避免正在播放的图片/视频断流），等下一轮再清 */
+      let openBlocked = false;
+      for (const d of refs) {
+        if (domSet[d] && !this.docAssetsInjected(d)) {
+          openBlocked = true;
+          break;
+        }
+      }
+      if (openBlocked) {
+        res.skippedOpen++;
         continue;
       }
       try {
@@ -10417,6 +10460,8 @@ var EdbPlugin = class extends Plugin {
     this.refreshDocBoxes();
     this.refreshPanel();
     this.cleanPlainAssets(null).catch((e) => console.error("[siyuan-edb]", e));
+    /* v1.6.78 同步后补一轮"只清已入库文档明文"（对打开中的文档做注入保护） */
+    this.cleanVaultDocPlaintext().catch((e) => console.error("[siyuan-edb]", e));
     this.maybeAutoBackup();
     this.maybePullFromWebdav();
     this.clearBusy();
@@ -11399,7 +11444,7 @@ var EdbPlugin = class extends Plugin {
   /** 当前插件版本（与 plugin.json 同步，发布时手工更新） */
   curVersion() {
     /* v1.6.63 必须与 plugin.json 的 version 保持一致（每次发版两处同步改） */
-    return "1.6.77";
+    return "1.6.78";
   }
   versionAtLeast(latest, cur) {
     const p = (s) => String(s || "").split(".").map((x) => parseInt(x, 10) || 0);

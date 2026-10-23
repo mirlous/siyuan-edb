@@ -6947,6 +6947,12 @@ var EdbPlugin = class extends Plugin {
       this.removeHideCss();
     } catch (e) {
     }
+    /* v1.7.7 清除 body 遮罩标记 */
+    try {
+      if (document.body)
+        document.body.classList.remove("edb-mask-doc");
+    } catch (e) {
+    }
     try {
       if (this._domObs) {
         this._domObs.disconnect();
@@ -8247,6 +8253,8 @@ var EdbPlugin = class extends Plugin {
    *  解锁后 → 防拍照水印角标（激活码尾号，截图外传可溯源）。只覆盖编辑器主区，不挡侧边栏 */
   applyDocMask() {
     try {
+      /* v1.7.7 先同步 body 遮罩标记（决定 CSS 是否作用于当前编辑器） */
+      this.syncDocMaskFlag();
       const unlocked = this.isUnlocked();
       const domSet = this.openDocIdsFromDom();
       if (!this._docUnlocked)
@@ -8508,6 +8516,14 @@ var EdbPlugin = class extends Plugin {
   /** v1.6.45: 打开已加密文档时若未解锁 → 提示（隐藏为主，此为其兜底） */
   openDocGuard(e) {
     try {
+      /* v1.7.7 切换到其它文档时立刻重算遮罩标记（切换即生效，不会残留上一文档的遮罩） */
+      Promise.resolve().then(() => {
+        try {
+          this.syncDocMaskFlag();
+          this.applyDocMask();
+        } catch (e2) {
+        }
+      });
       const id = e && e.detail && e.detail.id;
       if (!id || this.isUnlocked())
         return;
@@ -8595,7 +8611,13 @@ var EdbPlugin = class extends Plugin {
       }
       if (!activeUnlocked)
         for (const d of wl) curDocs.push(d);
-      const sel = (ids) => ids.filter(Boolean).map((x) => "[data-node-id=\"" + String(x).replace(/"/g, "") + "\"]").join(",");
+      /* v1.7.8 文档树隐藏限定作用域：只匹配文件树/大纲内的节点，
+         排除编辑器 .protyle（它同样带 data-node-id，否则打开密库文档时编辑器会被整块隐藏）。 */
+      const treeScope = ".sy__file [data-node-id=\"%ID%\"]:not(.protyle),.sy__outline [data-node-id=\"%ID%\"]:not(.protyle),.b3-list[data-node-id=\"%ID%\"]:not(.protyle)";
+      const sel = (ids) => ids.filter(Boolean).map((x) => {
+        const id = String(x).replace(/"/g, "");
+        return treeScope.replace(/%ID%/g, id);
+      }).join(",");
       let css = "";
       const curSel = sel(curDocs.concat(curNbs));
       if (curSel)
@@ -8603,19 +8625,104 @@ var EdbPlugin = class extends Plugin {
       const otherSel = sel(otherDocs.concat(otherNbs));
       if (otherSel)
         css += otherSel + "{display:none !important;}\n";
-      /* v1.7.5 未解锁时，编辑器正文/标题一律模糊+遮罩：CSS 在元素出现即刻生效，
-         不再等 applyDocMask 建浮层（那需要 DOM 和定时器，启动瞬间会露明文） */
-      if (!activeUnlocked && wl.length) {
-        css += ".protyle-wysiwyg,.protyle-title,.protyle-breadcrumb{filter:blur(9px) !important;user-select:none !important;pointer-events:none !important;}\n";
-        css += ".protyle{position:relative !important;}\n";
-        css += ".protyle::after{content:\"\u{1F512} \u5BC6\u5E93\u5DF2\u9501\u5B9A\uFF0C\u8BF7\u5148\u89E3\u9501\";position:absolute;inset:0;display:flex;align-items:center;justify-content:center;background:rgba(40,40,40,.45);color:#fff;font-size:18px;z-index:2147483000;backdrop-filter:blur(2px);}\n";
+      /* v1.7.8 修复正文遮罩范围：必须【按文档 id】精确匹配 .protyle，
+         绝不能用 body 全局标记或裸 .protyle 选择器——那会把同窗口里所有普通文档一起遮住
+         （v1.7.5 的严重回归：锁定后编辑任何文档都显示"密库已锁定"）。 */
+      if (!activeUnlocked) {
+        const maskIds = curDocs.concat(otherDocs);
+        if (maskIds.length) {
+          const psel = (suffix) => maskIds.filter(Boolean).map((x) => ".protyle[data-node-id=\"" + String(x).replace(/"/g, "") + "\"]" + suffix).join(",");
+          const inner = psel(" .protyle-wysiwyg") + "," + psel(" .protyle-title") + "," + psel(" .protyle-breadcrumb");
+          css += inner + "{filter:blur(9px) !important;user-select:none !important;pointer-events:none !important;}\n";
+          css += psel("") + "{position:relative !important;}\n";
+          css += psel("::after") + "{content:\"\u{1F512} \u5BC6\u5E93\u5DF2\u9501\u5B9A\uFF0C\u8BF7\u5148\u89E3\u9501\uFF08\u70B9\u9876\u90E8\u5BC6\u5E93\u56FE\u6807\u89E3\u9501\uFF09\";position:absolute;inset:0;display:flex;align-items:center;justify-content:center;background:rgba(40,40,40,.45);color:#fff;font-size:18px;z-index:2147483000;backdrop-filter:blur(2px);pointer-events:none;}\n";
+        }
       }
       /* 隐藏被锁文档/笔记本里的正文元素（防"点进去看到内容"）——由 JS 遮罩兜底，这里只管树 */
       if (st.textContent !== css)
         st.textContent = css;
       this._hideCssSig = css;
+      /* v1.7.7 CSS 重建后同步一次遮罩标记 */
+      this.syncDocMaskFlag();
     } catch (e) {
       console.error("[siyuan-edb] rebuildHideCss", e);
+    }
+  }
+  /** v1.7.8 兜底：把"非密库文档"的编辑器遮罩样式显式清掉。
+   *  即使 CSS 选择器在某个思源版本里失配/残留，普通文档也绝不会被遮住。 */
+  clearNonVaultDocMask() {
+    try {
+      const excl = new Set(this.cfg.excludedDocs || []);
+      const wlSet = new Set(this.cfg.watchlist || []);
+      const activeV = Number(this.cfg.activeVault) || 0;
+      const others = new Set();
+      (this.cfg.vaults || []).forEach((v, i) => {
+        if (v && i !== activeV)
+          (v.watchlist || []).forEach((d) => others.add(d));
+      });
+      document.querySelectorAll(".protyle[data-node-id]").forEach((p) => {
+        const id = p.getAttribute("data-node-id");
+        if (!id)
+          return;
+        const isVaultDoc = (wlSet.has(id) && !excl.has(id)) || others.has(id);
+        if (isVaultDoc)
+          return;
+        /* 非密库文档：清掉任何残留遮罩/模糊 */
+        p.style.removeProperty("position");
+        const kids = p.querySelectorAll(".protyle-wysiwyg,.protyle-title,.protyle-breadcrumb");
+        for (const k of kids) {
+          if (k.style.filter)
+            k.style.removeProperty("filter");
+          if (k.style.pointerEvents)
+            k.style.removeProperty("pointer-events");
+          if (k.style.userSelect)
+            k.style.removeProperty("user-select");
+        }
+      });
+    } catch (e) {
+    }
+  }
+  /** v1.7.7 只有"当前打开的文档属于密库且未解锁"时才给 body 加遮罩标记，
+   *  普通文档绝不加 → 修复"锁定后编辑其它文档也被遮住"的回归。 */
+  syncDocMaskFlag() {
+    try {
+      const body = document.body;
+      if (!body)
+        return;
+      let need = false;
+      if (!this.isUnlocked()) {
+        const excl = new Set(this.cfg.excludedDocs || []);
+        const wlSet = new Set(this.cfg.watchlist || []);
+        const domSet = this.openDocIdsFromDom();
+        for (const id in domSet) {
+          if (wlSet.has(id) && !excl.has(id)) {
+            need = true;
+            break;
+          }
+        }
+        /* 打开中的文档若属于"其它库"，同样遮罩（多库隔离） */
+        if (!need) {
+          const activeV = Number(this.cfg.activeVault) || 0;
+          const others = new Set();
+          (this.cfg.vaults || []).forEach((v, i) => {
+            if (v && i !== activeV)
+              (v.watchlist || []).forEach((d) => others.add(d));
+          });
+          for (const id in domSet) {
+            if (others.has(id)) {
+              need = true;
+              break;
+            }
+          }
+        }
+      }
+      /* v1.7.8 不再使用 body 全局标记（会导致所有 .protyle 被遮）；
+         改为 CSS 直接按文档 id 匹配，这里只做清理兜底。 */
+      if (body.classList.contains("edb-mask-doc"))
+        body.classList.remove("edb-mask-doc");
+      /* v1.7.8 兜底：清掉非密库文档上的残留遮罩样式，保证普通文档绝不被遮 */
+      this.clearNonVaultDocMask();
+    } catch (e) {
     }
   }
   /** v1.7.5 移除隐藏 CSS（插件卸载时） */
@@ -11828,7 +11935,7 @@ var EdbPlugin = class extends Plugin {
   /** 当前插件版本（与 plugin.json 同步，发布时手工更新） */
   curVersion() {
     /* v1.6.63 必须与 plugin.json 的 version 保持一致（每次发版两处同步改） */
-    return "1.7.6";
+    return "1.7.8";
   }
   versionAtLeast(latest, cur) {
     const p = (s) => String(s || "").split(".").map((x) => parseInt(x, 10) || 0);

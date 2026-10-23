@@ -9775,6 +9775,65 @@ var EdbPlugin = class extends Plugin {
       return 0;
     }
   }
+  /** v1.6.76 统计"已加密进库但磁盘仍留明文"的附件（附件层面；.sy 正文不在统计内） */
+  async auditPlainLeftovers() {
+    if (!this.isUnlocked())
+      return { unlocked: false, total: 0, bytes: 0, samples: [] };
+    try {
+      await this.syncEncryptedAssetCache();
+    } catch (e) {
+    }
+    const dataDir = await this.wsDataDir();
+    if (!dataDir)
+      return { unlocked: true, total: 0, bytes: 0, samples: [] };
+    const names = [...new Set(this.cfg.encryptedAssets || [])];
+    let total = 0, bytes = 0;
+    const samples = [];
+    for (const n of names) {
+      try {
+        const st = fs.statSync(path.join(dataDir, "assets", n));
+        if (!st.isFile())
+          continue;
+        total++;
+        bytes += st.size;
+        if (samples.length < 8)
+          samples.push(n);
+      } catch (e) {
+      }
+    }
+    return { unlocked: true, total, bytes, samples };
+  }
+  /** v1.6.76 强制清理明文附件：库内已加密的全部删除明文副本（不检查其它文档引用；高风险、需用户确认） */
+  async forceCleanPlainAssets() {
+    if (!this.isUnlocked())
+      throw new Error("\u8BF7\u5148\u89E3\u9501\u5BC6\u5E93");
+    const dataDir = await this.wsDataDir();
+    const all = core.listAssets(this.state.db) || [];
+    let done = 0, bytes = 0, failed = 0;
+    for (const a of all) {
+      if (!a || !a.asset_path)
+        continue;
+      if (Number(a.trashed) === 1)
+        continue;
+      const abs = path.join(dataDir, "assets", a.asset_path);
+      let st = null;
+      try {
+        st = fs.statSync(abs);
+      } catch (e) {
+        st = null;
+      }
+      if (!st || !st.isFile())
+        continue;
+      try {
+        fs.unlinkSync(abs);
+        done++;
+        bytes += st.size;
+      } catch (e) {
+        failed++;
+      }
+    }
+    return { done, bytes, failed };
+  }
   /** v1.6.70 补全所有已入库文档的子文档（维护按钮用） */
   async addMissingSubDocsAll() {
     let added = 0, scanned = 0, docsWithSub = 0;
@@ -11287,7 +11346,7 @@ var EdbPlugin = class extends Plugin {
   /** 当前插件版本（与 plugin.json 同步，发布时手工更新） */
   curVersion() {
     /* v1.6.63 必须与 plugin.json 的 version 保持一致（每次发版两处同步改） */
-    return "1.6.75";
+    return "1.6.76";
   }
   versionAtLeast(latest, cur) {
     const p = (s) => String(s || "").split(".").map((x) => parseInt(x, 10) || 0);
@@ -12708,6 +12767,25 @@ var EdbPlugin = class extends Plugin {
       const r = await this.addMissingSubDocsAll();
       repInfo.textContent = "\u5B50\u6587\u6863\u8865\u5168\u5B8C\u6210\uFF1A\u626B\u63CF " + r.scanned + " \u7BC7\u6587\u6863\uFF0C\u65B0\u589E\u5165\u5E93 " + r.added + " \u7BC7\uFF08\u5176\u4E2D " + r.docsWithSub + " \u7BC7\u6709\u5B50\u6587\u6863\uFF09";
       showMessage(r.added > 0 ? "\u2705 \u5DF2\u8865\u5165 " + r.added + " \u7BC7\u5B50\u6587\u6863" : "\u2705 \u5B50\u6587\u6863\u5DF2\u5168\u90E8\u5728\u5E93");
+    }));
+    /* v1.6.76 明文残留统计 + 强制清理（附件层面；.sy 正文见说明） */
+    repRow.appendChild(mkRepBtn("\u{1F50E} \u7EDF\u8BA1\u660E\u6587\u6B8B\u7559", async () => {
+      const r = await this.auditPlainLeftovers();
+      if (!r.unlocked) {
+        repInfo.textContent = "\u8BF7\u5148\u89E3\u9501\u5BC6\u5E93\u540E\u518D\u7EDF\u8BA1";
+        return;
+      }
+      repInfo.textContent = "\u5DF2\u52A0\u5BC6\u4F46\u4ECD\u7559\u660E\u6587\uFF1A" + r.total + " \u4E2A\u9644\u4EF6 / " + this.fmtSize(r.bytes) + (r.samples.length ? "\uFF08\u793A\u4F8B\uFF1A" + r.samples.slice(0, 3).join("\u3001") + "\uFF09" : "");
+      showMessage(r.total > 0 ? "\u26A0 \u6709 " + r.total + " \u4E2A\u9644\u4EF6\u660E\u6587\u6B8B\u7559\uFF0C\u53EF\u70B9\u300C\u5F3A\u5236\u6E05\u7406\u660E\u6587\u300D" : "\u2705 \u672A\u53D1\u73B0\u660E\u6587\u6B8B\u7559");
+    }));
+    repRow.appendChild(mkRepBtn("\u{1F9F9} \u5F3A\u5236\u6E05\u7406\u660E\u6587", async () => {
+      const ok = await this.confirmBox("\u5C06\u5220\u9664\u300C\u5DF2\u52A0\u5BC6\u8FDB\u5E93\u300D\u9644\u4EF6\u5728 assets \u76EE\u5F55\u91CC\u7684\u660E\u6587\u526F\u672C\u3002\n\n\u26A0 \u98CE\u9669\uFF1A\u82E5\u540C\u4E00\u9644\u4EF6\u8FD8\u88AB\u300C\u4E0D\u5728\u5BC6\u5E93\u4E2D\u7684\u5176\u4ED6\u6587\u6863\u300D\u5F15\u7528\uFF0C\u90A3\u4E9B\u6587\u6863\u7684\u56FE\u7247/\u89C6\u9891\u5C06\u65E0\u6CD5\u663E\u793A\uFF08\u82E5\u662F\u91CD\u590D\u5BFC\u5165\u7684\u526F\u672C\uFF0C\u53EF\u5FFD\u7565\uFF09\u3002\n\n\u5BC6\u5E93\u5185\u7684\u5BC6\u6587\u4E0D\u53D7\u5F71\u54CD\uFF0C\u53EF\u968F\u65F6\u6062\u590D\u3002\n\n\u786E\u5B9A\u7EE7\u7EED\uFF1F");
+      if (!ok)
+        return;
+      repInfo.textContent = "\u6B63\u5728\u6E05\u7406\u2026";
+      const r = await this.forceCleanPlainAssets();
+      repInfo.textContent = "\u6E05\u7406\u5B8C\u6210\uFF1A\u5220\u9664 " + r.done + " \u4E2A\u660E\u6587\u9644\u4EF6\uFF0C\u91CA\u653E " + this.fmtSize(r.bytes) + (r.failed ? "\uFF0C\u5931\u8D25 " + r.failed + " \u4E2A\uFF08\u53EF\u80FD\u88AB\u5360\u7528\uFF09" : "");
+      showMessage("\u2705 \u5DF2\u6E05\u7406 " + r.done + " \u4E2A\u660E\u6587\u9644\u4EF6\uFF08" + this.fmtSize(r.bytes) + "\uFF09");
     }));
     repBox.appendChild(repRow);
     const repTip = document.createElement("div");

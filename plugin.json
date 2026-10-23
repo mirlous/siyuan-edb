@@ -2,7 +2,7 @@
   "name": "siyuan-edb",
   "author": "mirlous",
   "url": "https://github.com/mirlous/siyuan-edb",
-  "version": "1.7.8",
+  "version": "1.7.9",
   "minAppVersion": "3.0.0",
   "backends": [
     "all"

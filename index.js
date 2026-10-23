@@ -8222,6 +8222,15 @@ var EdbPlugin = class extends Plugin {
         const bid = el.getAttribute("data-node-id");
         if (!bid)
           return;
+        /* v1.7.9 跳过编辑器本体（.protyle 及内部块）：它们同样带 data-node-id，
+           若被 display:none 会整篇编辑器消失。编辑器由 CSS 按文档 id 遮罩负责。 */
+        try {
+          if (el.classList && (el.classList.contains("protyle") || el.classList.contains("protyle-wysiwyg") || el.classList.contains("protyle-title") || el.classList.contains("protyle-breadcrumb")))
+            return;
+          if (el.closest && el.closest(".protyle"))
+            return;
+        } catch (e3) {
+        }
         let want = null;
         if (otherNbs.has(bid) || otherDocs.has(bid)) {
           want = "none";
@@ -11935,7 +11944,7 @@ var EdbPlugin = class extends Plugin {
   /** 当前插件版本（与 plugin.json 同步，发布时手工更新） */
   curVersion() {
     /* v1.6.63 必须与 plugin.json 的 version 保持一致（每次发版两处同步改） */
-    return "1.7.8";
+    return "1.7.9";
   }
   versionAtLeast(latest, cur) {
     const p = (s) => String(s || "").split(".").map((x) => parseInt(x, 10) || 0);

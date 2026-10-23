@@ -10499,13 +10499,32 @@ var EdbPlugin = class extends Plugin {
       }
     }
   }
-  /** 把恢复密钥落盘到插件数据目录（密库-<库名>-恢复密钥.txt），用户可另行备份 */
+  /** v1.7.3 恢复密钥落盘：统一文件名「🔑 恢复密钥.txt」（库目录内），用户可另行备份。
+   *  旧版曾写成「<库名>-恢复密钥.txt」，更早还会出现「新建 文本文档.txt」（记事本默认名）——统一后不再有第二份明文副本。 */
   async saveRecoveryWords(words) {
     try {
+      const dir = path.dirname(this.cfg.dbPath);
       const name = path.basename(this.cfg.dbPath).replace(/\.sydb$/i, "") || "\u5BC6\u5E93";
-      const p = path.join(path.dirname(this.cfg.dbPath), name + "-\u6062\u590D\u5BC6\u94A5.txt");
-      const content = "\u3010\u5BC6\u5E93\u6062\u590D\u5BC6\u94A5\u3011\u8BF7\u59A5\u5584\u4FDD\u7BA1\uFF08\u4E0D\u8981\u5B58\u5728\u7535\u8111\u4E0A\u6216\u53EF\u622A\u56FE\u53D1\u7ED9\u4ED6\u4EBA\uFF09\n\n\u6062\u590D\u5BC6\u94A5\uFF1A" + words + "\n\n\u7528\u9014\uFF1A\u5FD8\u8BB0\u5BC6\u7801\u65F6\uFF0C\u5728\u89E3\u9501\u5F39\u7A97\u9009\u300C\u4F7F\u7528\u6062\u590D\u5BC6\u94A5\u300D\uFF0C\u8F93\u5165\u8FD9 12 \u4E2A\u8BCD\u5373\u53EF\u89E3\u9501\u5E76\u91CD\u8BBE\u65B0\u5BC6\u7801\u3002\n\u751F\u6210\u65F6\u95F4\uFF1A" + (/* @__PURE__ */ new Date()).toLocaleString() + "\n";
+      const p = path.join(dir, "\u{1F511} \u6062\u590D\u5BC6\u94A5.txt");
+      const content = "\u3010\u5BC6\u5E93\u6062\u590D\u5BC6\u94A5\u3011\u8BF7\u59A5\u5584\u4FDD\u7BA1\uFF08\u4E0D\u8981\u5B58\u5728\u7535\u8111\u4E0A\u6216\u53EF\u622A\u56FE\u53D1\u7ED9\u4ED6\u4EBA\uFF09\n\n\u5BC6\u5E93\uFF1A" + name + "\n\u5BC6\u5E93\u6587\u4EF6\uFF1A" + this.cfg.dbPath + "\n\u751F\u6210\u65F6\u95F4\uFF1A" + (/* @__PURE__ */ new Date()).toLocaleString() + "\n\n\u6062\u590D\u5BC6\u94A5\uFF1A" + words + "\n\n\u7528\u9014\uFF1A\u5FD8\u8BB0\u5BC6\u7801\u65F6\uFF0C\u5728\u89E3\u9501\u5F39\u7A97\u9009\u300C\u4F7F\u7528\u6062\u590D\u5BC6\u94A5\u300D\uFF0C\u8F93\u5165\u8FD9 12 \u4E2A\u8BCD\u5373\u53EF\u89E3\u9501\u5E76\u91CD\u8BBE\u65B0\u5BC6\u7801\u3002\n";
       fs.writeFileSync(p, content, "utf8");
+      /* 清理历史遗留的同内容副本（避免恢复密钥散落多份明文） */
+      try {
+        const legacy = ["\u65B0\u5EFA \u6587\u672C\u6587\u6863.txt", name + "-\u6062\u590D\u5BC6\u94A5.txt"];
+        for (const lf of legacy) {
+          const lp = path.join(dir, lf);
+          if (lp === p)
+            continue;
+          if (fs.existsSync(lp)) {
+            try {
+              fs.unlinkSync(lp);
+              console.log("[siyuan-edb] \u5DF2\u6E05\u7406\u5386\u53F2\u6062\u590D\u5BC6\u94A5\u526F\u672C:", lp);
+            } catch (e) {
+            }
+          }
+        }
+      } catch (e) {
+      }
       showMessage("\u{1F4C4} \u6062\u590D\u5BC6\u94A5\u5DF2\u4FDD\u5B58\u5230\uFF1A" + p);
     } catch (e) {
     }
@@ -11661,7 +11680,7 @@ var EdbPlugin = class extends Plugin {
   /** 当前插件版本（与 plugin.json 同步，发布时手工更新） */
   curVersion() {
     /* v1.6.63 必须与 plugin.json 的 version 保持一致（每次发版两处同步改） */
-    return "1.7.2";
+    return "1.7.3";
   }
   versionAtLeast(latest, cur) {
     const p = (s) => String(s || "").split(".").map((x) => parseInt(x, 10) || 0);

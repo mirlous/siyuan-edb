@@ -11828,7 +11828,7 @@ var EdbPlugin = class extends Plugin {
   /** 当前插件版本（与 plugin.json 同步，发布时手工更新） */
   curVersion() {
     /* v1.6.63 必须与 plugin.json 的 version 保持一致（每次发版两处同步改） */
-    return "1.7.5";
+    return "1.7.6";
   }
   versionAtLeast(latest, cur) {
     const p = (s) => String(s || "").split(".").map((x) => parseInt(x, 10) || 0);
@@ -12115,14 +12115,14 @@ var EdbPlugin = class extends Plugin {
     licLine.style.cssText = "padding:6px 10px;font-size:12px;color:" + (this.isLicensed() ? "var(--b3-theme-on-background,#999)" : "#d23f31") + ";border-bottom:1px solid var(--b3-theme-background-light,#ddd);";
     licLine.textContent = "\u{1F511} " + (this.isLicensed() ? this.licenseText() : this.cfg.revoked ? this.licenseText() : this.licState ? this.t("licExpired") + "\uFF08" + this.licenseText() + "\uFF09" : this.t("licStatusNone"));
     elc.appendChild(licLine);
-    /* v1.6.64 主动申请试用（服务端签发 7 天签名租约；删本地无法重置） */
+    /* v1.6.64 主动申请试用（服务端签发 60 天签名租约；删本地无法重置） */
     if (!this.isLicensed() && !this.trialLeaseValid()) {
       const srvExp = Number(this.cfg.trialLeaseExp) || 0;
       const tb = document.createElement("button");
       tb.className = "b3-button b3-button--outline";
       tb.style.cssText = "margin:6px 10px;font-size:12px;";
-      tb.textContent = srvExp > 0 && this.nowTs() >= srvExp ? "\u23F3 试用已结束（购买后激活）" : "\u{1F9EA} 开始 7 天免费试用";
-      tb.title = "联网申请一次，服务端签发 7 天试用租约；换工作区/重装/删文件都不会重置";
+      tb.textContent = srvExp > 0 && this.nowTs() >= srvExp ? "\u23F3 试用已结束（购买后激活）" : "\u{1F9EA} 开始 60 天免费试用（两个月）";
+      tb.title = "联网申请一次，服务端签发 60 天（两个月）试用租约；换工作区/重装/删文件都不会重置";
       if (srvExp > 0 && this.nowTs() >= srvExp) {
         tb.disabled = true;
       } else {
@@ -14863,7 +14863,7 @@ var EdbPlugin = class extends Plugin {
       }
       if (this.trialLeaseValid()) {
         this.writeTrialLeaseMirror();
-      } else if (this.cfg.trialStart && this.nowTs() - this.cfg.trialStart < 7 * 864e5) {
+      } else if (this.cfg.trialStart && this.nowTs() - this.cfg.trialStart < 60 * 864e5) {
         /* 老版本试用未到期 → 静默迁移为签名租约（不延长；离线失败则继续用本地试用） */
         this.applyTrial(true).catch(() => {});
       }
@@ -14871,7 +14871,7 @@ var EdbPlugin = class extends Plugin {
     }
     if (this.licState && this.licState.expAt && this.cfg.licWarnShown !== String(this.licState.expAt)) {
       const left = this.licState.expAt - this.nowTs();
-      if (left > 0 && left < 7 * 864e5) {
+      if (left > 0 && left < 60 * 864e5) {
         this.cfg.licWarnShown = String(this.licState.expAt);
         try {
           await this.saveConfig();
@@ -15212,6 +15212,23 @@ var EdbPlugin = class extends Plugin {
         this.cfg.trialStart = eff;
         changed = true;
       }
+      /* v1.7.6 试用期升级 7→60 天：本地判定"有效期已到 7 天但按新规仍未到 60 天"时，
+         主动拉一次 triallease，让服务端按 first+60d 重签租约（只延长不缩短）。 */
+      try {
+        const st = eff || Number(this.cfg.trialStart) || 0;
+        if (st > 0) {
+          const oldEnd = st + 7 * 864e5;
+          const newEnd = st + 60 * 864e5;
+          const leaseExp = Number(this.cfg.trialLeaseExp) || 0;
+          const nowTs = this.nowTs();
+          if (nowTs < newEnd && (leaseExp === 0 || leaseExp <= oldEnd + 60e3)) {
+            const okk = await this.applyTrial(true);
+            if (okk)
+              changed = true;
+          }
+        }
+      } catch (e) {
+      }
       if (changed) {
         try {
           await this.saveConfig();
@@ -15392,15 +15409,15 @@ var EdbPlugin = class extends Plugin {
     this.refreshTrialEff();
     return true;
   }
-  /** 试用到期时间（租约优先；老本地试用按 7 天折算） */
+  /** 试用到期时间（租约优先；老本地试用按 60 天折算） */
   trialExpAt() {
     const info = this.trialLeaseInfo();
     if (info)
       return info.exp;
     const st = this._trialEff || this.refreshTrialEff();
-    return st ? st + 7 * 864e5 : 0;
+    return st ? st + 60 * 864e5 : 0;
   }
-  /** 7 天试用是否有效 */
+  /** 60 天试用是否有效 */
   isTrialValid() {
     if (this.cfg.clockRollback)
       return false;
@@ -15414,7 +15431,7 @@ var EdbPlugin = class extends Plugin {
     const st = this._trialEff || this.refreshTrialEff();
     if (!st)
       return false;
-    return this.nowTs() - st < 7 * 864e5;
+    return this.nowTs() - st < 60 * 864e5;
   }
   /** 试用剩余天数（向上取整） */
   trialDaysLeft() {
@@ -15516,7 +15533,7 @@ var EdbPlugin = class extends Plugin {
         return this.t("licTrial") + " " + this.trialTimeLeft();
       if (Number(this.cfg.trialLeaseExp) > 0 || Number(this.cfg.trialStart) > 0)
         return "\u23F3 试用已结束，请购买激活码";
-      return "\u{1F511} 未激活 · 可申请 7 天免费试用";
+      return "\u{1F511} 未激活 · 可申请 60 天免费试用（两个月）";
     }
     if (this.licState.expAt === 0)
       return this.t("licStatusForever");

@@ -10942,6 +10942,33 @@ var EdbPlugin = class extends Plugin {
       return true; /* 估算失败不阻塞流程 */
     }
   }
+  /** v1.8.2 关闭所有"已打开的密库文档"页签（收集 → 点击关闭按钮）。
+   *  供 lockVault / quickLock 共用；返回关闭数量。 */
+  closeVaultDocTabs() {
+    try {
+      const ids = [];
+      const wl = new Set(this.cfg.watchlist || []);
+      const excl = new Set(this.cfg.excludedDocs || []);
+      const activeV = Number(this.cfg.activeVault) || 0;
+      const others = new Set();
+      (this.cfg.vaults || []).forEach((v, i) => {
+        if (v && i !== activeV)
+          (v.watchlist || []).forEach((d) => others.add(d));
+      });
+      document.querySelectorAll(".protyle[data-node-id]").forEach((el) => {
+        const id = el.getAttribute("data-node-id");
+        if (!id)
+          return;
+        if ((wl.has(id) && !excl.has(id)) || others.has(id))
+          ids.push(id);
+      });
+      if (!ids.length)
+        return 0;
+      return this.closeDocTabsByIds(ids);
+    } catch (e) {
+      return 0;
+    }
+  }
   /** v1.8.0 U4 一键锁定：命令/顶栏右键/快捷键统一入口。
    *  锁定后把"已打开的密库文档标签页"一并关闭（U5），避免标签标题继续暴露文档名。 */
   quickLock() {
@@ -10950,35 +10977,9 @@ var EdbPlugin = class extends Plugin {
         showMessage(this.t("alreadyLocked") || "\u5BC6\u5E93\u5DF2\u9501\u5B9A");
         return false;
       }
-      /* U5 关闭已打开的密库文档标签页（先收集，再锁，避免锁后读不到 state） */
-      const ids = [];
-      try {
-        const wl = new Set(this.cfg.watchlist || []);
-        const excl = new Set(this.cfg.excludedDocs || []);
-        const activeV = Number(this.cfg.activeVault) || 0;
-        const others = new Set();
-        (this.cfg.vaults || []).forEach((v, i) => {
-          if (v && i !== activeV)
-            (v.watchlist || []).forEach((d) => others.add(d));
-        });
-        document.querySelectorAll(".protyle[data-node-id]").forEach((el) => {
-          const id = el.getAttribute("data-node-id");
-          if (!id)
-            return;
-          if ((wl.has(id) && !excl.has(id)) || others.has(id))
-            ids.push(id);
-        });
-      } catch (e) {
-      }
+      /* v1.8.2 关页签由 lockVault 统一处理，这里只负责提示 */
       this.lockVault();
-      /* U5 关闭这些文档的标签页（失败静默，不影响锁定结果） */
-      let closedN = 0;
-      if (ids.length) {
-        try {
-          closedN = this.closeDocTabsByIds(ids);
-        } catch (e) {
-        }
-      }
+      const closedN = Number(this._lastLockClosedN) || 0;
       showMessage("\u{1F512} " + (this.t("lockSuccess") || "\u5BC6\u5E93\u5DF2\u9501\u5B9A") + (closedN > 0 ? "\uFF08\u5DF2\u5173\u95ED " + closedN + " \u4E2A\u6807\u7B7E\u9875\uFF09" : ""));
       return true;
     } catch (e) {
@@ -11016,6 +11017,15 @@ var EdbPlugin = class extends Plugin {
   }
 
   lockVault() {
+    /* v1.8.2 锁库统一入口：先关闭"已打开的密库文档页签"，再真正锁定。
+       此前只有 quickLock 会关页签 → 从面板/空闲自动锁定时页签残留，
+       留下整块"密库已锁定"遮罩但文档树已隐藏，用户找不到入口（死锁感）。 */
+    let _closedN = 0;
+    try {
+      _closedN = this.closeVaultDocTabs();
+    } catch (e) {
+    }
+    this._lastLockClosedN = _closedN;
     if (this.syncTimer)
       clearTimeout(this.syncTimer);
     // v1.6.26: 锁定/切换库时清掉单篇自动同步定时器，避免锁定时触发写库
@@ -12167,7 +12177,7 @@ var EdbPlugin = class extends Plugin {
   /** 当前插件版本（与 plugin.json 同步，发布时手工更新） */
   curVersion() {
     /* v1.6.63 必须与 plugin.json 的 version 保持一致（每次发版两处同步改） */
-    return "1.8.1";
+    return "1.8.2";
   }
   versionAtLeast(latest, cur) {
     const p = (s) => String(s || "").split(".").map((x) => parseInt(x, 10) || 0);

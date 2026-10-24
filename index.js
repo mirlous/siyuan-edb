@@ -6855,18 +6855,26 @@ var EdbPlugin = class extends Plugin {
         }
         return;
       }
-      /* v2.0.4 🔥 性能修复：原实现 for(watchlist) 逐篇调用 cleanPlainAssets，
-         80 篇文档时等于每 5 秒做 80 次 DOM 扫描 + 数千次索引遍历 → CPU 风扇狂转、
-         思源界面点击无响应。改为：
-           ① 一次全量调用（cleanPlainAssets(null) 内部逻辑等价）
-           ② 用户正在操作（20 秒内有输入）就跳过，不抢主线程
-           ③ 间隔从 5 秒放宽到 45 秒（明文清理有同步流程 + MutationObserver 兜底，无需高频） */
+      /* v2.0.4/v2.0.5 性能修复：原实现每 5 秒对 watchlist 逐篇调用 cleanPlainAssets，
+         80 篇文档 = 每秒 16 次 DOM 扫描 + 数千次索引遍历 → CPU 风扇狂转、界面点击无响应。
+         最终方案（保留安全语义）：
+           ① 间隔 5 秒 → 45 秒
+           ② 用户正在操作（20 秒内有输入）整轮跳过，不抢主线程
+           ③ 仍逐篇调用并保留 allowVisible 保护（v2.0.4 曾误改为无保护全量，已回退） */
       const _idleMs = Date.now() - (this.lastActive || 0);
       if (_idleMs < 20000)
         return;
       try {
         await this.injectOpenDocs();
-        await this.cleanPlainAssets(null, { ignoreOpenDocs: true });
+        const domSet = this.openDocIdsFromDom();
+        /* v2.0.5 回退：恢复逐篇调用与 allowVisible 保护。
+           v2.0.4 改成一次全量 cleanPlainAssets(null) 会丢掉 allowVisible，
+           可能清理掉"当前正在显示"的文档明文资产。
+           性能收益由【45 秒间隔 + 空闲跳过】提供，不靠牺牲安全语义。 */
+        for (const id of this.cfg.watchlist) {
+          if ((this.cfg.excludedDocs || []).includes(id)) continue;
+          await this.cleanPlainAssets(id, { ignoreOpenDocs: true, allowVisible: domSet[id] });
+        }
       } catch (e) {
         console.error("[siyuan-edb]", e);
       }
@@ -7285,18 +7293,9 @@ var EdbPlugin = class extends Plugin {
   }
   /** 从 DOM 检测当前可见打开中的文档（思源每个打开的编辑器是 .protyle[data-node-id]；不可见/已关闭的排除） */
   openDocIdsFromDom() {
-    /* v2.0.4 性能：同一轮逻辑里多处调用只扫一次 DOM（800ms 内复用） */
-    {
-      const _n = Date.now();
-      if (this._odCache && _n - this._odAt < 800)
-        return this._odCache;
-      this._odAt = _n;
-      const r = this._openDocIdsFromDomRaw();
-      this._odCache = r;
-      return r;
-    }
-  }
-  _openDocIdsFromDomRaw() {
+    /* v2.0.5 🔴 回退 v2.0.4 的 800ms 缓存：
+       该结果决定"向哪些文档注入解密数据"，缓存会让刚解锁时拿到锁定期的空结果
+       → 不注入 → 解锁后数据不显示。此处必须实时扫描。 */
     const set = {};
     try {
       const nodes = document.querySelectorAll(".protyle[data-node-id]");
@@ -8990,7 +8989,7 @@ var EdbPlugin = class extends Plugin {
   }
   /** 整本笔记本入库：查询该笔记本全部文档 ID → 批量加入 watchlist → 一次全量同步 */
   async addNotebookToVault(boxIds) {
-    /* v2.0.0 免费版允许整本加入，但受 50 篇额度限制 */
+    /* v2.0.0 免费版允许整本加入，但受额度限制（freeDocLimit，当前 10 篇） */
     if (!this.isUnlocked()) {
       const ok = await this.ensureUnlocked();
       if (!ok)
@@ -12755,7 +12754,7 @@ var EdbPlugin = class extends Plugin {
   /** 当前插件版本（与 plugin.json 同步，发布时手工更新） */
   curVersion() {
     /* v1.6.63 必须与 plugin.json 的 version 保持一致（每次发版两处同步改） */
-    return "2.0.4";
+    return "2.0.5";
   }
   versionAtLeast(latest, cur) {
     const p = (s) => String(s || "").split(".").map((x) => parseInt(x, 10) || 0);
@@ -14592,6 +14591,15 @@ var EdbPlugin = class extends Plugin {
     box.appendChild(secBox);
     /* ============ v1.6.55 购买激活码（扫码点单半自动：微信支付单号对账） ============ */
     const payBox = document.createElement("div");
+    /* v2.0.5 让用户在购买区也能看到"免费版可用"，降低购买抵触 */
+    try {
+      const freeTip = document.createElement("div");
+      freeTip.style.cssText = "font-size:12px;color:#6b7280;background:rgba(103,194,58,.10);border-left:3px solid #67c23a;padding:6px 8px;border-radius:4px;margin-bottom:8px;line-height:1.6;";
+      freeTip.innerHTML = "\u{1F193} <b>\u514D\u8D39\u7248\u6C38\u4E45\u53EF\u7528</b>\uFF1A\u6700\u591A 10 \u7BC7\u6587\u6863\u30011 \u4E2A\u5BC6\u5E93\uFF0C\u542B\u52A0\u5BC6/\u9501\u5B9A/\u6062\u590D\u5BC6\u94A5/\u81EA\u52A8\u5907\u4EFD\u3002" +
+        "<br>\u5347\u7EA7\u89E3\u9501\uFF1A\u65E0\u9650\u6587\u6863\u4E0E\u5BC6\u5E93\u3001\u7F51\u76D8\u540C\u6B65\u3001\u624B\u673A\u67E5\u770B\u3001\u9605\u540E\u5373\u711A\u3001\u53CC\u56E0\u7D20\u3002";
+      payBox.appendChild(freeTip);
+    } catch (e) {
+    }
     payBox.style.cssText = "border:1px solid var(--b3-border-color,#333);border-radius:6px;padding:10px;display:flex;flex-direction:column;gap:8px;";
     const payTitle = document.createElement("div");
     payTitle.style.cssText = "font-size:14px;font-weight:bold;";
@@ -14666,14 +14674,15 @@ var EdbPlugin = class extends Plugin {
     })();
     const payPlanRow = document.createElement("div");
     payPlanRow.style.cssText = "display:flex;gap:6px;flex-wrap:wrap;";
-    let selPlan = "M";
-    const plans = [["M", "\u6708\u5361 \u00A59.9"], ["H", "\u534A\u5E74\u5361 \u00A529.9"], ["Y", "\u5E74\u5361 \u00A549.9"], ["F", "\u6C38\u4E45 \u00A599"]];
+    /* v2.0.5 价格更新：年付为主推（默认选中），永久约等于 5 年费用 */
+    let selPlan = "Y";
+    const plans = [["M", "\u6708\u5361 \u00A56"], ["Y", "\u5E74\u5361 \u00A539"], ["H", "\u4E09\u5E74 \u00A589"], ["F", "\u6C38\u4E45 \u00A5199"]];
     for (const [k, label] of plans) {
       const b = document.createElement("button");
       b.textContent = label;
       b.className = "b3-button";
       b.style.cssText = "font-size:12px;padding:3px 10px;";
-      if (k === "M") b.style.outline = "2px solid #3370ff";
+      if (k === selPlan) b.style.outline = "2px solid #3370ff";
       b.addEventListener("click", () => {
         selPlan = k;
         for (const c of payPlanRow.children) c.style.outline = "";

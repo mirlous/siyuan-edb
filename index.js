@@ -8358,7 +8358,19 @@ var EdbPlugin = class extends Plugin {
             inner.appendChild(document.createElement("br"));
             inner.appendChild(btn);
           } else {
-            inner.textContent = "\u{1F512} " + this.t("maskLocked");
+            /* v1.8.3 兜底：整库锁定遮罩也提供【点击解锁】按钮，
+               避免"文档树已隐藏 + 编辑区被盖"导致用户找不到任何入口。 */
+            const t1 = document.createElement("div");
+            t1.textContent = "\u{1F512} " + this.t("maskLocked");
+            t1.style.cssText = "white-space:pre-wrap;";
+            const ub = document.createElement("button");
+            ub.textContent = "\u{1F513} " + (this.t("unlock") || "\u7ACB\u5373\u89E3\u9501");
+            ub.style.cssText = "margin-top:12px;padding:8px 22px;background:#3370ff;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:15px;";
+            ub.addEventListener("click", () => {
+              this.ensureUnlocked().catch((e) => console.error("[siyuan-edb]", e));
+            });
+            inner.appendChild(t1);
+            inner.appendChild(ub);
           }
           mask.appendChild(inner);
         }
@@ -10955,6 +10967,7 @@ var EdbPlugin = class extends Plugin {
         if (v && i !== activeV)
           (v.watchlist || []).forEach((d) => others.add(d));
       });
+      /* ① 已渲染正文的文档（当前激活页签） */
       document.querySelectorAll(".protyle[data-node-id]").forEach((el) => {
         const id = el.getAttribute("data-node-id");
         if (!id)
@@ -10962,6 +10975,34 @@ var EdbPlugin = class extends Plugin {
         if ((wl.has(id) && !excl.has(id)) || others.has(id))
           ids.push(id);
       });
+      /* ② v1.8.3 未激活页签里的密库文档：用"标题 → 文档 id"反查补全，
+             否则只能关掉当前激活的那个，其它页签残留。 */
+      try {
+        const byTitle = new Map();
+        for (const id of wl.concat([...others])) {
+          try {
+            const d = this.state && this.state.db ? core.getDoc(this.state.db, id) : null;
+            if (d && d.title) {
+              const tt = String(d.title).trim();
+              if (tt && !byTitle.has(tt))
+                byTitle.set(tt, id);
+            }
+          } catch (e) {
+          }
+        }
+        if (byTitle.size) {
+          document.querySelectorAll('[data-type="tab-header"]').forEach((tab) => {
+            const el = tab.querySelector(".item__text");
+            const txt = el ? String(el.textContent || "").trim() : "";
+            if (!txt)
+              return;
+            const id = byTitle.get(txt);
+            if (id && !ids.includes(id))
+              ids.push(id);
+          });
+        }
+      } catch (e) {
+      }
       if (!ids.length)
         return 0;
       return this.closeDocTabsByIds(ids);
@@ -10988,30 +11029,94 @@ var EdbPlugin = class extends Plugin {
       return false;
     }
   }
-  /** v1.8.0 U5 关闭指定文档的标签页（通过思源 fileTree 的 DOM 关闭按钮点击，最稳） */
+  /** v1.8.3 关闭指定"文档 id"的页签。
+   *  思源页签结构（源码实测）：<li data-type="tab-header" data-id="<页签id>" class="item">，
+   *  其 data-id 是【页签 id】而非文档 id，因此必须反查模型；关不掉的主因就在这。
+   *  匹配优先级：①页签模型里的文档 id ②页签标题与密库文档标题一致 ③data-node-id（兼容旧版）。 */
   closeDocTabsByIds(ids) {
     try {
-      if (!ids || !ids.length)
+      const want = new Set((ids || []).map(String).filter(Boolean));
+      if (!want.size)
         return 0;
-      const want = new Set(ids);
+      /* v1.8.3 收集密库文档标题；同名标题会误关别人的文档，因此只保留"唯一标题" */
+      const titleCount = new Map();
+      for (const id of want) {
+        try {
+          const d = this.state && this.state.db ? core.getDoc(this.state.db, id) : null;
+          if (d && d.title) {
+            const tt = String(d.title).trim();
+            if (tt)
+              titleCount.set(tt, (titleCount.get(tt) || 0) + 1);
+          }
+        } catch (e) {
+        }
+      }
+      const wantTitles = new Set();
+      for (const [tt, c] of titleCount) {
+        if (c === 1)
+          wantTitles.add(tt);
+      }
+      /* 所有页签：思源权威标识 data-type="tab-header" */
+      let tabs = Array.from(document.querySelectorAll('[data-type="tab-header"]'));
+      /* 兜底：兼容没有 data-type 的旧结构 */
+      if (!tabs.length)
+        tabs = Array.from(document.querySelectorAll(".layout-tab-bar .item"));
       let closed = 0;
-      /* 标签栏：.layout-tab-bar .item[data-id] 或 [data-node-id] */
-      const tabs = document.querySelectorAll(".layout-tab-bar .item, .layout-tab-bar .item--focus");
       for (const tab of tabs) {
-        const id = tab.getAttribute("data-id") || tab.getAttribute("data-node-id");
-        if (!id || !want.has(id))
-          continue;
-        const closeBtn = tab.querySelector(".item__close");
-        if (closeBtn) {
+        let isTarget = false;
+        /* ① 页签自身带文档 id（部分版本） */
+        const nid = tab.getAttribute("data-node-id");
+        if (nid && want.has(nid))
+          isTarget = true;
+        /* ② 精确法：页签所在 Wnd 内同容器的 .protyle 的文档 id。
+              结构：.layout__wnd > .layout-tab-bar(含页签) + .layout-tab-container > .protyle[data-node-id]
+              只有"当前激活"的页签对应容器里才有 protyle，因此还需按页签标题对准激活项。 */
+        if (!isTarget) {
           try {
-            closeBtn.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
-            closed++;
+            const wnd = tab.closest(".layout__wnd");
+            if (wnd) {
+              /* 该 Wnd 内所有已渲染的正文文档 id */
+              const prot = wnd.querySelectorAll(".protyle[data-node-id]");
+              const tabTextEl = tab.querySelector(".item__text");
+              const tabTxt = tabTextEl ? String(tabTextEl.textContent || "").trim() : "";
+              const isFocus = tab.classList && tab.classList.contains("item--focus");
+              for (const p of prot) {
+                const pid = p.getAttribute("data-node-id");
+                if (!pid || !want.has(pid))
+                  continue;
+                /* 激活页签：容器里的 protyle 就是它的 → 直接判定 */
+                if (isFocus) {
+                  isTarget = true;
+                  break;
+                }
+                /* 非激活页签：只有"标题唯一且与 protyle 所属文档标题无关歧义"时才关，
+                   这里保守起见交给标题兜底逻辑处理 */
+              }
+            }
           } catch (e) {
           }
+        }
+        /* ③ 标题兜底（仅当该标题在密库文档中唯一，避免误关同名文档） */
+        if (!isTarget && wantTitles.size) {
+          const el = tab.querySelector(".item__text");
+          const txt = el ? String(el.textContent || "").trim() : "";
+          if (txt && wantTitles.has(txt))
+            isTarget = true;
+        }
+        if (!isTarget)
+          continue;
+        const closeBtn = tab.querySelector(".item__close");
+        if (!closeBtn)
+          continue;
+        try {
+          closeBtn.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
+          closed++;
+        } catch (e) {
         }
       }
       return closed;
     } catch (e) {
+      console.error("[siyuan-edb] closeDocTabsByIds", e);
       return 0;
     }
   }
@@ -11045,6 +11150,36 @@ var EdbPlugin = class extends Plugin {
       this.rebuildHideCss();
       this.applyNotebookVisibility();
       this.applyDocMask();
+    } catch (e) {
+    }
+    /* v1.8.3 fail-safe：关页签是异步 DOM 操作，且不同思源版本结构可能不同。
+       若 1.5 秒后仍有"密库已锁定"遮罩残留（说明页签没关掉），
+       则主动清理遮罩并把编辑区切到空白，避免用户卡在"看不到也没入口"的状态。 */
+    try {
+      setTimeout(() => {
+        try {
+          if (this.isUnlocked())
+            return;
+          const mask = document.getElementById("edb-unlock-mask");
+          if (!mask)
+            return;
+          /* 仍有遮罩：再尝试关一次页签，然后移除遮罩 */
+          const again = this.closeVaultDocTabs();
+          if (again > 0) {
+            setTimeout(() => {
+              try {
+                this.applyDocMask();
+              } catch (e) {
+              }
+            }, 300);
+          } else {
+            /* 页签实在关不掉（结构不匹配）：不移除遮罩会更糟，改为移除并提示 */
+            mask.remove();
+            showMessage("\u{1F512} " + (this.t("maskLocked") || "\u5BC6\u5E93\u5DF2\u9501\u5B9A").split("\n")[0] + "\uFF08\u8BF7\u5148\u89E3\u9501\u540E\u518D\u67E5\u770B\u6587\u6863\uFF09");
+          }
+        } catch (e) {
+        }
+      }, 1500);
     } catch (e) {
     }
   }
@@ -12177,7 +12312,7 @@ var EdbPlugin = class extends Plugin {
   /** 当前插件版本（与 plugin.json 同步，发布时手工更新） */
   curVersion() {
     /* v1.6.63 必须与 plugin.json 的 version 保持一致（每次发版两处同步改） */
-    return "1.8.2";
+    return "1.8.3";
   }
   versionAtLeast(latest, cur) {
     const p = (s) => String(s || "").split(".").map((x) => parseInt(x, 10) || 0);

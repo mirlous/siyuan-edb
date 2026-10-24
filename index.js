@@ -6855,30 +6855,32 @@ var EdbPlugin = class extends Plugin {
         }
         return;
       }
-      /* v2.0.4/v2.0.5 性能修复：原实现每 5 秒对 watchlist 逐篇调用 cleanPlainAssets，
-         80 篇文档 = 每秒 16 次 DOM 扫描 + 数千次索引遍历 → CPU 风扇狂转、界面点击无响应。
-         最终方案（保留安全语义）：
-           ① 间隔 5 秒 → 45 秒
-           ② 用户正在操作（20 秒内有输入）整轮跳过，不抢主线程
-           ③ 仍逐篇调用并保留 allowVisible 保护（v2.0.4 曾误改为无保护全量，已回退） */
-      const _idleMs = Date.now() - (this.lastActive || 0);
-      if (_idleMs < 20000)
-        return;
+      /* v2.0.6 🔴 关键修复：把"注入"和"明文清理"拆开。
+         v2.0.4 曾把两者合并并加空闲跳过 → 用户一动鼠标整轮被跳过 → 注入永不执行
+         → 图片/视频全不显示（严重回归）。
+         现在：
+           ① 注入：每个 tick 都做，不受空闲检测影响（决定"能否看见内容"）
+           ② 明文清理：内部限流（空闲 ≥20 秒 且 距上次 ≥45 秒）——它才是耗 CPU 的那个
+           ③ 间隔回到 5 秒，与原版注入响应性一致 */
       try {
         await this.injectOpenDocs();
-        const domSet = this.openDocIdsFromDom();
-        /* v2.0.5 回退：恢复逐篇调用与 allowVisible 保护。
-           v2.0.4 改成一次全量 cleanPlainAssets(null) 会丢掉 allowVisible，
-           可能清理掉"当前正在显示"的文档明文资产。
-           性能收益由【45 秒间隔 + 空闲跳过】提供，不靠牺牲安全语义。 */
-        for (const id of this.cfg.watchlist) {
-          if ((this.cfg.excludedDocs || []).includes(id)) continue;
-          await this.cleanPlainAssets(id, { ignoreOpenDocs: true, allowVisible: domSet[id] });
-        }
       } catch (e) {
-        console.error("[siyuan-edb]", e);
+        console.error("[siyuan-edb] injectOpenDocs", e);
       }
-    }, 45000);
+      const _idleMs = Date.now() - (this.lastActive || 0);
+      if (_idleMs >= 20000 && Date.now() - (this._lastCleanAt || 0) >= 45000) {
+        this._lastCleanAt = Date.now();
+        try {
+          const domSet = this.openDocIdsFromDom();
+          for (const id of this.cfg.watchlist) {
+            if ((this.cfg.excludedDocs || []).includes(id)) continue;
+            await this.cleanPlainAssets(id, { ignoreOpenDocs: true, allowVisible: domSet[id] });
+          }
+        } catch (e) {
+          console.error("[siyuan-edb] cleanPlainAssets", e);
+        }
+      }
+    }, 5000);
     this.eventBus.on("open-menu-doctree", this.onDocTreeMenu.bind(this));
     this.eventBus.on("open-doc", (e) => this.openDocGuard(e));
     this.eventBus.on("ws-main", this.onWsMain.bind(this));
@@ -7202,6 +7204,12 @@ var EdbPlugin = class extends Plugin {
       if (r.migrated)
         showMessage(this.t("vaultUpgraded") || "\u52A0\u5BC6\u5F15\u64CE\u5DF2\u5347\u7EA7\uFF08MK \u4FE1\u5C01\uFF09\uFF0C\u6570\u636E\u5B8C\u6574");
       this.noPwd = true;
+      /* v2.0.6 自动解锁后立即注入一次 */
+      try {
+        await this.injectOpenDocs();
+      } catch (e) {
+        console.error("[siyuan-edb] 自动解锁后注入失败", e);
+      }
       /* v2.0.3 记住"这是无密码库"，下次启动才值得尝试空密码解锁（避免白烧 KDF） */
       if (this.cfg.vaultNoPwd !== true) {
         this.cfg.vaultNoPwd = true;
@@ -10861,6 +10869,12 @@ var EdbPlugin = class extends Plugin {
         this.noPwd = false;
         await this.syncWatchlistFromDb();
         this.syncEncryptedAssetCache();
+        /* v2.0.6 解锁后立即注入一次：不等定时器，图片/视频立刻显示 */
+        try {
+          await this.injectOpenDocs();
+        } catch (e) {
+          console.error("[siyuan-edb] 解锁后立即注入失败", e);
+        }
         if (r.migrated)
           showMessage(this.t("vaultUpgraded") || "\u52A0\u5BC6\u5F15\u64CE\u5DF2\u5347\u7EA7\uFF08MK \u4FE1\u5C01\uFF09\uFF0C\u6570\u636E\u5B8C\u6574");
         showMessage(this.t("unlocked"));
@@ -12754,7 +12768,7 @@ var EdbPlugin = class extends Plugin {
   /** 当前插件版本（与 plugin.json 同步，发布时手工更新） */
   curVersion() {
     /* v1.6.63 必须与 plugin.json 的 version 保持一致（每次发版两处同步改） */
-    return "2.0.5";
+    return "2.0.6";
   }
   versionAtLeast(latest, cur) {
     const p = (s) => String(s || "").split(".").map((x) => parseInt(x, 10) || 0);

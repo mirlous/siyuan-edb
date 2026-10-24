@@ -9161,7 +9161,14 @@ var EdbPlugin = class extends Plugin {
     this.setBusy("\u6B63\u5728\u521B\u5EFA\u72EC\u7ACB\u5BC6\u5E93\u2026");
     let dstState = null;
     try {
-      dstState = await core.createVault(newPath, String(p1), this.wasmPath(), WASM_B64, "");
+      /* v1.9.3 独立密库同样自动生成恢复密钥并落盘 */
+      let _recW = null;
+      try {
+        _recW = core.genRecoveryWords();
+      } catch (e) {
+        _recW = null;
+      }
+      dstState = await core.createVault(newPath, String(p1), this.wasmPath(), WASM_B64, "", _recW, true);
       const srcState = this.state;
       const srcPath = this.cfg.dbPath;
       const docIds = await this.collectNotebookDocIds(boxIds);
@@ -9211,6 +9218,15 @@ var EdbPlugin = class extends Plugin {
       this.state = dstState;
       this.noPwd = false;
       await this.saveConfig();
+      /* v1.9.3 独立密库落盘恢复密钥文件 */
+      if (_recW) {
+        try {
+          await this.saveRecoveryWords(_recW, newPath);
+          setTimeout(() => this.promptSaveRecoveryElsewhere(_recW), 600);
+        } catch (e) {
+          console.error("[siyuan-edb] 独立库恢复密钥写盘失败", e);
+        }
+      }
       this.refreshPanel();
       this.applyNotebookVisibility();
       this.applyDocMask();
@@ -11164,13 +11180,15 @@ var EdbPlugin = class extends Plugin {
   }
   /** v1.7.3 恢复密钥落盘：统一文件名「🔑 恢复密钥.txt」（库目录内），用户可另行备份。
    *  旧版曾写成「<库名>-恢复密钥.txt」，更早还会出现「新建 文本文档.txt」（记事本默认名）——统一后不再有第二份明文副本。 */
-  async saveRecoveryWords(words) {
+  async saveRecoveryWords(words, dbPathOverride) {
     try {
-      const dir = path.dirname(this.cfg.dbPath);
-      const name = path.basename(this.cfg.dbPath).replace(/\.sydb$/i, "") || "\u5BC6\u5E93";
+      /* v1.9.3 支持指定库路径：新建/封存库时 this.cfg.dbPath 可能还是旧库 */
+      const _dbp = dbPathOverride || this.cfg.dbPath;
+      const dir = path.dirname(_dbp);
+      const name = path.basename(_dbp).replace(/\.sydb$/i, "") || "\u5BC6\u5E93";
       /* v1.9.1 文件名带库名前缀，避免多库互相覆盖（此前固定名会让第二个库覆盖第一个库的密钥） */
       const p = path.join(dir, name + "+\u{1F511} \u6062\u590D\u5BC6\u94A5.txt");
-      const content = "\u3010\u5BC6\u5E93\u6062\u590D\u5BC6\u94A5\u3011\u8BF7\u59A5\u5584\u4FDD\u7BA1\uFF08\u4E0D\u8981\u5B58\u5728\u7535\u8111\u4E0A\u6216\u53EF\u622A\u56FE\u53D1\u7ED9\u4ED6\u4EBA\uFF09\n\n\u5BC6\u5E93\uFF1A" + name + "\n\u5BC6\u5E93\u6587\u4EF6\uFF1A" + this.cfg.dbPath + "\n\u751F\u6210\u65F6\u95F4\uFF1A" + (/* @__PURE__ */ new Date()).toLocaleString() + "\n\n\u6062\u590D\u5BC6\u94A5\uFF1A" + words + "\n\n\u7528\u9014\uFF1A\u5FD8\u8BB0\u5BC6\u7801\u65F6\uFF0C\u5728\u89E3\u9501\u5F39\u7A97\u9009\u300C\u4F7F\u7528\u6062\u590D\u5BC6\u94A5\u300D\uFF0C\u8F93\u5165\u8FD9 12 \u4E2A\u8BCD\u5373\u53EF\u89E3\u9501\u5E76\u91CD\u8BBE\u65B0\u5BC6\u7801\u3002\n";
+      const content = "\u3010\u5BC6\u5E93\u6062\u590D\u5BC6\u94A5\u3011\u8BF7\u59A5\u5584\u4FDD\u7BA1\uFF08\u4E0D\u8981\u5B58\u5728\u7535\u8111\u4E0A\u6216\u53EF\u622A\u56FE\u53D1\u7ED9\u4ED6\u4EBA\uFF09\n\n\u5BC6\u5E93\uFF1A" + name + "\n\u5BC6\u5E93\u6587\u4EF6\uFF1A" + _dbp + "\n\u751F\u6210\u65F6\u95F4\uFF1A" + (/* @__PURE__ */ new Date()).toLocaleString() + "\n\n\u6062\u590D\u5BC6\u94A5\uFF1A" + words + "\n\n\u7528\u9014\uFF1A\u5FD8\u8BB0\u5BC6\u7801\u65F6\uFF0C\u5728\u89E3\u9501\u5F39\u7A97\u9009\u300C\u4F7F\u7528\u6062\u590D\u5BC6\u94A5\u300D\uFF0C\u8F93\u5165\u8FD9 12 \u4E2A\u8BCD\u5373\u53EF\u89E3\u9501\u5E76\u91CD\u8BBE\u65B0\u5BC6\u7801\u3002\n";
       fs.writeFileSync(p, content, "utf8");
       /* 清理历史遗留的同内容副本（避免恢复密钥散落多份明文） */
       try {
@@ -12645,7 +12663,7 @@ var EdbPlugin = class extends Plugin {
   /** 当前插件版本（与 plugin.json 同步，发布时手工更新） */
   curVersion() {
     /* v1.6.63 必须与 plugin.json 的 version 保持一致（每次发版两处同步改） */
-    return "1.9.2";
+    return "1.9.3";
   }
   versionAtLeast(latest, cur) {
     const p = (s) => String(s || "").split(".").map((x) => parseInt(x, 10) || 0);
@@ -15509,13 +15527,31 @@ var EdbPlugin = class extends Plugin {
       throw new Error("\u8DEF\u5F84\u4E0D\u80FD\u4E3A\u7A7A");
     const pwd = this.isUnlocked() && this.state ? this.state.password || "" : "";
     const hint = this.state && this.state.hint ? this.state.hint : "";
-    const st = await core.createVault(newPath, pwd, this.wasmPath(), WASM_B64, hint);
+    /* v1.9.3 新库默认生成恢复密钥（必须参与 createVault 派生 MK，事后补无效） */
+    let recWords = null;
+    try {
+      if (pwd)
+        recWords = core.genRecoveryWords();
+    } catch (e) {
+      recWords = null;
+    }
+    const st = await core.createVault(newPath, pwd, this.wasmPath(), WASM_B64, hint, recWords, true);
     this.cfg.vaults.push({ name: name || "\u65B0\u5E93", path: newPath, watchlist: [] });
     this.cfg.activeVault = this.cfg.vaults.length - 1;
     this.applyActiveAliases();
     this.state = st;
     this.noPwd = !pwd;
     await this.saveConfig();
+    /* v1.9.3 落盘恢复密钥文件（文件名带库名前缀），并提示另存 */
+    if (recWords) {
+      try {
+        this.cfg.dbPath = newPath;
+        await this.saveRecoveryWords(recWords, newPath);
+        setTimeout(() => this.promptSaveRecoveryElsewhere(recWords), 600);
+      } catch (e) {
+        console.error("[siyuan-edb] \u65B0\u5EFA\u5E93\u6062\u590D\u5BC6\u94A5\u5199\u76D8\u5931\u8D25", e);
+      }
+    }
     try {
       this.refreshPanel();
     } catch (e) {
@@ -15605,7 +15641,20 @@ var EdbPlugin = class extends Plugin {
         throw new Error(this.t("vaultDiffPwd"));
       }
     } else {
-      dstState = await core.createVault(tv.path, srcState.password || "", this.wasmPath(), WASM_B64, srcState.hint || "");
+      /* v1.9.3 目标库不存在时新建：同样生成并落盘恢复密钥 */
+      let _mvRecW = null;
+      try {
+        _mvRecW = core.genRecoveryWords();
+      } catch (e) {
+        _mvRecW = null;
+      }
+      dstState = await core.createVault(tv.path, srcState.password || "", this.wasmPath(), WASM_B64, srcState.hint || "", _mvRecW, true);
+      if (_mvRecW) {
+        try {
+          await this.saveRecoveryWords(_mvRecW, tv.path);
+        } catch (e) {
+        }
+      }
     }
     const assets = core.getAssetsByDoc(srcState.db, docId);
     for (const a of assets) {

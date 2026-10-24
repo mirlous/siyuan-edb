@@ -1,5 +1,34 @@
 # Changelog
 
+## v1.8.1 (2026-10-24) — 🔴 紧急修复：无法拖动思源窗口
+
+### 症状
+思源**顶栏按住拖动不了窗口**（点击无反应，窗口无法移动）。
+
+### 根因
+`hideLostAssets()`（隐藏「丢失的资源文件」里密库资产条目）使用了**过宽的祖先匹配正则**：
+
+```js
+/b3-list-item|list__item|__item|b3-list|asset|file/.test(className)
+```
+
+其中 `__item` 会命中 **`toolbar__item`（顶栏图标）**、`protyle-breadcrumb__item`（面包屑）；
+`file` 会命中 **`sy__file`（整个文档树容器）**。
+
+一旦某条"已加密资产名"的文本（例如资源列表里的文件名）出现，它就在**整条祖先链**上找匹配，
+若命中顶栏元素 → `display:none` → 思源重算 `--b3-toolbar-drag-left/right`（拖动区宽度）
+→ **拖动区变 0 宽 → 窗口拖不动**。
+（你的配置 `hideToolbar: true`，拖动完全依赖 `#drag` 的 `::before/::after` 伪元素，因此必现。）
+
+### 修复
+1. **正则收窄**：只匹配真正的资源列表项（`b3-list-item` / `asset`），不再用 `__item|file|b3-list`。
+2. **新增保护名单** `PROTECTED`：类名**包含**以下关键字一律跳过，绝不设置 `display:none`
+   —— `toolbar / layout / tab-bar / __item / drag / dock / protyle / breadcrumb / b3-menu / b3-dialog / status / sy__file / sy__outline / sy__`
+3. **显式排除** `#drag` 元素与 `id="toolbar"`。
+4. 兜底分支也加同样的保护判断（此前兜底可无条件 `display:none`）。
+
+> 验证：16 项拖动保护专项 + 17 项保留功能检查全部通过；确认 `b3-list-item` 仍可被隐藏（功能未退化）。
+
 ## v1.8.0 (2026-10-24) — 体验升级（U4 + U5 + U6）
 
 ### 🔒 U4 一键锁定（离开座位前 1 秒锁库）

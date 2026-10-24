@@ -8796,11 +8796,22 @@ var EdbPlugin = class extends Plugin {
         const t = (walker.currentNode.textContent || "").trim();
         if (!t || !basenames.has(t))
           continue;
+        /* v1.8.1 修复：祖先匹配正则过宽（`__item` 命中 toolbar__item、`file` 命中 sy__file），
+           会把顶栏/文档树容器整块隐藏 → 思源重算拖动区宽度变 0 → 窗口拖不动。
+           现在只允许隐藏"资源列表项"这一种叶子元素，并显式跳过关键容器。 */
+        /* v1.8.1 保护名单：类名"包含"即跳过（思源用 BEM 双下划线，不能用 \s 边界判断）。
+           含 toolbar/layout/tab-bar/drag/dock/protyle/breadcrumb/menu/dialog/sy__file/sy__outline 全部保护，
+           确保顶栏布局不被改动 → 窗口拖动区宽度不被重置。 */
+        const PROTECTED = /toolbar|layout|tab-bar|__item|drag|dock|protyle|breadcrumb|b3-menu|b3-dialog|status|sy__file|sy__outline|sy__/;
         let el = walker.currentNode.parentElement;
         let done = false;
         while (el && el !== document.body) {
           const cls = el.className && el.className.toString ? el.className.toString() : "";
-          if (/b3-list-item|list__item|__item|b3-list|asset|file/.test(cls) || el.tagName === "LI") {
+          /* 关键容器一律跳过（保护顶栏 → 保证窗口可拖动） */
+          if (PROTECTED.test(cls) || el.id === "drag" || el.id === "toolbar")
+            break;
+          /* 只隐藏资源列表项本体（b3-list-item / asset 列表项） */
+          if (/b3-list-item|asset/.test(cls) && !/b3-list-item--focus/.test(cls)) {
             el.style.display = "none";
             hit++;
             done = true;
@@ -8808,8 +8819,15 @@ var EdbPlugin = class extends Plugin {
           }
           el = el.parentElement;
         }
-        if (!done && walker.currentNode.parentElement)
-          walker.currentNode.parentElement.style.display = "none";
+        /* v1.8.1 兜底也加保护：绝不对顶栏/标签栏/容器设置 display:none */
+        if (!done && walker.currentNode.parentElement) {
+          const pe = walker.currentNode.parentElement;
+          const pcls = pe.className && pe.className.toString ? pe.className.toString() : "";
+          if (!PROTECTED.test(pcls) && pe.id !== "drag") {
+            pe.style.display = "none";
+            hit++;
+          }
+        }
       }
       if (hit > 0)
         console.log("[siyuan-edb] \u667A\u80FD\u9690\u85CF\u5BC6\u5E93\u8D44\u4EA7\u6761\u76EE " + hit + " \u6761");
@@ -12149,7 +12167,7 @@ var EdbPlugin = class extends Plugin {
   /** 当前插件版本（与 plugin.json 同步，发布时手工更新） */
   curVersion() {
     /* v1.6.63 必须与 plugin.json 的 version 保持一致（每次发版两处同步改） */
-    return "1.8.0";
+    return "1.8.1";
   }
   versionAtLeast(latest, cur) {
     const p = (s) => String(s || "").split(".").map((x) => parseInt(x, 10) || 0);

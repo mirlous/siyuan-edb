@@ -12676,7 +12676,7 @@ var EdbPlugin = class extends Plugin {
   /** 当前插件版本（与 plugin.json 同步，发布时手工更新） */
   curVersion() {
     /* v1.6.63 必须与 plugin.json 的 version 保持一致（每次发版两处同步改） */
-    return "2.0.0";
+    return "2.0.1";
   }
   versionAtLeast(latest, cur) {
     const p = (s) => String(s || "").split(".").map((x) => parseInt(x, 10) || 0);
@@ -16078,7 +16078,7 @@ var EdbPlugin = class extends Plugin {
   }
   /** 免费版文档额度 */
   freeDocLimit() {
-    return 50;
+    return 10;
   }
   /** 免费版密库数量额度 */
   freeVaultLimit() {

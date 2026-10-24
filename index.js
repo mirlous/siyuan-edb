@@ -6801,6 +6801,10 @@ var EdbPlugin = class extends Plugin {
     }
     setTimeout(() => {
       this.tryAutoUnlock().catch((e) => console.error("[siyuan-edb]", e));
+      /* v1.9.1 一次性迁移旧的无前缀恢复密钥文件（改名，不改内容） */
+      setTimeout(() => {
+        this.migrateRecoveryKeyFile();
+      }, 1500);
     }, 800);
     /* v1.9.0 U7 首次使用向导（延迟 2.5s，等思源 UI 完全就绪；已用过的用户不会弹） */
     setTimeout(() => {
@@ -8694,14 +8698,23 @@ var EdbPlugin = class extends Plugin {
          严格限定：①只用文件树/大纲容器 ②排除 .protyle ③用 ::after 伪元素 + content，
          不改布局、不插元素、不影响点击。锁定时该规则不生成（树上本来就隐藏了）。 */
       if (activeUnlocked && curDocs.length) {
+        /* v1.9.1 修正：不再强依赖 .sy__file 容器（不同布局/虚拟滚动下可能失配）。
+           改为三种安全写法并列，任一命中即可显示小锁：
+             ① 文档树项直接挂标记（项元素带 data-node-id 且是 .b3-list-item）
+             ② 项内标题元素后追加（item 内含 .b3-list-item__text 的常见结构）
+             ③ 大纲项同理
+           全部带 :not(.protyle) / .b3-list-item 限定，绝不裸用 [data-node-id]。 */
         const markSel = (ids) => ids.filter(Boolean).map((x) => {
           const id = String(x).replace(/"/g, "");
-          return ".sy__file [data-node-id=\"" + id + "\"]:not(.protyle) .b3-list-item__text::after," +
-            ".sy__outline [data-node-id=\"" + id + "\"]:not(.protyle) .b3-list-item__text::after";
+          return [
+            ".b3-list-item[data-node-id=\"" + id + "\"]::after",
+            "[data-node-id=\"" + id + "\"]:not(.protyle):not(.protyle-wysiwyg) .b3-list-item__text::after",
+            ".sy__file [data-node-id=\"" + id + "\"]:not(.protyle) .b3-list-item__text::after",
+            ".sy__outline [data-node-id=\"" + id + "\"]:not(.protyle) .b3-list-item__text::after",
+          ].join(",");
         }).join(",");
-        const ms = markSel(curDocs);
-        if (ms)
-          css += ms + "{content:\" \u{1F512}\";font-size:11px;opacity:.55;margin-left:4px;}\n";
+        if (markSel(curDocs))
+          css += markSel(curDocs) + "{content:\" \u{1F512}\";font-size:11px;opacity:.6;margin-left:4px;}\n";
       }
       /* 隐藏被锁文档/笔记本里的正文元素（防"点进去看到内容"）——由 JS 遮罩兜底，这里只管树 */
       if (st.textContent !== css)
@@ -11076,18 +11089,53 @@ var EdbPlugin = class extends Plugin {
       console.error("[siyuan-edb] promptSaveRecoveryElsewhere", e);
     }
   }
+  /** v1.9.1 一次性迁移：把旧的无库名前缀密钥文件改名，防止多库覆盖/找不到。
+   *  只在文件存在且新名字不存在时改名；失败静默（不影响使用）。 */
+  migrateRecoveryKeyFile() {
+    try {
+      const dbPath = this.cfg && this.cfg.dbPath;
+      if (!dbPath)
+        return;
+      const dir = path.dirname(dbPath);
+      const name = path.basename(dbPath).replace(/\.sydb$/i, "") || "\u5BC6\u5E93";
+      const oldP = path.join(dir, "\u{1F511} \u6062\u590D\u5BC6\u94A5.txt");
+      const newP = path.join(dir, name + "+\u{1F511} \u6062\u590D\u5BC6\u94A5.txt");
+      if (!fs.existsSync(oldP))
+        return;
+      if (fs.existsSync(newP))
+        return;
+      try {
+        fs.renameSync(oldP, newP);
+        console.log("[siyuan-edb] \u6062\u590D\u5BC6\u94A5\u6587\u4EF6\u5DF2\u8FC1\u79FB:", path.basename(newP));
+      } catch (e) {
+      }
+    } catch (e) {
+    }
+  }
   /** v1.7.3 恢复密钥落盘：统一文件名「🔑 恢复密钥.txt」（库目录内），用户可另行备份。
    *  旧版曾写成「<库名>-恢复密钥.txt」，更早还会出现「新建 文本文档.txt」（记事本默认名）——统一后不再有第二份明文副本。 */
   async saveRecoveryWords(words) {
     try {
       const dir = path.dirname(this.cfg.dbPath);
       const name = path.basename(this.cfg.dbPath).replace(/\.sydb$/i, "") || "\u5BC6\u5E93";
-      const p = path.join(dir, "\u{1F511} \u6062\u590D\u5BC6\u94A5.txt");
+      /* v1.9.1 文件名带库名前缀，避免多库互相覆盖（此前固定名会让第二个库覆盖第一个库的密钥） */
+      const p = path.join(dir, name + "+\u{1F511} \u6062\u590D\u5BC6\u94A5.txt");
       const content = "\u3010\u5BC6\u5E93\u6062\u590D\u5BC6\u94A5\u3011\u8BF7\u59A5\u5584\u4FDD\u7BA1\uFF08\u4E0D\u8981\u5B58\u5728\u7535\u8111\u4E0A\u6216\u53EF\u622A\u56FE\u53D1\u7ED9\u4ED6\u4EBA\uFF09\n\n\u5BC6\u5E93\uFF1A" + name + "\n\u5BC6\u5E93\u6587\u4EF6\uFF1A" + this.cfg.dbPath + "\n\u751F\u6210\u65F6\u95F4\uFF1A" + (/* @__PURE__ */ new Date()).toLocaleString() + "\n\n\u6062\u590D\u5BC6\u94A5\uFF1A" + words + "\n\n\u7528\u9014\uFF1A\u5FD8\u8BB0\u5BC6\u7801\u65F6\uFF0C\u5728\u89E3\u9501\u5F39\u7A97\u9009\u300C\u4F7F\u7528\u6062\u590D\u5BC6\u94A5\u300D\uFF0C\u8F93\u5165\u8FD9 12 \u4E2A\u8BCD\u5373\u53EF\u89E3\u9501\u5E76\u91CD\u8BBE\u65B0\u5BC6\u7801\u3002\n";
       fs.writeFileSync(p, content, "utf8");
       /* 清理历史遗留的同内容副本（避免恢复密钥散落多份明文） */
       try {
+        /* v1.9.1 同时清理历史命名：记事本默认名、<库名>-恢复密钥.txt、以及旧的「🔑 恢复密钥.txt」
+           （旧无前缀名只在"该目录下没有其它库的密钥文件"时才清理，避免误删别的库） */
         const legacy = ["\u65B0\u5EFA \u6587\u672C\u6587\u6863.txt", name + "-\u6062\u590D\u5BC6\u94A5.txt"];
+        try {
+          const noPrefix = path.join(dir, "\u{1F511} \u6062\u590D\u5BC6\u94A5.txt");
+          if (fs.existsSync(noPrefix)) {
+            const others = fs.readdirSync(dir).filter((f) => f.endsWith("+\u{1F511} \u6062\u590D\u5BC6\u94A5.txt") && !f.startsWith(name + "+"));
+            if (!others.length)
+              legacy.push("\u{1F511} \u6062\u590D\u5BC6\u94A5.txt");
+          }
+        } catch (e) {
+        }
         for (const lf of legacy) {
           const lp = path.join(dir, lf);
           if (lp === p)
@@ -12547,7 +12595,7 @@ var EdbPlugin = class extends Plugin {
   /** 当前插件版本（与 plugin.json 同步，发布时手工更新） */
   curVersion() {
     /* v1.6.63 必须与 plugin.json 的 version 保持一致（每次发版两处同步改） */
-    return "1.9.0";
+    return "1.9.1";
   }
   versionAtLeast(latest, cur) {
     const p = (s) => String(s || "").split(".").map((x) => parseInt(x, 10) || 0);

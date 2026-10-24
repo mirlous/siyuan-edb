@@ -1,5 +1,29 @@
 # Changelog
 
+## v1.9.1 (2026-10-24) — 修复 U9 小锁不显示 + 🔴 多库恢复密钥互相覆盖
+
+### 🔒 修复：文档树"已入库"小锁不显示
+v1.9.0 的选择器假设了 `.sy__file [data-node-id="X"] .b3-list-item__text::after` 这一条链路，
+实际思源的文档树项 DOM 层级不一定如此（虚拟滚动/不同布局下会失配），导致小锁一个都没显示。
+
+**修正为四种安全写法并列**（任一命中即可）：
+```css
+.b3-list-item[data-node-id="X"]::after                                        /* 直接挂在项上 */
+[data-node-id="X"]:not(.protyle):not(.protyle-wysiwyg) .b3-list-item__text::after  /* 项内标题后 */
+.sy__file [data-node-id="X"]:not(.protyle) .b3-list-item__text::after         /* 文件树容器内 */
+.sy__outline [data-node-id="X"]:not(.protyle) .b3-list-item__text::after      /* 大纲容器内 */
+```
+依然**绝不裸用 `[data-node-id]`**（全部带 `:not(.protyle)` 或 `.b3-list-item` 限定），继续守 v1.7.5 的教训。
+
+### 🔑🔴 修复：新建第二个密库时，恢复密钥文件互相覆盖
+**这是数据安全问题**：此前密钥文件固定叫 `<库目录>/🔑 恢复密钥.txt`，
+新建/切换第二个库时会**覆盖第一个库的密钥文件** → 旧库恢复密钥永久丢失。
+
+**修复**：文件名带上库名前缀 → **`<库名>+🔑 恢复密钥.txt`**
+- 例：`保密文件+🔑 恢复密钥.txt`、`MIKU+🔑 恢复密钥.txt`
+- 顺带做**老用户一次性迁移**：`migrateRecoveryKeyFile()` 在 onload 后把旧的无前缀文件**改名**（不删内容、已有新文件时跳过）
+- 旧的 `<库名>-恢复密钥.txt`、记事本默认名 `新建 文本文档.txt` 继续清理，但**不会误删其它库**（检测目录下是否有其它库的 `+🔑 恢复密钥.txt`）
+
 ## v1.9.0 (2026-10-24) — 低风险体验批次（U7 + U2 + U9 + D1）
 
 四个**纯 UI 增补**改动，不碰加密/同步/授权核心，一次验证一次发布。

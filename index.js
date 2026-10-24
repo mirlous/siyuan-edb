@@ -6802,6 +6802,10 @@ var EdbPlugin = class extends Plugin {
     setTimeout(() => {
       this.tryAutoUnlock().catch((e) => console.error("[siyuan-edb]", e));
     }, 800);
+    /* v1.9.0 U7 首次使用向导（延迟 2.5s，等思源 UI 完全就绪；已用过的用户不会弹） */
+    setTimeout(() => {
+      this.maybeShowGuide();
+    }, 2500);
     /* v1.6.71 历史数据一次性自动补全子文档（锁定时不跑，解锁后会再触发） */
     setTimeout(() => {
       this.autoFixSubDocsOnce().catch(() => {
@@ -8685,6 +8689,19 @@ var EdbPlugin = class extends Plugin {
           css += psel("") + "{position:relative !important;}\n";
           css += psel("::after") + "{content:\"\u{1F512} \u5BC6\u5E93\u5DF2\u9501\u5B9A\uFF0C\u8BF7\u5148\u89E3\u9501\uFF08\u70B9\u9876\u90E8\u5BC6\u5E93\u56FE\u6807\u89E3\u9501\uFF09\";position:absolute;inset:0;display:flex;align-items:center;justify-content:center;background:rgba(40,40,40,.45);color:#fff;font-size:18px;z-index:2147483000;backdrop-filter:blur(2px);pointer-events:none;}\n";
         }
+      }
+      /* v1.9.0 U9 已入库标记：解锁状态下，在文档树里给"已入库文档"标题后加一个小锁。
+         严格限定：①只用文件树/大纲容器 ②排除 .protyle ③用 ::after 伪元素 + content，
+         不改布局、不插元素、不影响点击。锁定时该规则不生成（树上本来就隐藏了）。 */
+      if (activeUnlocked && curDocs.length) {
+        const markSel = (ids) => ids.filter(Boolean).map((x) => {
+          const id = String(x).replace(/"/g, "");
+          return ".sy__file [data-node-id=\"" + id + "\"]:not(.protyle) .b3-list-item__text::after," +
+            ".sy__outline [data-node-id=\"" + id + "\"]:not(.protyle) .b3-list-item__text::after";
+        }).join(",");
+        const ms = markSel(curDocs);
+        if (ms)
+          css += ms + "{content:\" \u{1F512}\";font-size:11px;opacity:.55;margin-left:4px;}\n";
       }
       /* 隐藏被锁文档/笔记本里的正文元素（防"点进去看到内容"）——由 JS 遮罩兜底，这里只管树 */
       if (st.textContent !== css)
@@ -10831,6 +10848,8 @@ var EdbPlugin = class extends Plugin {
           this.saveRecoveryWords(r.recWords).catch(() => {
           });
           showMessage("\u{1F511} " + this.t("recWordsShown") + "\uFF1A" + r.recWords);
+          /* v1.9.0 U2 引导"另存到别处"（丢电脑=密码密钥一起丢） */
+          setTimeout(() => this.promptSaveRecoveryElsewhere(r.recWords), 600);
         }
         this.refreshPanel();
         return true;
@@ -10839,6 +10858,222 @@ var EdbPlugin = class extends Plugin {
         showMessage(this.t("addFail") + "\uFF1A" + (e && e.message));
         return false;
       }
+    }
+  }
+  /** v1.9.0 D1 备份健康检查（只读）：
+   *  背景：曾有"库 6.27GB，但唯一备份只有 0.14MB（空库时留下的）"的情况——
+   *  用户以为有备份，其实等于没有。
+   *  返回 { ok, level, msg }，level: ok | warn | danger；**绝不修改用户备份配置**。 */
+  checkBackupHealth() {
+    try {
+      if (!this.cfg.backupEnabled)
+        return { ok: false, level: "warn", msg: "\u81EA\u52A8\u5907\u4EFD\u5DF2\u5173\u95ED\uFF08\u5EFA\u8BAE\u5F00\u542F\uFF09", lastAt: 0, lastSize: 0, vaultSize: 0 };
+      const dbPath = this.cfg.dbPath;
+      if (!dbPath || !fs.existsSync(dbPath))
+        return { ok: false, level: "warn", msg: "\u5E93\u6587\u4EF6\u4E0D\u5B58\u5728", lastAt: 0, lastSize: 0, vaultSize: 0 };
+      const vaultSize = fs.statSync(dbPath).size;
+      const dir = this.cfg.backupDir && String(this.cfg.backupDir).trim()
+        ? String(this.cfg.backupDir).trim()
+        : path.join(path.dirname(dbPath), "miku-backup");
+      let last = null;
+      try {
+        if (fs.existsSync(dir)) {
+          const base = path.basename(dbPath).replace(/\.sydb$/i, "") + "-";
+          const files = fs.readdirSync(dir).filter((f) => f.startsWith(base) && f.endsWith(".sydb"));
+          for (const f of files) {
+            const fp = path.join(dir, f);
+            try {
+              const st = fs.statSync(fp);
+              if (!last || st.mtimeMs > last.mtimeMs)
+                last = { mtimeMs: st.mtimeMs, size: st.size, path: fp };
+            } catch (e) {
+            }
+          }
+        }
+      } catch (e) {
+      }
+      if (!last)
+        return { ok: false, level: "danger", msg: "\u26A0 \u8FD8\u6CA1\u6709\u4EFB\u4F55\u5907\u4EFD\uFF08\u5EFA\u8BAE\u7ACB\u5373\u5907\u4EFD\uFF09", lastAt: 0, lastSize: 0, vaultSize };
+      const hours = (Date.now() - last.mtimeMs) / 36e5;
+      /* 备份明显小于库（<60%）→ 极可能是"空库"或"残缺"备份，等于没有 */
+      const ratio = vaultSize > 0 ? last.size / vaultSize : 1;
+      if (ratio < 0.6) {
+        return {
+          ok: false,
+          level: "danger",
+          msg: "\u26A0 \u6700\u8FD1\u5907\u4EFD\u4EC5 " + this.fmtSize(last.size) + "\uFF0C\u5E93\u4E3A " + this.fmtSize(vaultSize) + "\uFF08\u5907\u4EFD\u7591\u4F3C\u4E0D\u5B8C\u6574\uFF0C\u5EFA\u8BAE\u7ACB\u5373\u91CD\u5907\u4EFD\uFF09",
+          lastAt: last.mtimeMs,
+          lastSize: last.size,
+          vaultSize,
+        };
+      }
+      if (hours > 24 * 7)
+        return { ok: false, level: "warn", msg: "\u6700\u8FD1\u5907\u4EFD\u5DF2 " + Math.floor(hours / 24) + " \u5929\u524D\uFF08\u5EFA\u8BAE\u5907\u4EFD\uFF09", lastAt: last.mtimeMs, lastSize: last.size, vaultSize };
+      return {
+        ok: true,
+        level: "ok",
+        msg: "\u2705 \u5907\u4EFD\u6B63\u5E38\uFF1A\u6700\u8FD1 " + (hours < 1 ? "\u521A\u521A" : Math.floor(hours) + " \u5C0F\u65F6\u524D") + "\uFF0C" + this.fmtSize(last.size),
+        lastAt: last.mtimeMs,
+        lastSize: last.size,
+        vaultSize,
+      };
+    } catch (e) {
+      return { ok: false, level: "warn", msg: "\u5907\u4EFD\u68C0\u6D4B\u5931\u8D25", lastAt: 0, lastSize: 0, vaultSize: 0 };
+    }
+  }
+  /** v1.9.0 U7 首次使用向导：新用户装上后不知道从哪开始，首次加载弹一次三步引导。
+   *  纯前端弹窗，不碰加密/同步逻辑；可勾"不再提示"（写入 cfg.guideDone）。 */
+  maybeShowGuide() {
+    try {
+      if (!this.cfg || this.cfg.guideDone)
+        return;
+      /* 已建库/已入库的用户不是"新用户"，直接标记完成不再打扰 */
+      const hasVault = this.cfg.dbPath && fs.existsSync(this.cfg.dbPath);
+      const hasDocs = (this.cfg.watchlist || []).length > 0;
+      if (hasVault && hasDocs) {
+        this.cfg.guideDone = true;
+        this.saveConfig().catch(() => {
+        });
+        return;
+      }
+      const box = document.createElement("div");
+      box.style.cssText = "display:flex;flex-direction:column;gap:12px;width:520px;font-size:13px;line-height:1.8;";
+      const hello = document.createElement("div");
+      hello.style.cssText = "font-size:15px;font-weight:bold;";
+      hello.textContent = "\u{1F3AF} \u6B22\u8FCE\u4F7F\u7528\u5BC6\u5E93 \xB7 3 \u6B65\u5F00\u59CB";
+      box.appendChild(hello);
+
+      const steps = [
+        ["1\u20E3 \u521B\u5EFA\u5BC6\u5E93", "\u8BBE\u7F6E\u5BC6\u7801\uFF08\u5EFA\u8BAE\u5F3A\u5BC6\u7801\uFF09\uFF0C\u5E76\u628A\u300C\u6062\u590D\u5BC6\u94A5\u300D\u6284\u5230\u7EB8\u4E0A\u6216 U \u76D8\uFF08\u522B\u548C\u5E93\u653E\u4E00\u8D77\uFF09", "\u{1F510} \u73B0\u5728\u53BB\u521B\u5EFA", () => this.openNewVaultDialog ? this.openNewVaultDialog() : this.openPanelDialog()],
+        ["2\u20E3 \u52A0\u5165\u6587\u6863", "\u6587\u6863\u6811\u91CC\u53F3\u952E\u6587\u6863\u6216\u7B14\u8BB0\u672C \u2192 \u300C\u52A0\u5165\u5BC6\u5E93\u300D\uFF1B\u52A0\u5165\u540E\u4F1A\u81EA\u52A8\u52A0\u5BC6\u5E76\u6E05\u7406\u660E\u6587", null, null],
+        ["3\u20E3 \u9A8C\u8BC1\u9501\u5B9A", "\u70B9\u9876\u90E8\u5BC6\u5E93\u56FE\u6807\uFF08\u6216\u53F3\u952E\uFF09\u9501\u5B9A\uFF0C\u6587\u6863\u6811\u4F1A\u9690\u85CF\u3001\u6B63\u6587\u4F1A\u906E\u853D\uFF1B\u518D\u70B9\u4E00\u6B21\u8F93\u5BC6\u7801\u89E3\u9501", null, null],
+      ];
+      for (const [title, desc, btnLabel, fn] of steps) {
+        const row = document.createElement("div");
+        row.style.cssText = "border:1px solid var(--b3-border-color,#333);border-radius:6px;padding:10px 12px;display:flex;flex-direction:column;gap:6px;";
+        const ttl = document.createElement("div");
+        ttl.style.cssText = "font-weight:bold;font-size:13px;";
+        ttl.textContent = title;
+        const dd = document.createElement("div");
+        dd.style.cssText = "color:var(--b3-theme-on-background,#666);font-size:12px;";
+        dd.textContent = desc;
+        row.appendChild(ttl);
+        row.appendChild(dd);
+        if (btnLabel && fn) {
+          const b = document.createElement("button");
+          b.className = "b3-button b3-button--text";
+          b.textContent = btnLabel;
+          b.style.cssText = "align-self:flex-start;font-size:12px;";
+          b.addEventListener("click", () => {
+            try {
+              dlg.destroy();
+            } catch (e) {
+            }
+            this.cfg.guideDone = true;
+            this.saveConfig().catch(() => {
+            });
+            fn();
+          });
+          row.appendChild(b);
+        }
+        box.appendChild(row);
+      }
+
+      const tip = document.createElement("div");
+      tip.style.cssText = "color:var(--b3-theme-on-background,#888);font-size:12px;";
+      tip.textContent = "\u{1F4A1} \u5BC6\u5E93\u6570\u636E\u5168\u5728\u672C\u673A\u52A0\u5BC6\uFF0C\u4E0D\u4E0A\u4F20\u660E\u6587\uFF1B\u5BC6\u7801\u4E0D\u4F1A\u4FDD\u5B58\uFF0C\u8BF7\u52A1\u5FC5\u8BB0\u7262\u3002";
+      box.appendChild(tip);
+
+      const foot = document.createElement("div");
+      foot.style.cssText = "display:flex;gap:10px;align-items:center;justify-content:flex-end;";
+      const dont = document.createElement("label");
+      dont.style.cssText = "display:flex;align-items:center;gap:6px;font-size:12px;color:var(--b3-theme-on-background,#888);cursor:pointer;margin-right:auto;";
+      const cb = document.createElement("input");
+      cb.type = "checkbox";
+      cb.checked = true;
+      dont.appendChild(cb);
+      dont.appendChild(document.createTextNode("\u4E0D\u518D\u63D0\u793A"));
+      const ok = document.createElement("button");
+      ok.className = "b3-button b3-button--primary";
+      ok.textContent = "\u5F00\u59CB\u4F7F\u7528";
+      foot.appendChild(dont);
+      foot.appendChild(ok);
+      box.appendChild(foot);
+
+      const dlg = this.openDialog("\u6B22\u8FCE\u4F7F\u7528\u5BC6\u5E93", box, "560px", "auto");
+      ok.addEventListener("click", () => {
+        try {
+          dlg.destroy();
+        } catch (e) {
+        }
+        if (cb.checked) {
+          this.cfg.guideDone = true;
+          this.saveConfig().catch(() => {
+          });
+        }
+      });
+    } catch (e) {
+      console.error("[siyuan-edb] maybeShowGuide", e);
+    }
+  }
+  /** v1.9.0 U2 恢复密钥"另存别处"引导：生成后弹窗强调不要和库放一起，并提供一键复制。
+   *  背景：恢复密钥若与 .sydb 同目录，丢电脑=密码和密钥一起丢，或电脑被偷=密钥也送人。 */
+  promptSaveRecoveryElsewhere(words) {
+    try {
+      if (!words)
+        return;
+      const box = document.createElement("div");
+      box.style.cssText = "display:flex;flex-direction:column;gap:12px;width:520px;font-size:13px;line-height:1.8;";
+      const warn = document.createElement("div");
+      warn.style.cssText = "color:#d97706;font-weight:bold;font-size:14px;";
+      warn.textContent = "\u26A0 \u8BF7\u628A\u6062\u590D\u5BC6\u94A5\u53E6\u5B58\u5230\u522B\u7684\u5730\u65B9";
+      box.appendChild(warn);
+      const reason = document.createElement("div");
+      reason.style.cssText = "color:var(--b3-theme-on-background,#666);";
+      reason.textContent = "\u9ED8\u8BA4\u5DF2\u4FDD\u5B58\u4E00\u4EFD txt \u5728\u5E93\u76EE\u5F55\u65C1\u3002\u4F46\u90A3\u4E0D\u591F\u2014\u2014\n\u2022 \u7535\u8111\u4E22\u4E86\uFF1A\u5BC6\u7801\u548C\u5BC6\u94A5\u4E00\u8D77\u4E22\uFF0C\u6570\u636E\u6C38\u8FDC\u6253\u4E0D\u5F00\n\u2022 \u7535\u8111\u88AB\u5077\uFF1A\u5BC6\u94A5\u4E5F\u9001\u7ED9\u4E86\u5BF9\u65B9\n\n\u8BF7\u81F3\u5C11\u518D\u5B58 1 \u4EFD\u5230\uFF1A\u7EB8\u8D28\u6284\u5199 / U \u76D8 / \u53E6\u4E00\u53F0\u8BBE\u5907 / \u5BC6\u7801\u7BA1\u7406\u5668\u3002";
+      reason.style.whiteSpace = "pre-wrap";
+      box.appendChild(reason);
+
+      const wordsBox = document.createElement("div");
+      wordsBox.style.cssText = "padding:10px 12px;border:1px dashed #d97706;border-radius:6px;background:rgba(217,119,6,.08);font-size:15px;color:#d97706;text-align:center;letter-spacing:1px;word-break:break-all;user-select:all;";
+      wordsBox.textContent = "\u{1F511} " + words;
+      box.appendChild(wordsBox);
+
+      const foot = document.createElement("div");
+      foot.style.cssText = "display:flex;gap:8px;justify-content:flex-end;flex-wrap:wrap;";
+      const copyBtn = document.createElement("button");
+      copyBtn.className = "b3-button";
+      copyBtn.textContent = "\u{1F4CB} \u590D\u5236\u6062\u590D\u5BC6\u94A5";
+      copyBtn.addEventListener("click", () => {
+        try {
+          navigator.clipboard.writeText(String(words)).then(() => {
+            copyBtn.textContent = "\u2705 \u5DF2\u590D\u5236";
+            setTimeout(() => {
+              copyBtn.textContent = "\u{1F4CB} \u590D\u5236\u6062\u590D\u5BC6\u94A5";
+            }, 2000);
+          }).catch(() => {
+            showMessage("\u590D\u5236\u5931\u8D25\uFF0C\u8BF7\u624B\u52A8\u9009\u4E2D\u6587\u5B57\u590D\u5236");
+          });
+        } catch (e) {
+          showMessage("\u590D\u5236\u5931\u8D25\uFF0C\u8BF7\u624B\u52A8\u9009\u4E2D\u6587\u5B57\u590D\u5236");
+        }
+      });
+      const doneBtn = document.createElement("button");
+      doneBtn.className = "b3-button b3-button--primary";
+      doneBtn.textContent = "\u6211\u5DF2\u53E6\u5B58\uFF0C\u5B8C\u6210";
+      foot.appendChild(copyBtn);
+      foot.appendChild(doneBtn);
+      box.appendChild(foot);
+
+      const dlg = this.openDialog("\u{1F511} \u6062\u590D\u5BC6\u94A5\u5DF2\u751F\u6210", box, "560px", "auto");
+      doneBtn.addEventListener("click", () => {
+        try {
+          dlg.destroy();
+        } catch (e) {
+        }
+      });
+    } catch (e) {
+      console.error("[siyuan-edb] promptSaveRecoveryElsewhere", e);
     }
   }
   /** v1.7.3 恢复密钥落盘：统一文件名「🔑 恢复密钥.txt」（库目录内），用户可另行备份。
@@ -12312,7 +12547,7 @@ var EdbPlugin = class extends Plugin {
   /** 当前插件版本（与 plugin.json 同步，发布时手工更新） */
   curVersion() {
     /* v1.6.63 必须与 plugin.json 的 version 保持一致（每次发版两处同步改） */
-    return "1.8.3";
+    return "1.9.0";
   }
   versionAtLeast(latest, cur) {
     const p = (s) => String(s || "").split(".").map((x) => parseInt(x, 10) || 0);
@@ -12587,6 +12822,19 @@ var EdbPlugin = class extends Plugin {
         }
       } catch (e) {
       }
+      /* v1.9.0 D1 备份健康状态：只读检测，绝不修改用户备份设置 */
+      try {
+        const bh = this.checkBackupHealth();
+        if (bh && bh.msg) {
+          const color = bh.level === "danger" ? "#d23f31" : (bh.level === "warn" ? "#e6a23c" : "#67c23a");
+          info += "<br><span style='color:" + color + ";font-weight:bold;'>" + bh.msg + "</span>";
+          if (bh.level !== "ok") {
+            /* v1.9.0 D1 提供一键备份入口，不让用户自己找 */
+            info += " <a href='javascript:void(0)' id='edb-ibk' style='color:#3370ff;font-size:12px;cursor:pointer;text-decoration:underline;'>\u7ACB\u5373\u5907\u4EFD</a>";
+          }
+        }
+      } catch (e) {
+      }
     } else {
       info = "<b>" + this.t("locked") + "</b><br>" + (core.vaultExists(this.cfg.dbPath) ? this.esc(this.cfg.dbPath) : this.t("noVault"));
       if (this.pendingSync && this.cfg.watchlist.length) {
@@ -12595,6 +12843,29 @@ var EdbPlugin = class extends Plugin {
     }
     status.innerHTML = info;
     elc.appendChild(status);
+    /* v1.9.0 D1 "立即备份"链接：绑定一键备份（面板每次渲染都重新绑定） */
+    try {
+      const ibk = status.querySelector("#edb-ibk");
+      if (ibk) {
+        ibk.addEventListener("click", async (ev) => {
+          ev.preventDefault();
+          ev.stopPropagation();
+          try {
+            ibk.textContent = "\u6B63\u5728\u5907\u4EFD\u2026";
+            await this.doBackup();
+            showMessage("\u2705 \u5907\u4EFD\u5B8C\u6210");
+            this.refreshPanel();
+          } catch (e) {
+            showMessage("\u5907\u4EFD\u5931\u8D25\uFF1A" + (e && e.message ? e.message : e));
+            try {
+              ibk.textContent = "\u7ACB\u5373\u5907\u4EFD";
+            } catch (e2) {
+            }
+          }
+        });
+      }
+    } catch (e) {
+    }
     const licLine = document.createElement("div");
     licLine.style.cssText = "padding:6px 10px;font-size:12px;color:" + (this.isLicensed() ? "var(--b3-theme-on-background,#999)" : "#d23f31") + ";border-bottom:1px solid var(--b3-theme-background-light,#ddd);";
     licLine.textContent = "\u{1F511} " + (this.isLicensed() ? this.licenseText() : this.cfg.revoked ? this.licenseText() : this.licState ? this.t("licExpired") + "\uFF08" + this.licenseText() + "\uFF09" : this.t("licStatusNone"));
@@ -13233,6 +13504,8 @@ var EdbPlugin = class extends Plugin {
       await this.saveConfig();
       this.saveRecoveryWords(words).catch(() => {
       });
+      /* v1.9.0 U2 更换恢复密钥后同样提示另存 */
+      setTimeout(() => this.promptSaveRecoveryElsewhere(words), 600);
       this.refreshPanel();
     } catch (e) {
       showMessage("\u8BBE\u7F6E\u5931\u8D25\uFF1A" + (e && e.message));

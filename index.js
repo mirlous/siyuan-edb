@@ -7181,14 +7181,22 @@ var EdbPlugin = class extends Plugin {
       this.refreshPanel();
       /* v1.7.5 自动解锁成功 → 重建隐藏 CSS（去掉正文遮罩、放出文档树） */
       try {
+        /* v2.0.2 轻量自检：任一步 > 80ms 打印警告，便于定位卡顿来源 */
+        const _t0 = (typeof performance !== "undefined" && performance.now) ? performance.now() : Date.now();
         this.rebuildHideCss();
+        const _t1 = (typeof performance !== "undefined" && performance.now) ? performance.now() : Date.now();
         this.applyNotebookVisibility();
+        const _t2 = (typeof performance !== "undefined" && performance.now) ? performance.now() : Date.now();
         this.applyDocMask();
+        const _t3 = (typeof performance !== "undefined" && performance.now) ? performance.now() : Date.now();
+        if (_t3 - _t0 > 80)
+          console.warn("[siyuan-edb] 解锁后处理偏慢: css=" + Math.round(_t1 - _t0) + "ms visibility=" + Math.round(_t2 - _t1) + "ms mask=" + Math.round(_t3 - _t2) + "ms");
       } catch (e) {
       }
+      /* v2.0.2 1200→3000ms：解锁后先让界面渲染完成，再做全库同步，避免抢主线程 */
       setTimeout(() => {
         this.syncNow().catch((e) => console.error("[siyuan-edb]", e));
-      }, 1200);
+      }, 3000);
     } catch (e) {
       this.noPwd = false;
     }
@@ -8264,8 +8272,11 @@ var EdbPlugin = class extends Plugin {
         (v.notebooks || []).forEach((b) => otherNbs.add(b));
         (v.watchlist || []).forEach((d) => otherDocs.add(d));
       });
-      /* v1.6.69：锁定时不仅隐藏"整本加入"的笔记本行，也隐藏"单篇加入密库"的文档行（防左侧文档树泄露标题） */
-      document.querySelectorAll("[data-node-id]").forEach((el) => {
+      /* v2.0.2 性能修复：原 `document.querySelectorAll("[data-node-id]")` 会扫到编辑器里
+         每一个段落/块（正常文档就几千个），再 each 做 closest(".protyle") 祖先遍历 → 解锁卡顿。
+         JS 兜底真正需要处理的只有【文档树 / 大纲 / 列表】里的条目；编辑器由声明式 CSS 遮罩负责。 */
+      const treeEls = document.querySelectorAll(".sy__file [data-node-id],.sy__outline [data-node-id],.b3-list [data-node-id],.b3-list[data-node-id]");
+      treeEls.forEach((el) => {
         const bid = el.getAttribute("data-node-id");
         if (!bid)
           return;
@@ -8575,10 +8586,12 @@ var EdbPlugin = class extends Plugin {
       if (this._nbTimer)
         clearInterval(this._nbTimer);
       this.startDomObserver();
+      /* v2.0.2 1200ms → 3000ms：隐藏/遮挡已由声明式 CSS 即时生效，
+         MutationObserver 负责新增节点，定时器只是兜底，无需高频。 */
       this._nbTimer = setInterval(() => {
-      this.applyNotebookVisibility();
-      this.applyDocMask();
-    }, 1200);
+        this.applyNotebookVisibility();
+        this.applyDocMask();
+      }, 3000);
     } catch (e) {
       console.error("[siyuan-edb]", e);
     }
@@ -8809,6 +8822,11 @@ var EdbPlugin = class extends Plugin {
   }
   hideLostAssets() {
     try {
+      /* v2.0.2 性能：整篇 body 文本节点遍历开销大，节流到 8 秒一次 */
+      const _now = Date.now();
+      if (this._lostAt && _now - this._lostAt < 8000)
+        return;
+      this._lostAt = _now;
       let names = this.cfg.encryptedAssets || [];
       if (!names.length && this.state && this.state.db && this.isUnlocked()) {
         const rows = core.listAllAssets(this.state.db) || [];
@@ -10897,7 +10915,17 @@ var EdbPlugin = class extends Plugin {
    *  背景：曾有"库 6.27GB，但唯一备份只有 0.14MB（空库时留下的）"的情况——
    *  用户以为有备份，其实等于没有。
    *  返回 { ok, level, msg }，level: ok | warn | danger；**绝不修改用户备份配置**。 */
+  /** v2.0.2 带缓存的备份健康检查（10 秒内复用，避免每次面板刷新都扫目录） */
   checkBackupHealth() {
+    const _t = Date.now();
+    if (this._bhCache && _t - this._bhAt < 10000)
+      return this._bhCache;
+    const r = this._checkBackupHealthRaw();
+    this._bhCache = r;
+    this._bhAt = _t;
+    return r;
+  }
+  _checkBackupHealthRaw() {
     try {
       if (!this.cfg.backupEnabled)
         return { ok: false, level: "warn", msg: "\u81EA\u52A8\u5907\u4EFD\u5DF2\u5173\u95ED\uFF08\u5EFA\u8BAE\u5F00\u542F\uFF09", lastAt: 0, lastSize: 0, vaultSize: 0 };
@@ -10970,7 +10998,13 @@ var EdbPlugin = class extends Plugin {
         if (v && i !== activeV)
           (v.watchlist || []).forEach((d) => others.add(d));
       });
-      const items = document.querySelectorAll(".b3-list-item[data-node-id]");
+      /* v2.0.2 性能：限定侧栏范围；并用轻量签名跳过重复扫描 */
+      const sig = (unlocked ? "1" : "0") + "|" + (this.cfg.watchlist || []).length + "|" + (this.cfg.vaults || []).length + "|" + ((this.cfg.excludedDocs || []).length);
+      const items = document.querySelectorAll(".sy__file .b3-list-item[data-node-id],.sy__outline .b3-list-item[data-node-id],.b3-list .b3-list-item[data-node-id]");
+      if (this._markSig === sig && this._markCount === items.length)
+        return;
+      this._markSig = sig;
+      this._markCount = items.length;
       for (const el of items) {
         const id = el.getAttribute("data-node-id");
         if (!id)
@@ -12676,7 +12710,7 @@ var EdbPlugin = class extends Plugin {
   /** 当前插件版本（与 plugin.json 同步，发布时手工更新） */
   curVersion() {
     /* v1.6.63 必须与 plugin.json 的 version 保持一致（每次发版两处同步改） */
-    return "2.0.1";
+    return "2.0.2";
   }
   versionAtLeast(latest, cur) {
     const p = (s) => String(s || "").split(".").map((x) => parseInt(x, 10) || 0);

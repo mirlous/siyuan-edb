@@ -6832,7 +6832,7 @@ var EdbPlugin = class extends Plugin {
         showMessage(this.t("idleLocked"));
         return;
       }
-      if (!this.isUnlocked() || this.cfg.keepPlain || !this.isLicensed()) {
+      if (!this.isUnlocked() || this.cfg.keepPlain) {
         if (!this.isUnlocked() && this.isLicensed()) {
           try {
             const domSet = this.openDocIdsFromDom();
@@ -8932,10 +8932,7 @@ var EdbPlugin = class extends Plugin {
   }
   /** 整本笔记本入库：查询该笔记本全部文档 ID → 批量加入 watchlist → 一次全量同步 */
   async addNotebookToVault(boxIds) {
-    if (!this.isLicensed()) {
-      showMessage(this.t("licStatusNone"));
-      return 0;
-    }
+    /* v2.0.0 免费版允许整本加入，但受 50 篇额度限制 */
     if (!this.isUnlocked()) {
       const ok = await this.ensureUnlocked();
       if (!ok)
@@ -9016,6 +9013,14 @@ var EdbPlugin = class extends Plugin {
       await this.saveConfig();
       this.applyNotebookVisibility();
       return { added: 0, total: totalFound, allIn: true };
+    }
+    /* v2.0.0 免费版额度拦截：整本加入不得超限 */
+    {
+      const _newIds = (ids || []).filter((x) => x && !this.cfg.watchlist.includes(x)).length;
+      if (this.freeTierDocBlocked(_newIds)) {
+        this.cfg.watchlist = this.cfg.watchlist;
+        return { added: 0, total: 0, blockedByFreeTier: true };
+      }
     }
     /* v1.8.0 U6 整本加入前确认（笔记本可能几百篇/几 GB，误点会很惨） */
     try {
@@ -10175,17 +10180,14 @@ var EdbPlugin = class extends Plugin {
   }
   async addToVault(docId, routed) {
     try {
-      if (!this.isLicensed()) {
-        showMessage(this.licState ? this.t("licExpired") : this.t("licStatusNone"));
-        return;
-      }
+      /* v2.0.0 免费版允许单篇加入，但受 50 篇额度限制 */
       if (!this.isUnlocked()) {
         const ok = await this.ensureUnlocked();
         if (!ok)
           return;
       }
       const box = await this.boxOfDoc(docId);
-      /* v1.8.0 U6 加入前确认（大文档/大附件时提示规模与耗时，用户可取消） */
+      /* v2.0.0 免费版额度检查：单篇 + 子文档总数不得超过免费上限 */
       let _preSubs = [];
       if (this.cfg.includeSubDocs !== false && box) {
         try {
@@ -10193,6 +10195,13 @@ var EdbPlugin = class extends Plugin {
         } catch (e) {
           _preSubs = [];
         }
+      }
+      /* v2.0.0 免费版额度拦截 */
+      {
+        const _already = this.cfg.watchlist.includes(docId) ? 0 : 1;
+        const _newSubs = _preSubs.filter((x) => x && !this.cfg.watchlist.includes(x)).length;
+        if (this.freeTierDocBlocked(_already + _newSubs))
+          return;
       }
       try {
         const _okJoin = await this.confirmVaultJoin("doc", [docId].concat(_preSubs));
@@ -10350,7 +10359,7 @@ var EdbPlugin = class extends Plugin {
       const curV = String(this.curVersion() || "");
       if (this.cfg.subDocsFixed && String(this.cfg.subDocsFixedV || "") === curV)
         return 0;
-      if (!this.isUnlocked() || !this.isLicensed())
+      if (!this.isUnlocked())
         return 0;
       const missing = [];
       const missSet = new Set();
@@ -11571,11 +11580,8 @@ var EdbPlugin = class extends Plugin {
       return { ok: false, reason: "busy" };
     if (!this.isUnlocked())
       return { ok: false, reason: "locked" };
-    if (!this.isLicensed()) {
-      if (this._licWarned !== String(!!this.licState)) {
-        this._licWarned = String(!!this.licState);
-        showMessage(this.licState ? this.t("licExpired") : this.t("licStatusNone"));
-      }
+    /* v2.0.0 免费版可正常同步（核心能力） */
+    if (false) {
       return { ok: false, reason: "no-license" };
     }
     // v1.6.11: 同步期间显示动态等待
@@ -12670,7 +12676,7 @@ var EdbPlugin = class extends Plugin {
   /** 当前插件版本（与 plugin.json 同步，发布时手工更新） */
   curVersion() {
     /* v1.6.63 必须与 plugin.json 的 version 保持一致（每次发版两处同步改） */
-    return "1.9.4";
+    return "2.0.0";
   }
   versionAtLeast(latest, cur) {
     const p = (s) => String(s || "").split(".").map((x) => parseInt(x, 10) || 0);
@@ -12991,16 +12997,31 @@ var EdbPlugin = class extends Plugin {
     }
     const licLine = document.createElement("div");
     licLine.style.cssText = "padding:6px 10px;font-size:12px;color:" + (this.isLicensed() ? "var(--b3-theme-on-background,#999)" : "#d23f31") + ";border-bottom:1px solid var(--b3-theme-background-light,#ddd);";
-    licLine.textContent = "\u{1F511} " + (this.isLicensed() ? this.licenseText() : this.cfg.revoked ? this.licenseText() : this.licState ? this.t("licExpired") + "\uFF08" + this.licenseText() + "\uFF09" : this.t("licStatusNone"));
+    /* v2.0.0 Freemium 面板：免费版清楚展示"能用什么 + 额度还剩多少 + 升级解锁什么" */
+    if (this.isFreeTier() && !this.cfg.revoked) {
+      try {
+        const used = (this.cfg.watchlist || []).length;
+        const lim = this.freeDocLimit();
+        const vUsed = (this.cfg.vaults || []).length;
+        const vLim = this.freeVaultLimit();
+        licLine.style.cssText = "padding:8px 10px;font-size:12px;color:#8a6d3b;background:rgba(230,162,60,.10);border-bottom:1px solid var(--b3-border-color);line-height:1.7;";
+        licLine.innerHTML = "\u{1F193} <b>\u514D\u8D39\u7248</b>\uFF08\u6587\u6863 " + used + "/" + lim + "\u3000\u5BC6\u5E93 " + vUsed + "/" + vLim + "\uFF09" +
+          "<br><span style='color:#6b7280;'>\u5DF2\u542B\uFF1A\u52A0\u5BC6 / \u9501\u5B9A\u906E\u7F69 / \u6062\u590D\u5BC6\u94A5 / \u81EA\u52A8\u540C\u6B65 / \u5907\u4EFD / \u56DE\u6536\u7A7A\u95F4</span>" +
+          "<br><span style='color:#3370ff;'>\u5347\u7EA7\u89E3\u9501\uFF1A\u65E0\u9650\u6587\u6863 &\u00B7& \u65E0\u9650\u5BC6\u5E93 &\u00B7& \u7F51\u76D8\u540C\u6B65 &\u00B7& \u624B\u673A\u67E5\u770B &\u00B7& \u9605\u540E\u5373\u711A &\u00B7& \u53CC\u56E0\u7D20</span>";
+      } catch (e) {
+      }
+    } else {
+      licLine.textContent = "\u{1F511} " + (this.isLicensed() ? this.licenseText() : this.cfg.revoked ? this.licenseText() : this.licState ? this.t("licExpired") + "\uFF08" + this.licenseText() + "\uFF09" : this.t("licStatusNone"));
+    }
     elc.appendChild(licLine);
-    /* v1.6.64 主动申请试用（服务端签发 60 天签名租约；删本地无法重置） */
+    /* v1.6.64 主动申请试用（服务端签发 14 天签名租约；删本地无法重置） */
     if (!this.isLicensed() && !this.trialLeaseValid()) {
       const srvExp = Number(this.cfg.trialLeaseExp) || 0;
       const tb = document.createElement("button");
       tb.className = "b3-button b3-button--outline";
       tb.style.cssText = "margin:6px 10px;font-size:12px;";
-      tb.textContent = srvExp > 0 && this.nowTs() >= srvExp ? "\u23F3 试用已结束（购买后激活）" : "\u{1F9EA} 开始 60 天免费试用（两个月）";
-      tb.title = "联网申请一次，服务端签发 60 天（两个月）试用租约；换工作区/重装/删文件都不会重置";
+      tb.textContent = srvExp > 0 && this.nowTs() >= srvExp ? "\u23F3 试用已结束（购买后激活）" : "\u{1F9EA} 开始 14 天免费试用";
+      tb.title = "联网申请一次，服务端签发 14 天试用租约；换工作区/重装/删文件都不会重置";
       if (srvExp > 0 && this.nowTs() >= srvExp) {
         tb.disabled = true;
       } else {
@@ -13870,8 +13891,6 @@ var EdbPlugin = class extends Plugin {
   async maybeAutoCompact() {
     try {
       if (!this.isUnlocked() || !this.state || !this.cfg.dbPath || !fs.existsSync(this.cfg.dbPath))
-        return;
-      if (!this.isLicensed())
         return;
       const th = Math.max(0, Number(this.cfg.autoCompactMB) || 256);
       if (th <= 0)
@@ -15532,6 +15551,9 @@ var EdbPlugin = class extends Plugin {
   async createVaultAndActivate(newPath, name) {
     if (!newPath)
       throw new Error("\u8DEF\u5F84\u4E0D\u80FD\u4E3A\u7A7A");
+    /* v2.0.0 免费版仅允许 1 个密库 */
+    if (this.freeTierVaultBlocked())
+      return false;
     /* v1.9.4 BUG 修复：原逻辑 `pwd = 已解锁 ? 当前库密码 : ""`
        —— 锁定时 pwd 为空 → 既不生成恢复密钥，还会静默创建"无密码库"（用户以为有保护）。
        现在：已解锁且当前库有密码 → 继承；否则弹出建库密码对话框让用户设置。 */
@@ -15799,7 +15821,7 @@ var EdbPlugin = class extends Plugin {
       }
       if (this.trialLeaseValid()) {
         this.writeTrialLeaseMirror();
-      } else if (this.cfg.trialStart && this.nowTs() - this.cfg.trialStart < 60 * 864e5) {
+      } else if (this.cfg.trialStart && this.nowTs() - this.cfg.trialStart < 14 * 864e5) {
         /* 老版本试用未到期 → 静默迁移为签名租约（不延长；离线失败则继续用本地试用） */
         this.applyTrial(true).catch(() => {});
       }
@@ -15807,7 +15829,7 @@ var EdbPlugin = class extends Plugin {
     }
     if (this.licState && this.licState.expAt && this.cfg.licWarnShown !== String(this.licState.expAt)) {
       const left = this.licState.expAt - this.nowTs();
-      if (left > 0 && left < 60 * 864e5) {
+      if (left > 0 && left < 14 * 864e5) {
         this.cfg.licWarnShown = String(this.licState.expAt);
         try {
           await this.saveConfig();
@@ -16049,6 +16071,48 @@ var EdbPlugin = class extends Plugin {
     return this.onlineGraceDaysEff() * 864e5;
   }
   /** 是否在授权有效期内（含试用模式） */
+  /** v2.0.0 免费版判定：试用到期且未购买 → 进入免费版（不再"全部锁死"）。
+   *  免费版保留全部核心安全能力，仅限制额度与高阶功能，让用户能长期用、愿意推荐。 */
+  isFreeTier() {
+    return !this.isLicensed();
+  }
+  /** 免费版文档额度 */
+  freeDocLimit() {
+    return 50;
+  }
+  /** 免费版密库数量额度 */
+  freeVaultLimit() {
+    return 1;
+  }
+  /** 检查"再加入 N 篇文档"是否会超免费额度；返回 true 表示被拦截 */
+  freeTierDocBlocked(addingN) {
+    try {
+      if (!this.isFreeTier())
+        return false;
+      const cur = (this.cfg.watchlist || []).length;
+      const add = Math.max(0, Number(addingN) || 0);
+      if (cur + add <= this.freeDocLimit())
+        return false;
+      showMessage("\u{1F512} \u514D\u8D39\u7248\u6700\u591A " + this.freeDocLimit() + " \u7BC7\u6587\u6863\uFF08\u5F53\u524D " + cur + " \u7BC7\uFF09\u3002\u5347\u7EA7\u540E\u89E3\u9501\u65E0\u9650\u6587\u6863\u3001\u65E0\u9650\u5BC6\u5E93\u4E0E\u5168\u90E8\u9AD8\u9636\u529F\u80FD\u3002");
+      return true;
+    } catch (e) {
+      return false;
+    }
+  }
+  /** 检查"再新建 1 个密库"是否会超免费额度 */
+  freeTierVaultBlocked() {
+    try {
+      if (!this.isFreeTier())
+        return false;
+      const cnt = (this.cfg.vaults || []).length;
+      if (cnt < this.freeVaultLimit())
+        return false;
+      showMessage("\u{1F512} \u514D\u8D39\u7248\u4EC5\u652F\u6301 " + this.freeVaultLimit() + " \u4E2A\u5BC6\u5E93\uFF08\u5F53\u524D " + cnt + " \u4E2A\uFF09\u3002\u5347\u7EA7\u540E\u53EF\u65E0\u9650\u5EFA\u5E93\u3001\u5206\u5E93\u4E0E\u667A\u80FD\u5206\u5E93\u3002");
+      return true;
+    } catch (e) {
+      return false;
+    }
+  }
   isLicensed() {
     if (this.cfg.revoked)
       return false;
@@ -16148,13 +16212,13 @@ var EdbPlugin = class extends Plugin {
         this.cfg.trialStart = eff;
         changed = true;
       }
-      /* v1.7.6 试用期升级 7→60 天：本地判定"有效期已到 7 天但按新规仍未到 60 天"时，
-         主动拉一次 triallease，让服务端按 first+60d 重签租约（只延长不缩短）。 */
+      /* v1.7.6 试用期调整：本地判定"有效期已到旧期限但按新规仍未到 14 天"时，
+         主动拉一次 triallease，让服务端按 first+14d 重签租约（只延长不缩短）。 */
       try {
         const st = eff || Number(this.cfg.trialStart) || 0;
         if (st > 0) {
           const oldEnd = st + 7 * 864e5;
-          const newEnd = st + 60 * 864e5;
+          const newEnd = st + 14 * 864e5;
           const leaseExp = Number(this.cfg.trialLeaseExp) || 0;
           const nowTs = this.nowTs();
           if (nowTs < newEnd && (leaseExp === 0 || leaseExp <= oldEnd + 60e3)) {
@@ -16345,15 +16409,15 @@ var EdbPlugin = class extends Plugin {
     this.refreshTrialEff();
     return true;
   }
-  /** 试用到期时间（租约优先；老本地试用按 60 天折算） */
+  /** 试用到期时间（租约优先；老本地试用按 14 天折算） */
   trialExpAt() {
     const info = this.trialLeaseInfo();
     if (info)
       return info.exp;
     const st = this._trialEff || this.refreshTrialEff();
-    return st ? st + 60 * 864e5 : 0;
+    return st ? st + 14 * 864e5 : 0;
   }
-  /** 60 天试用是否有效 */
+  /** 14 天试用是否有效 */
   isTrialValid() {
     if (this.cfg.clockRollback)
       return false;
@@ -16367,7 +16431,7 @@ var EdbPlugin = class extends Plugin {
     const st = this._trialEff || this.refreshTrialEff();
     if (!st)
       return false;
-    return this.nowTs() - st < 60 * 864e5;
+    return this.nowTs() - st < 14 * 864e5;
   }
   /** 试用剩余天数（向上取整） */
   trialDaysLeft() {
@@ -16469,7 +16533,7 @@ var EdbPlugin = class extends Plugin {
         return this.t("licTrial") + " " + this.trialTimeLeft();
       if (Number(this.cfg.trialLeaseExp) > 0 || Number(this.cfg.trialStart) > 0)
         return "\u23F3 试用已结束，请购买激活码";
-      return "\u{1F511} 未激活 · 可申请 60 天免费试用（两个月）";
+      return "\u{1F511} 未激活 · 可申请 14 天免费试用";
     }
     if (this.licState.expAt === 0)
       return this.t("licStatusForever");

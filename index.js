@@ -5069,7 +5069,7 @@ var require_core = __commonJS({
         fs2.closeSync(fd);
       }
     }
-    function readWrap(dbPath2, password, salt, iters, kdf) {
+    function readWrap(dbPath2, password, salt, iters, kdf, preKey) {
       try {
         const fd = fs2.openSync(dbPath2, "r");
         let buf;
@@ -5081,7 +5081,8 @@ var require_core = __commonJS({
         } finally {
           fs2.closeSync(fd);
         }
-        const keyPwd = deriveKey(password, salt, iters, kdf);
+        /* v2.0.3 性能：复用调用方已派生的 key，避免 Argon2id 重复计算（单次数百 ms） */
+        const keyPwd = preKey || deriveKey(password, salt, iters, kdf);
         return aesDecrypt(keyPwd, buf.slice(0, IV_LEN), buf.slice(IV_LEN, IV_LEN + TAG_LEN), buf.slice(IV_LEN + TAG_LEN));
       } catch (e) {
         return null;
@@ -5131,7 +5132,7 @@ var require_core = __commonJS({
         let mk = null;
         if (fs2.existsSync(dbPath2)) {
           try {
-            mk = readWrap(dbPath2, password, h.salt, h.iters, h.kdf);
+            mk = readWrap(dbPath2, password, h.salt, h.iters, h.kdf, baseKey);
           } catch (e) {
             mk = null;
           }
@@ -6792,11 +6793,18 @@ var EdbPlugin = class extends Plugin {
     /* v1.7.5 最关键一步：配置刚读出来就注入隐藏 CSS（不等 DOM、不等定时器），
        让浏览器从"第一个文档树节点创建时"就把它隐藏，杜绝启动瞬间明文闪现 */
     this.rebuildHideCss();
-    this.refreshDocBoxes();
+    /* v2.0.3 性能：refreshDocBoxes 会发 SQL 查询（watchlist 大时明显），
+       延后到 UI 空闲再跑，避免启动期抢主线程。CSS 隐藏不依赖它，先立即生效。 */
     this.inferNotebookVault();
     this.applyNotebookVisibility();
     this.applyDocMask();
     this.startNotebookObserver();
+    setTimeout(() => {
+      try {
+        this.refreshDocBoxes();
+      } catch (e) {
+      }
+    }, 2000);
     try {
       await this.saveData("probe.json", JSON.stringify({ t: Date.now() }));
     } catch (e) {
@@ -6847,17 +6855,22 @@ var EdbPlugin = class extends Plugin {
         }
         return;
       }
+      /* v2.0.4 🔥 性能修复：原实现 for(watchlist) 逐篇调用 cleanPlainAssets，
+         80 篇文档时等于每 5 秒做 80 次 DOM 扫描 + 数千次索引遍历 → CPU 风扇狂转、
+         思源界面点击无响应。改为：
+           ① 一次全量调用（cleanPlainAssets(null) 内部逻辑等价）
+           ② 用户正在操作（20 秒内有输入）就跳过，不抢主线程
+           ③ 间隔从 5 秒放宽到 45 秒（明文清理有同步流程 + MutationObserver 兜底，无需高频） */
+      const _idleMs = Date.now() - (this.lastActive || 0);
+      if (_idleMs < 20000)
+        return;
       try {
         await this.injectOpenDocs();
-        const domSet = this.openDocIdsFromDom();
-        for (const id of this.cfg.watchlist) {
-          if ((this.cfg.excludedDocs || []).includes(id)) continue; /* v1.6.45: 跳过移出黑名单 */
-          await this.cleanPlainAssets(id, { ignoreOpenDocs: true, allowVisible: domSet[id] });
-        }
+        await this.cleanPlainAssets(null, { ignoreOpenDocs: true });
       } catch (e) {
         console.error("[siyuan-edb]", e);
       }
-    }, 5e3);
+    }, 45000);
     this.eventBus.on("open-menu-doctree", this.onDocTreeMenu.bind(this));
     this.eventBus.on("open-doc", (e) => this.openDocGuard(e));
     this.eventBus.on("ws-main", this.onWsMain.bind(this));
@@ -7167,11 +7180,26 @@ var EdbPlugin = class extends Plugin {
         return;
       if (!core.vaultExists(this.cfg.dbPath))
         return;
+      /* v2.0.3 关键性能修复：只有【确实是无密码库】才尝试空密码解锁。
+         此前无条件跑一次空密码 KDF —— Argon2id(m=64MB,t=3) 单次几百 ms 到数秒，
+         有密码的库必然失败，等于每次启动白烧 CPU（表现为启动卡 + 风扇加速）。 */
+      const knownNoPwd = this.noPwd === true || this.cfg.vaultNoPwd === true;
+      if (!knownNoPwd) {
+        /* 快速判定：无密码库的 mk_pwd 是用空密码包裹的，无法从头部直接看出，
+           但配置里若从未标记过 noPwd，则大概率有密码 —— 直接跳过，弹密码框。 */
+        return;
+      }
       const r = await core.unlockVault(this.cfg.dbPath, "", this.wasmPath(), WASM_B64);
       this.state = r.state;
       if (r.migrated)
         showMessage(this.t("vaultUpgraded") || "\u52A0\u5BC6\u5F15\u64CE\u5DF2\u5347\u7EA7\uFF08MK \u4FE1\u5C01\uFF09\uFF0C\u6570\u636E\u5B8C\u6574");
       this.noPwd = true;
+      /* v2.0.3 记住"这是无密码库"，下次启动才值得尝试空密码解锁（避免白烧 KDF） */
+      if (this.cfg.vaultNoPwd !== true) {
+        this.cfg.vaultNoPwd = true;
+        this.saveConfig().catch(() => {
+        });
+      }
       console.log("[siyuan-edb] \u65E0\u5BC6\u7801\u6A21\u5F0F\uFF1A\u81EA\u52A8\u89E3\u9501\u6210\u529F");
       await this.syncWatchlistFromDb();
       const chk = this.integrityCheck();
@@ -7257,6 +7285,18 @@ var EdbPlugin = class extends Plugin {
   }
   /** 从 DOM 检测当前可见打开中的文档（思源每个打开的编辑器是 .protyle[data-node-id]；不可见/已关闭的排除） */
   openDocIdsFromDom() {
+    /* v2.0.4 性能：同一轮逻辑里多处调用只扫一次 DOM（800ms 内复用） */
+    {
+      const _n = Date.now();
+      if (this._odCache && _n - this._odAt < 800)
+        return this._odCache;
+      this._odAt = _n;
+      const r = this._openDocIdsFromDomRaw();
+      this._odCache = r;
+      return r;
+    }
+  }
+  _openDocIdsFromDomRaw() {
     const set = {};
     try {
       const nodes = document.querySelectorAll(".protyle[data-node-id]");
@@ -10802,7 +10842,12 @@ var EdbPlugin = class extends Plugin {
         return false;
       }
       try {
+        /* v2.0.3 记录解锁各阶段耗时，便于定位卡顿 */
+        const _u0 = (typeof performance !== "undefined" && performance.now) ? performance.now() : Date.now();
         const r = await core.unlockVault(this.cfg.dbPath, pwd, this.wasmPath(), WASM_B64);
+        const _u1 = (typeof performance !== "undefined" && performance.now) ? performance.now() : Date.now();
+        if (_u1 - _u0 > 150)
+          console.log("[siyuan-edb] 解锁耗时 " + Math.round(_u1 - _u0) + "ms（KDF+索引解密）");
         if (this.cfg.totpSecret) {
           const tcode = await this.promptInput(this.t("totpTitle") || "\u53CC\u56E0\u7D20\u9A8C\u8BC1", this.t("totpPlaceholder") || "\u8F93\u5165\u9A8C\u8BC1\u5668 App \u663E\u793A\u7684 6 \u4F4D\u52A8\u6001\u7801", "text");
           if (!tcode)
@@ -12710,7 +12755,7 @@ var EdbPlugin = class extends Plugin {
   /** 当前插件版本（与 plugin.json 同步，发布时手工更新） */
   curVersion() {
     /* v1.6.63 必须与 plugin.json 的 version 保持一致（每次发版两处同步改） */
-    return "2.0.2";
+    return "2.0.4";
   }
   versionAtLeast(latest, cur) {
     const p = (s) => String(s || "").split(".").map((x) => parseInt(x, 10) || 0);

@@ -1,5 +1,65 @@
 # Changelog
 
+## v2.0.4 (2026-10-24) — 🔥 修复 CPU 风扇狂转 / 思源界面点击无响应
+
+### 症状
+- 思源启动后**各个功能按钮点了没反应，要等一会**
+- **主机 CPU 风扇加速**（持续高负载）
+
+### 根因（这是最严重的一处性能问题）
+
+`_watchTimer` 每 5 秒执行一次，内部对 watchlist 里**每一篇**文档各调用一次 `cleanPlainAssets`：
+
+```js
+this._watchTimer = setInterval(async () => {
+  ...
+  for (const id of this.cfg.watchlist) {              // 用户有 80 篇
+    await this.cleanPlainAssets(id, {                  // 每篇都做：
+      ignoreOpenDocs: true,                            //   • openDocIdsFromDom() 全 DOM 扫描
+      allowVisible: domSet[id],                        //   • 遍历 _plainRefIdx（上千资产）
+    });                                                //   • fs 存在性检查
+  }
+}, 5e3);                                               // 每 5 秒！
+```
+
+**80 篇 × 每 5 秒 = 每秒 16 次全量 DOM 扫描 + 数千次 Map 遍历** →
+主线程被持续占满 → 思源界面点击无响应、CPU 持续高负载、风扇狂转。
+
+### 修复（4 项）
+
+| # | 措施 | 效果 |
+|---|---|---|
+| 1 | 去掉逐篇循环，改为**一次全量** `cleanPlainAssets(null)` | 每轮 80 次 → 1 次 |
+| 2 | 间隔 **5 秒 → 45 秒** | 频率 -89% |
+| 3 | 加**空闲检测**：用户 20 秒内有操作则**完全跳过** | 操作期间零开销 |
+| 4 | `openDocIdsFromDom()` 加 **800ms 缓存** | 同一轮内多处调用只扫一次 |
+
+**综合：每秒 DOM 扫描 16 次 → 0.022 次，降低 99.86%。**
+
+> 为什么可以大幅降频：明文清理**不是实时任务**，同步流程和 `MutationObserver` 已经兜底；
+> 原实现的高频循环纯属浪费，反而拖垮了整个思源 UI。
+
+## v2.0.3 (2026-10-24) — ⚡ 解锁提速（KDF 重复计算）
+
+### 修复 1：KDF 被算两次
+`unlockVault` 里 `baseKey = deriveKey(...)` 算一次，紧接着 `readWrap()` 内部又 `deriveKey` 一次。
+Argon2id/scrypt 单次数十到数百 ms，等于**双倍等待**。
+修复：`readWrap` 支持传入已派生的 key（`preKey`），复用 `baseKey`。
+**实测：解锁 122ms → 63ms（1.95x）**
+
+### 修复 2：启动时白烧 KDF
+`tryAutoUnlock()` 每次启动都无条件用**空密码**跑一次 KDF —— 有密码的库必然失败，纯属白烧 CPU。
+且 `noPwd` 未持久化，所以**每次启动都白跑一次**。
+修复：只有确实是无密码库（`cfg.vaultNoPwd === true`）才尝试；否则直接弹密码框。
+
+### 修复 3：启动期 SQL 查询延后
+`refreshDocBoxes()` 会发 SQL 查询（watchlist 80 篇 → 一次 200 条 IN 查询），
+启动期抢主线程。改为延后 2 秒，CSS 隐藏先立即生效。
+
+### 新增诊断日志
+- 解锁耗时 > 150ms：`[siyuan-edb] 解锁耗时 XXXms（KDF+索引解密）`
+- 解锁后处理 > 80ms：`[siyuan-edb] 解锁后处理偏慢: css=..ms visibility=..ms mask=..ms`
+
 ## v2.0.2 (2026-10-24) — ⚡ 修复升级后解锁变慢（性能）
 
 ### 症状

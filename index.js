@@ -6234,7 +6234,7 @@ var crypto2 = require("crypto");
 var WASM_B64 = require_wasm().b64;
 var SYNC_DEBOUNCE_MS = 2500;
 var DEFAULT_DB_PATH = "__AUTO__";
-var BIG_ASSET_BYTES = 200 * 1024 * 1024;
+var BIG_ASSET_BYTES = 16 * 1024 * 1024; /* v2.0.8: 200MB→16MB，让 10-200MB 的重资产走流式（秒开），不再整块读入内存 */
 var { genTotpSecret, totpValid, totpUri } = core;
 var OCR_WORKER_JS = "https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/worker.min.js";
 var OCR_CORE_WASM = "https://cdn.jsdelivr.net/npm/tesseract.js-core@5.1.1/tesseract-core-simd.wasm.js";
@@ -7382,6 +7382,49 @@ var EdbPlugin = class extends Plugin {
    *  小附件（≤200MB）：img → data URL；video/audio/iframe/a → blob URL（播放/预览/下载全内存，磁盘零明文）
    *  大附件（>200MB，如 2GB+ 视频）：改用本地流式服务 URL（按 Range 边播边解密，内存 O(播放缓冲)）
    *  文件链接（xlsx 等）额外带 download 属性保持真实文件名 */
+  /** v2.0.7 资产索引缓存：listAssets + byName 映射，避免每 tick 每篇文档重跑 SQL 与映射构建。
+   *  失效条件：state 变化（切库/锁定）、资产数量变化、30 秒 TTL、或显式 invalidateAssetIndex()。 */
+  getAssetIndex() {
+    try {
+      if (!this.state || !this.state.db)
+        return null;
+      const now = Date.now();
+      if (this._ai && this._ai.state === this.state && now - this._ai.at < 30000)
+        return this._ai;
+      const all = core.listAssets(this.state.db) || [];
+      if (!all.length)
+        return null;
+      const byName = {};
+      for (const a of all) {
+        if (!a || !a.asset_path)
+          continue;
+        byName[a.asset_path] = a;
+        let dec = null;
+        try {
+          dec = decodeURIComponent(a.asset_path);
+        } catch (e) {
+          dec = a.asset_path.replace(/%20/g, " ");
+        }
+        if (dec !== a.asset_path)
+          byName[dec] = a;
+        if (/^[0-9a-f]{32}_/i.test(a.asset_path)) {
+          const sm = /^(.*)-(\d{14})-[a-z0-9]+(\.[A-Za-z0-9]+)?$/i.exec(a.asset_path);
+          if (sm && /^[0-9a-f]{32}_/i.test(sm[1])) {
+            byName[sm[1] + (sm[3] || "")] = a;
+            byName[sm[1]] = a;
+          }
+        }
+      }
+      this._ai = { state: this.state, all, byName, at: now };
+      return this._ai;
+    } catch (e) {
+      return null;
+    }
+  }
+  /** v2.0.7 显式失效资产索引缓存（资产增删改后调用） */
+  invalidateAssetIndex() {
+    this._ai = null;
+  }
   async injectDocAssets(docId) {
     // v1.6.19 诊断：一律记录到文件日志（不依赖截图），红框必现
     const diag = { watchlist: false, protyle: false, assets: 0, els: 0, matched: 0, ok: 0, fail: "", samples: [], skipInjected: 0, streamFail: 0, err: "" };
@@ -7417,8 +7460,16 @@ var EdbPlugin = class extends Plugin {
     // 原实现仅按当前 docId 过滤 getAssetsByDoc → 跨文档引用的资产查不到 → 不注入 → 图片/动态图不显示。
     // asset_path 全局唯一，全库索引覆盖即正确；diag.assets 仍保留"当前文档名下资产数"语义。
     let allAssets = [];
+    let byName = null;
     try {
-      allAssets = core.listAssets(this.state.db) || [];
+      /* v2.0.7 走缓存索引（省掉每 tick 的 SQL + 映射构建） */
+      const idx = this.getAssetIndex();
+      if (idx) {
+        allAssets = idx.all;
+        byName = idx.byName;
+      } else {
+        allAssets = core.listAssets(this.state.db) || [];
+      }
     } catch (e) {
       // v1.6.31: listAssets 偶发抛错（如状态切换瞬间 db 句柄短暂不可用）时，若静默置空
       // 会让本轮 byName 索引为空 → matched=0 → 正在播放/显示的资产下一轮被误判失败。
@@ -7436,7 +7487,9 @@ var EdbPlugin = class extends Plugin {
     // 生成短名键：思源"同名冲突"资产真实文件名形如 <hash>_<n>-<时间戳>-<随机>.ext，
     // 前端渲染/DOM src 只暴露资源短名 <hash>_<n>[.ext]（无时间戳后缀），库内 asset_path 却是完整名。
     // 只为 hash 风格名生成短名键（避免 1.gif 这类普通短名互相覆盖造成误匹配）。
-    const byName = {};
+    /* v2.0.7 若已从缓存拿到 byName，跳过重建（这是原来的 2.75ms/次开销） */
+    if (!byName) {
+    byName = {};
     for (const a of allAssets) {
       if (!a || !a.asset_path)
         continue;
@@ -7461,6 +7514,7 @@ var EdbPlugin = class extends Plugin {
           byName[sm[1]] = a;
         }
       }
+    }
     }
     let els = [];
     try {
@@ -7574,12 +7628,44 @@ var EdbPlugin = class extends Plugin {
         if (isBig) {
           const base = await this.ensureStreamServer();
           if (!base) {
+            /* v2.0.8 流式服务不可用时回退为整块读取（宁可慢，也不能不显示） */
             diag.streamFail = (diag.streamFail || 0) + 1;
+            try {
+              const bytes2 = await core.readAsset(this.cfg.dbPath, this.state, realName);
+              let blob2 = null;
+              try {
+                blob2 = new Blob([new Uint8Array(bytes2)], { type: mime });
+                url = URL.createObjectURL(blob2);
+              } catch (e5) {
+                url = "data:" + mime + ";base64," + Buffer.from(bytes2).toString("base64");
+              }
+              (this._blobUrls = this._blobUrls || {})[realName] = url;
+              (this._blobSize = this._blobSize || {})[realName] = Number(a.size);
+              diag.ok++;
+            } catch (e6) {
+              diag.fail = (e6 && e6.message) || String(e6);
+              continue;
+            }
+          } else {
+            url = base + encodeURIComponent(realName);
+            diag.ok++;
+          }
+        } else {
+          /* v2.0.7 性能：若该资产已注入过且尺寸未变，直接复用内存中的 blob URL，
+             省掉「从 6.2GB 库读盘 + AES 解密 + 重建 Blob」的重复劳动。
+             SiYuan 资产名带时间戳，同名换内容实际不可能；仍用 size 做二次校验。 */
+          const _cachedUrl = this._blobUrls ? this._blobUrls[realName] : null;
+          const _cachedSize = this._blobSize ? this._blobSize[realName] : undefined;
+          if (_cachedUrl && _cachedSize === Number(a.size)) {
+            url = _cachedUrl;
+            diag.ok++;
+            el.setAttribute(attr, url);
+            if (el.dataset) {
+              el.dataset.edbInjected = "1";
+              el.dataset.edbAsset = realName;
+            }
             continue;
           }
-          url = base + encodeURIComponent(realName);
-          diag.ok++;
-        } else {
           let bytes = null;
           try {
             bytes = await core.readAsset(this.cfg.dbPath, this.state, realName);
@@ -7608,6 +7694,7 @@ var EdbPlugin = class extends Plugin {
               url = "data:" + mime + ";base64," + Buffer.from(bytes).toString("base64");
             }
             (this._blobUrls = this._blobUrls || {})[realName] = url;
+            (this._blobSize = this._blobSize || {})[realName] = Number(a.size);
           }
         }
         el.setAttribute(attr, url);
@@ -7639,6 +7726,13 @@ var EdbPlugin = class extends Plugin {
   /** v1.6.19 注入诊断写入文件日志（storage/petal/siyuan-edb/inject-diag.log，只留最近 200 行） */
   writeInjectDiag(docId, diag) {
     try {
+      /* v2.0.7 性能：此函数原本【每个 tick、每篇文档】都读写整个日志文件（即使全成功）。
+         改为：异常必写；正常成功最多 60 秒写一次 → 消除常态磁盘 I/O。 */
+      const _isProblem = !!diag.err || (Number(diag.matched) > 0 && (Number(diag.ok) + Number(diag.skipInjected || 0)) < Number(diag.matched));
+      const _now = Date.now();
+      if (!_isProblem && _now - (this._diagAt || 0) < 60000)
+        return;
+      this._diagAt = _now;
       let dir = this.storagePath || "";
       if (!dir && this._dataDir)
         dir = path.join(this._dataDir, "storage", "petal", "siyuan-edb");
@@ -8666,6 +8760,11 @@ var EdbPlugin = class extends Plugin {
   }
   /** v1.6.45: 从密库同步加密资产名缓存（供"丢失的资源文件"隐藏，未解锁也可用上次缓存） */
   async syncEncryptedAssetCache() {
+    /* v2.0.7 资产缓存刷新后索引也要失效 */
+    try {
+      this.invalidateAssetIndex();
+    } catch (e) {
+    }
     try {
       if (!this.state || !this.state.db || !this.isUnlocked())
         return;
@@ -10001,6 +10100,8 @@ var EdbPlugin = class extends Plugin {
         this.rememberDocBox(docId, info.notebook_id);
       const changed = await this.syncDocAssets(docId, info.markdown);
       this.cfg.lastSyncAt = Date.now();
+      /* v2.0.7 资产索引可能已变化（同步写入新资产）→ 失效缓存 */
+      this.invalidateAssetIndex();
       await this.saveConfig();
       this.pendingSync = false;
       this.refreshPanel();
@@ -10613,6 +10714,11 @@ var EdbPlugin = class extends Plugin {
     return { added, scanned, docsWithSub };
   }
   async removeFromVault(docId) {
+    /* v2.0.7 移出会改动资产归属/回收站 → 失效索引缓存 */
+    try {
+      this.invalidateAssetIndex();
+    } catch (e) {
+    }
     /* v1.6.70 文档分支视为整体：移出父文档时把已入库的子文档一并移出（避免子文档残留在库里被隐藏、无法管理） */
     const box = await this.boxOfDoc(docId);
     let subs = [];
@@ -12768,7 +12874,7 @@ var EdbPlugin = class extends Plugin {
   /** 当前插件版本（与 plugin.json 同步，发布时手工更新） */
   curVersion() {
     /* v1.6.63 必须与 plugin.json 的 version 保持一致（每次发版两处同步改） */
-    return "2.0.6";
+    return "2.0.8";
   }
   versionAtLeast(latest, cur) {
     const p = (s) => String(s || "").split(".").map((x) => parseInt(x, 10) || 0);
@@ -13589,6 +13695,11 @@ var EdbPlugin = class extends Plugin {
         restoreBtn.addEventListener("click", async () => {
           try {
             core.restoreAsset(this.state.db, it.asset_path);
+      /* v2.0.7 回收站恢复改变资产可见性 → 失效索引 */
+      try {
+        this.invalidateAssetIndex();
+      } catch (e2) {
+      }
             this.flushVault();
             render();
             showMessage(this.t("trashRestored"));

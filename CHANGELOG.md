@@ -1,5 +1,36 @@
 # Changelog
 
+## v1.9.2 (2026-10-24) — 🔴 修 U9 小锁真正根因 + 恢复密钥默认自动生成
+
+### 🔒 小锁不显示：根因是**逻辑 bug**，不是选择器
+连续两版都在调 CSS 选择器，方向错了。真正的问题在 `rebuildHideCss()`：
+
+```js
+if (!activeUnlocked)                                  // ← 只有"锁定"时才填充
+  for (const d of wl) curDocs.push(d);
+...
+if (activeUnlocked && curDocs.length) { ... }         // ← 解锁时 curDocs 恒为空！
+```
+
+**解锁状态下 `curDocs` 永远是空数组**，所以标记 CSS 从未被生成——再怎么改选择器也没用。
+
+**修复**：彻底放弃"用 CSS 选择器猜 DOM 层级"的思路，改为 **JS 打标记**：
+- 新增 `markInVaultTree()`：扫描 `.b3-list-item[data-node-id]`，若 id 属于当前库 `watchlist`（且不在排除表）→ 给它的 `.b3-list-item__text` 加 class `edb-in-vault`
+- CSS 只需一条：`.b3-list-item__text.edb-in-vault::after{content:" 🔒"}`
+- 锁定 / 卸载时清除所有 `edb-in-vault`
+- **绝不碰 `.protyle`**（只扫 `.b3-list-item`），不插节点、不改布局、不影响点击
+
+> 教训：CSS 选择器方案对第三方 DOM 结构太脆弱，能用 JS 精确定位的就不要靠选择器猜。
+
+### 🔑 新建密库不生成恢复密钥文件
+根因：恢复密钥必须用户**手动点**「生成恢复密钥」按钮，不点则 `recWords = null`：
+- 库没有备用钥匙 → 忘记密码即永久锁死
+- 也不落盘任何密钥文件
+
+**且 `recWords` 必须参与 `createVault` 派生 MK**，事后补生成无效——所以必须建库前就生成好。
+
+**修复**：密码对话框一打开就**自动生成**恢复密钥并显示；按钮改为「重新生成恢复密钥」。
+
 ## v1.9.1 (2026-10-24) — 修复 U9 小锁不显示 + 🔴 多库恢复密钥互相覆盖
 
 ### 🔒 修复：文档树"已入库"小锁不显示

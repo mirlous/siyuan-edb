@@ -6986,6 +6986,11 @@ var EdbPlugin = class extends Plugin {
     try {
       if (document.body)
         document.body.classList.remove("edb-mask-doc");
+      /* v1.9.2 清掉文档树里的小锁标记 */
+      try {
+        document.querySelectorAll(".edb-in-vault").forEach((el) => el.classList.remove("edb-in-vault"));
+      } catch (e) {
+      }
     } catch (e) {
     }
     try {
@@ -8281,6 +8286,8 @@ var EdbPlugin = class extends Plugin {
         if (want !== null && el.style.display !== want)
           el.style.display = want;
       });
+      /* v1.9.2 U9 给文档树里已入库的文档加小锁标记 */
+      this.markInVaultTree();
       /* v1.6.45: 隐藏 设置→资源→丢失的资源文件 中的密库加密资产条目（防泄露库内文件名） */
       this.hideLostAssets();
       /* v1.6.45: 密库已打开时每 60 秒刷新一次资产名缓存（未解锁也能用上次缓存隐藏） */
@@ -8694,28 +8701,9 @@ var EdbPlugin = class extends Plugin {
           css += psel("::after") + "{content:\"\u{1F512} \u5BC6\u5E93\u5DF2\u9501\u5B9A\uFF0C\u8BF7\u5148\u89E3\u9501\uFF08\u70B9\u9876\u90E8\u5BC6\u5E93\u56FE\u6807\u89E3\u9501\uFF09\";position:absolute;inset:0;display:flex;align-items:center;justify-content:center;background:rgba(40,40,40,.45);color:#fff;font-size:18px;z-index:2147483000;backdrop-filter:blur(2px);pointer-events:none;}\n";
         }
       }
-      /* v1.9.0 U9 已入库标记：解锁状态下，在文档树里给"已入库文档"标题后加一个小锁。
-         严格限定：①只用文件树/大纲容器 ②排除 .protyle ③用 ::after 伪元素 + content，
-         不改布局、不插元素、不影响点击。锁定时该规则不生成（树上本来就隐藏了）。 */
-      if (activeUnlocked && curDocs.length) {
-        /* v1.9.1 修正：不再强依赖 .sy__file 容器（不同布局/虚拟滚动下可能失配）。
-           改为三种安全写法并列，任一命中即可显示小锁：
-             ① 文档树项直接挂标记（项元素带 data-node-id 且是 .b3-list-item）
-             ② 项内标题元素后追加（item 内含 .b3-list-item__text 的常见结构）
-             ③ 大纲项同理
-           全部带 :not(.protyle) / .b3-list-item 限定，绝不裸用 [data-node-id]。 */
-        const markSel = (ids) => ids.filter(Boolean).map((x) => {
-          const id = String(x).replace(/"/g, "");
-          return [
-            ".b3-list-item[data-node-id=\"" + id + "\"]::after",
-            "[data-node-id=\"" + id + "\"]:not(.protyle):not(.protyle-wysiwyg) .b3-list-item__text::after",
-            ".sy__file [data-node-id=\"" + id + "\"]:not(.protyle) .b3-list-item__text::after",
-            ".sy__outline [data-node-id=\"" + id + "\"]:not(.protyle) .b3-list-item__text::after",
-          ].join(",");
-        }).join(",");
-        if (markSel(curDocs))
-          css += markSel(curDocs) + "{content:\" \u{1F512}\";font-size:11px;opacity:.6;margin-left:4px;}\n";
-      }
+      /* v1.9.2 U9 已入库小锁：CSS 只定义"有 .edb-in-vault 类时显示锁"，
+         具体给哪个元素加类由 markInVaultTree() 用 JS 精确处理（不猜 DOM 层级）。 */
+      css += ".b3-list-item__text.edb-in-vault::after{content:\" \u{1F512}\";font-size:11px;opacity:.6;margin-left:4px;}\n";
       /* 隐藏被锁文档/笔记本里的正文元素（防"点进去看到内容"）——由 JS 遮罩兜底，这里只管树 */
       if (st.textContent !== css)
         st.textContent = css;
@@ -10934,6 +10922,68 @@ var EdbPlugin = class extends Plugin {
       return { ok: false, level: "warn", msg: "\u5907\u4EFD\u68C0\u6D4B\u5931\u8D25", lastAt: 0, lastSize: 0, vaultSize: 0 };
     }
   }
+  /** v1.9.2 U9 文档树"已入库"标记：用 JS 给文档树项加 .edb-in-vault 类。
+   *  不依赖 DOM 层级猜测；只扫 .b3-list-item（绝不碰 .protyle）；锁定时移除所有标记。 */
+  markInVaultTree() {
+    try {
+      if (!this.cfg)
+        return;
+      const unlocked = this.isUnlocked();
+      const wl = new Set(this.cfg.watchlist || []);
+      const excl = new Set(this.cfg.excludedDocs || []);
+      /* 其它库的文档也标记（提示"属于另一个库"） */
+      const activeV = Number(this.cfg.activeVault) || 0;
+      const others = new Set();
+      (this.cfg.vaults || []).forEach((v, i) => {
+        if (v && i !== activeV)
+          (v.watchlist || []).forEach((d) => others.add(d));
+      });
+      const items = document.querySelectorAll(".b3-list-item[data-node-id]");
+      for (const el of items) {
+        const id = el.getAttribute("data-node-id");
+        if (!id)
+          continue;
+        const should = unlocked && ((wl.has(id) && !excl.has(id)) || others.has(id));
+        /* 优先标记标题元素（锁紧跟在标题后，且不会出现两个锁） */
+        let target = null;
+        try {
+          target = el.querySelector(".b3-list-item__text");
+        } catch (e) {
+        }
+        if (!target)
+          target = el;
+        const has = target.classList && target.classList.contains("edb-in-vault");
+        if (should && !has) {
+          try {
+            target.classList.add("edb-in-vault");
+          } catch (e) {
+          }
+        } else if (!should && has) {
+          try {
+            target.classList.remove("edb-in-vault");
+          } catch (e) {
+          }
+        }
+        /* 清理可能残留在 li 上的旧标记 */
+        if (el.classList && el.classList.contains("edb-in-vault") && target !== el) {
+          try {
+            el.classList.remove("edb-in-vault");
+          } catch (e) {
+          }
+        }
+      }
+      /* 锁定状态下把所有残留标记清掉（含 class 加在别处的历史残留） */
+      if (!unlocked) {
+        document.querySelectorAll(".edb-in-vault").forEach((el) => {
+          try {
+            el.classList.remove("edb-in-vault");
+          } catch (e) {
+          }
+        });
+      }
+    } catch (e) {
+    }
+  }
   /** v1.9.0 U7 首次使用向导：新用户装上后不知道从哪开始，首次加载弹一次三步引导。
    *  纯前端弹窗，不碰加密/同步逻辑；可勾"不再提示"（写入 cfg.guideDone）。 */
   maybeShowGuide() {
@@ -12595,7 +12645,7 @@ var EdbPlugin = class extends Plugin {
   /** 当前插件版本（与 plugin.json 同步，发布时手工更新） */
   curVersion() {
     /* v1.6.63 必须与 plugin.json 的 version 保持一致（每次发版两处同步改） */
-    return "1.9.1";
+    return "1.9.2";
   }
   versionAtLeast(latest, cur) {
     const p = (s) => String(s || "").split(".").map((x) => parseInt(x, 10) || 0);
@@ -16548,12 +16598,24 @@ var EdbPlugin = class extends Plugin {
       recBtnRow.appendChild(recGen);
       recBtnRow.appendChild(recWordsBox);
       box.appendChild(recBtnRow);
+      /* v1.9.2 恢复密钥改为【默认自动生成】：
+         此前不点按钮则 recWords=null → 库没有备用钥匙、也不落盘任何密钥文件，
+         用户忘记密码就永久锁死。且 recWords 必须参与 createVault 派生 MK，
+         事后补生成无效，所以必须在对话框打开时就生成好。 */
       let recWords = null;
-      recGen.addEventListener("click", () => {
-        recWords = core.genRecoveryWords();
-        recWordsBox.textContent = recWords;
-        showMessage(this.t("recWordsTip") || "\u8BF7\u6284\u5199\u4FDD\u5B58\u8FD9 12 \u4E2A\u8BCD\uFF1B\u5FD8\u8BB0\u5BC6\u7801\u65F6\u53EF\u51ED\u5B83\u89E3\u9501\u5E76\u91CD\u8BBE\u5BC6\u7801");
-      });
+      const genWords = (notify) => {
+        try {
+          recWords = core.genRecoveryWords();
+          recWordsBox.textContent = recWords;
+          if (notify)
+            showMessage(this.t("recWordsTip") || "\u8BF7\u6284\u5199\u4FDD\u5B58\u8FD9 12 \u4E2A\u8BCD\uFF1B\u5FD8\u8BB0\u5BC6\u7801\u65F6\u53EF\u51ED\u5B83\u89E3\u9501\u5E76\u91CD\u8BBE\u5BC6\u7801");
+        } catch (e) {
+          recWords = null;
+        }
+      };
+      genWords(false); /* 打开对话框即自动生成 */
+      recGen.textContent = this.t("recRegen") || "\u91CD\u65B0\u751F\u6210\u6062\u590D\u5BC6\u94A5";
+      recGen.addEventListener("click", () => genWords(true));
       const btnRow = document.createElement("div");
       btnRow.style.cssText = "display:flex;gap:8px;";
       const ok = document.createElement("button");

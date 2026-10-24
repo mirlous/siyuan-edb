@@ -6484,6 +6484,10 @@ var VIEWER_HTML = `<!DOCTYPE html>
 </body>
 </html>`;
 var FALLBACK = {
+  /* v1.8.0 U4 一键锁定 */
+  lockNow: "\u7ACB\u5373\u9501\u5B9A\u5BC6\u5E93",
+  lockSuccess: "\u5BC6\u5E93\u5DF2\u9501\u5B9A",
+  alreadyLocked: "\u5BC6\u5E93\u5DF2\u9501\u5B9A",
   menuAdd: "\u52A0\u5165\u5BC6\u5E93",
   menuRemove: "\u79FB\u51FA\u5BC6\u5E93",
   nbAdd: "\u6574\u672C\u52A0\u5165\u5BC6\u5E93",
@@ -6881,6 +6885,22 @@ var EdbPlugin = class extends Plugin {
         }
       }
     });
+    /* v1.8.0 U4 顶栏图标右键 = 立即锁定（不用打开面板） */
+    try {
+      const _tb = this.topBarElement;
+      if (_tb) {
+        _tb.addEventListener("contextmenu", (ev) => {
+          ev.preventDefault();
+          ev.stopPropagation();
+          if (this.isUnlocked())
+            this.quickLock();
+          else
+            showMessage(this.t("alreadyLocked") || "密库已锁定");
+        });
+        _tb.title = (this.t("panelTitle") || "密库") + "（右键立即锁定）";
+      }
+    } catch (e) {
+    }
     this.addCommand({
       langKey: "openPanel",
       langText: this.t("openPanel"),
@@ -6920,6 +6940,13 @@ var EdbPlugin = class extends Plugin {
         if (id)
           this.removeFromVault(id);
       }
+    });
+    /* v1.8.0 U4 一键锁定：命令面板可搜到，用户可自行绑定快捷键（离开座位前一键锁库） */
+    this.addCommand({
+      langKey: "lockNow",
+      langText: this.t("lockNow") || "立即锁定密库",
+      hotkey: "",
+      callback: () => this.quickLock()
     });
     this.buildPanel();
     this.addDock({
@@ -8935,6 +8962,13 @@ var EdbPlugin = class extends Plugin {
       this.applyNotebookVisibility();
       return { added: 0, total: totalFound, allIn: true };
     }
+    /* v1.8.0 U6 整本加入前确认（笔记本可能几百篇/几 GB，误点会很惨） */
+    try {
+      const _okNb = await this.confirmVaultJoin("notebook", ids);
+      if (!_okNb)
+        return { added: 0, total: totalFound, canceled: true };
+    } catch (e) {
+    }
     this.cfg.watchlist = this.cfg.watchlist.concat(ids);
     /* v1.6.45: 重新加入 → 从移出黑名单移除（黑名单为独立持久化字段，防库记录残留时自动回库） */
     this.cfg.excludedDocs = (this.cfg.excludedDocs || []).filter((x) => !ids.includes(x));
@@ -10080,6 +10114,21 @@ var EdbPlugin = class extends Plugin {
           return;
       }
       const box = await this.boxOfDoc(docId);
+      /* v1.8.0 U6 加入前确认（大文档/大附件时提示规模与耗时，用户可取消） */
+      let _preSubs = [];
+      if (this.cfg.includeSubDocs !== false && box) {
+        try {
+          _preSubs = await this.listSubDocIds(box, docId);
+        } catch (e) {
+          _preSubs = [];
+        }
+      }
+      try {
+        const _okJoin = await this.confirmVaultJoin("doc", [docId].concat(_preSubs));
+        if (!_okJoin)
+          return;
+      } catch (e) {
+      }
       let added = 0;
       if (!this.cfg.watchlist.includes(docId)) {
         this.cfg.watchlist.push(docId);
@@ -10092,7 +10141,7 @@ var EdbPlugin = class extends Plugin {
       /* v1.6.70 连同子文档树一起加入（文档分支视为整体；此前只加父文档 → 子文档仍是明文且显示在树上） */
       let subAdded = 0;
       if (this.cfg.includeSubDocs !== false && box) {
-        const subs = await this.listSubDocIds(box, docId);
+        const subs = _preSubs.length ? _preSubs : await this.listSubDocIds(box, docId);
         for (const sid of subs) {
           if (!this.cfg.watchlist.includes(sid)) {
             this.cfg.watchlist.push(sid);
@@ -10792,6 +10841,162 @@ var EdbPlugin = class extends Plugin {
     } catch (e) {
     }
   }
+  /** v1.8.0 U6 估算"即将加入密库"的规模：文档数 + 附件总体积（只 stat，不解密，很快） */
+  async assessVaultSize(docIds) {
+    const out = { docs: 0, assets: 0, bytes: 0, missing: 0 };
+    try {
+      const dataDir = await this.wsDataDir();
+      if (!dataDir)
+        return out;
+      const adir = path.join(dataDir, "assets");
+      const seenAsset = new Set();
+      const ids = [...new Set(docIds || [])];
+      out.docs = ids.length;
+      for (const docId of ids) {
+        let syPath = null;
+        try {
+          syPath = await this.findDocSyPath(docId, dataDir);
+        } catch (e) {
+        }
+        if (!syPath) {
+          try {
+            syPath = await this.findDocSyPathGlobal(docId, dataDir, this._syCache);
+          } catch (e) {
+          }
+        }
+        if (!syPath) {
+          out.missing++;
+          continue;
+        }
+        let raw = "";
+        try {
+          raw = fs.readFileSync(syPath, "utf8");
+        } catch (e) {
+          continue;
+        }
+        const re = /(?:data\/)?assets\/([^"'()<>\\]+)/g;
+        let m;
+        while ((m = re.exec(raw)) !== null) {
+          const nm = m[1].replace(/[?#].*$/, "");
+          if (!nm || /^\.\.?\//.test(nm) || seenAsset.has(nm))
+            continue;
+          seenAsset.add(nm);
+          try {
+            const st = fs.statSync(path.join(adir, nm));
+            if (st.isFile()) {
+              out.assets++;
+              out.bytes += st.size;
+            }
+          } catch (e) {
+          }
+        }
+      }
+    } catch (e) {
+      console.error("[siyuan-edb] assessVaultSize", e);
+    }
+    return out;
+  }
+  /** v1.8.0 U6 加入前确认：>5 篇 或 >200MB 时弹窗告知规模与耗时；用户可取消 */
+  async confirmVaultJoin(kind, docIds, extraText) {
+    try {
+      const r = await this.assessVaultSize(docIds);
+      const big = r.docs > 5 || r.bytes > 200 * 1024 * 1024;
+      if (!big)
+        return true; /* 小批量：不打扰，直接进 */
+      /* v1.8.0 实测：加密吞吐约 30~60 MB/s（受磁盘 IO 影响），按 40MB/s 估，
+         并给出"约 X 秒/分钟"更贴近实际感受（此前 8MB/s 会把 2.5GB 估成 320 分钟，吓退用户） */
+      const sec = Math.ceil(r.bytes / (40 * 1024 * 1024));
+      const minTxt = sec < 60 ? (Math.max(5, sec) + " \u79D2") : (Math.ceil(sec / 60) + " \u5206\u949F");
+      const lines2 = [];
+      lines2.push(kind === "notebook" ? "将把整个笔记本加入密库：" : "将把该文档（含子文档）加入密库：");
+      lines2.push("");
+      lines2.push("\u2022 \u6587\u6863\uFF1A" + r.docs + " \u7BC7" + (r.missing ? "\uFF08" + r.missing + " \u7BC7\u5B9A\u4F4D\u4E0D\u5230\uFF0C\u5C06\u8DF3\u8FC7\uFF09" : ""));
+      lines2.push("\u2022 \u9644\u4EF6\uFF1A" + r.assets + " \u4E2A\uFF0C\u5171 " + this.fmtSize(r.bytes));
+      lines2.push("\u2022 \u9884\u8BA1\u8017\u65F6\uFF1A\u7EA6 " + minTxt + "\uFF08\u52A0\u5BC6\u671F\u95F4\u8BF7\u52FF\u5173\u95ED\u601D\u6E90\uFF09");
+      lines2.push("");
+      lines2.push("\u52A0\u5BC6\u5B8C\u6210\u540E\uFF0C\u8FD9\u4E9B\u6587\u6863\u7684\u9644\u4EF6\u660E\u6587\u5C06\u81EA\u52A8\u6E05\u7406\uFF08\u5E93\u5185\u4FDD\u7559\u5BC6\u6587\u526F\u672C\uFF09\u3002");
+      if (extraText)
+        lines2.push(extraText);
+      lines2.push("");
+      lines2.push("\u786E\u5B9A\u5F00\u59CB\uFF1F");
+      return await this.confirmBox(lines2.join("\n"));
+    } catch (e) {
+      return true; /* 估算失败不阻塞流程 */
+    }
+  }
+  /** v1.8.0 U4 一键锁定：命令/顶栏右键/快捷键统一入口。
+   *  锁定后把"已打开的密库文档标签页"一并关闭（U5），避免标签标题继续暴露文档名。 */
+  quickLock() {
+    try {
+      if (!this.isUnlocked()) {
+        showMessage(this.t("alreadyLocked") || "\u5BC6\u5E93\u5DF2\u9501\u5B9A");
+        return false;
+      }
+      /* U5 关闭已打开的密库文档标签页（先收集，再锁，避免锁后读不到 state） */
+      const ids = [];
+      try {
+        const wl = new Set(this.cfg.watchlist || []);
+        const excl = new Set(this.cfg.excludedDocs || []);
+        const activeV = Number(this.cfg.activeVault) || 0;
+        const others = new Set();
+        (this.cfg.vaults || []).forEach((v, i) => {
+          if (v && i !== activeV)
+            (v.watchlist || []).forEach((d) => others.add(d));
+        });
+        document.querySelectorAll(".protyle[data-node-id]").forEach((el) => {
+          const id = el.getAttribute("data-node-id");
+          if (!id)
+            return;
+          if ((wl.has(id) && !excl.has(id)) || others.has(id))
+            ids.push(id);
+        });
+      } catch (e) {
+      }
+      this.lockVault();
+      /* U5 关闭这些文档的标签页（失败静默，不影响锁定结果） */
+      let closedN = 0;
+      if (ids.length) {
+        try {
+          closedN = this.closeDocTabsByIds(ids);
+        } catch (e) {
+        }
+      }
+      showMessage("\u{1F512} " + (this.t("lockSuccess") || "\u5BC6\u5E93\u5DF2\u9501\u5B9A") + (closedN > 0 ? "\uFF08\u5DF2\u5173\u95ED " + closedN + " \u4E2A\u6807\u7B7E\u9875\uFF09" : ""));
+      return true;
+    } catch (e) {
+      console.error("[siyuan-edb] quickLock", e);
+      showMessage("\u9501\u5B9A\u5931\u8D25\uFF1A" + (e && e.message ? e.message : e));
+      return false;
+    }
+  }
+  /** v1.8.0 U5 关闭指定文档的标签页（通过思源 fileTree 的 DOM 关闭按钮点击，最稳） */
+  closeDocTabsByIds(ids) {
+    try {
+      if (!ids || !ids.length)
+        return 0;
+      const want = new Set(ids);
+      let closed = 0;
+      /* 标签栏：.layout-tab-bar .item[data-id] 或 [data-node-id] */
+      const tabs = document.querySelectorAll(".layout-tab-bar .item, .layout-tab-bar .item--focus");
+      for (const tab of tabs) {
+        const id = tab.getAttribute("data-id") || tab.getAttribute("data-node-id");
+        if (!id || !want.has(id))
+          continue;
+        const closeBtn = tab.querySelector(".item__close");
+        if (closeBtn) {
+          try {
+            closeBtn.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
+            closed++;
+          } catch (e) {
+          }
+        }
+      }
+      return closed;
+    } catch (e) {
+      return 0;
+    }
+  }
+
   lockVault() {
     if (this.syncTimer)
       clearTimeout(this.syncTimer);
@@ -11944,7 +12149,7 @@ var EdbPlugin = class extends Plugin {
   /** 当前插件版本（与 plugin.json 同步，发布时手工更新） */
   curVersion() {
     /* v1.6.63 必须与 plugin.json 的 version 保持一致（每次发版两处同步改） */
-    return "1.7.10";
+    return "1.8.0";
   }
   versionAtLeast(latest, cur) {
     const p = (s) => String(s || "").split(".").map((x) => parseInt(x, 10) || 0);

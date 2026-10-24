@@ -4537,7 +4537,14 @@ var require_core = __commonJS({
         return { ok: false, reason: "no-recovery" };
       const mk = deriveKey(normalizeRecoveryWords(words), h.rec.salt, h.iters, h.kdf);
       try {
-        aesDecrypt(mk, h.rec.iv, h.rec.tag, Buffer.alloc(0));
+        /* v1.9.4 BUG 修复：rec.tag 存于 128 字节头部末尾，16 字节会溢出 1 字节被截断成 15。
+           必须按【实际 tag 长度】设置 authTagLength，否则 GCM 校验必然失败 →
+           恢复密钥永远打不开库。GCM 允许 12~16 字节 tag，这里按实际长度修正。 */
+        const tagLen = Math.max(12, Math.min(16, h.rec.tag ? h.rec.tag.length : 16));
+        const d0 = crypto3.createDecipheriv("aes-256-gcm", mk, h.rec.iv, { authTagLength: tagLen });
+        d0.setAuthTag(h.rec.tag);
+        d0.update(Buffer.alloc(0));
+        d0.final();
         return { ok: true, mk };
       } catch (e) {
         return { ok: false, reason: "bad-words" };
@@ -12663,7 +12670,7 @@ var EdbPlugin = class extends Plugin {
   /** 当前插件版本（与 plugin.json 同步，发布时手工更新） */
   curVersion() {
     /* v1.6.63 必须与 plugin.json 的 version 保持一致（每次发版两处同步改） */
-    return "1.9.3";
+    return "1.9.4";
   }
   versionAtLeast(latest, cur) {
     const p = (s) => String(s || "").split(".").map((x) => parseInt(x, 10) || 0);
@@ -15525,15 +15532,40 @@ var EdbPlugin = class extends Plugin {
   async createVaultAndActivate(newPath, name) {
     if (!newPath)
       throw new Error("\u8DEF\u5F84\u4E0D\u80FD\u4E3A\u7A7A");
-    const pwd = this.isUnlocked() && this.state ? this.state.password || "" : "";
-    const hint = this.state && this.state.hint ? this.state.hint : "";
-    /* v1.9.3 新库默认生成恢复密钥（必须参与 createVault 派生 MK，事后补无效） */
+    /* v1.9.4 BUG 修复：原逻辑 `pwd = 已解锁 ? 当前库密码 : ""`
+       —— 锁定时 pwd 为空 → 既不生成恢复密钥，还会静默创建"无密码库"（用户以为有保护）。
+       现在：已解锁且当前库有密码 → 继承；否则弹出建库密码对话框让用户设置。 */
+    let pwd = "";
+    let hint = "";
     let recWords = null;
-    try {
-      if (pwd)
+    if (this.isUnlocked() && this.state && this.state.password) {
+      pwd = this.state.password;
+      hint = this.state.hint || "";
+      try {
         recWords = core.genRecoveryWords();
-    } catch (e) {
-      recWords = null;
+      } catch (e) {
+        recWords = null;
+      }
+    } else {
+      /* 未解锁 / 当前库无密码 → 让用户为新库设置密码（对话框默认已生成恢复密钥） */
+      const r = await this.promptNewPassword("", "\u65B0\u5EFA\u5BC6\u5E93");
+      if (!r)
+        return false; /* 用户取消 */
+      pwd = r.pwd || "";
+      hint = r.hint || "";
+      recWords = r.recWords || null;
+      if (!recWords) {
+        try {
+          recWords = core.genRecoveryWords();
+        } catch (e) {
+          recWords = null;
+        }
+      }
+      if (!pwd) {
+        const goOn = await this.confirmBox("\u26A0\uFE0F \u5BC6\u7801\u4E3A\u7A7A\uFF1A\u8BE5\u5E93\u5C06\u4E0D\u9700\u5BC6\u7801\u5373\u53EF\u6253\u5F00\uFF08\u65E0\u6CD5\u9632\u6B62\u4ED6\u4EBA\u67E5\u770B\uFF09\u3002\n\u786E\u5B9A\u7EE7\u7EED\u5417\uFF1F");
+        if (!goOn)
+          return false;
+      }
     }
     const st = await core.createVault(newPath, pwd, this.wasmPath(), WASM_B64, hint, recWords, true);
     this.cfg.vaults.push({ name: name || "\u65B0\u5E93", path: newPath, watchlist: [] });

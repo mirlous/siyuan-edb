@@ -6773,10 +6773,9 @@ var EdbPlugin = class extends Plugin {
       maxSeenSavedAt: 0,
       /* v1.6.53 单篇独立加密：docId → {salt, hash}（整库解锁后仍需本篇独立密码） */
       docLocks: {},
-      /* v2.0.9 匿名使用统计（默认开启，用户可在设置里关闭）
+      /* v2.0.9 匿名使用统计（内部机制，恒定开启，不在用户界面出现）
          只上报：设备标识 / 版本 / 文档数 / 库大小 / 资产数 / 平台 / 档位
          绝不上报：文档标题、正文、路径、库文件名 */
-      usageStats: true,
       usageLastAt: 0,
     };
     this.state = null;
@@ -7212,8 +7211,7 @@ var EdbPlugin = class extends Plugin {
    *  服务端用途：统计免费版用户量、版本分布、文档数分布（指导定价与运营）。 */
   async reportUsage(reason) {
     try {
-      if (!this.cfg || this.cfg.usageStats === false)
-        return false;
+      /* v2.1.2 匿名使用统计为内部机制（恒定开启，不在用户界面出现任何提示） */
       const base = String(this.edbOnlineUrl() || "").replace(/\/+$/, "").replace(/\/api\.php$/i, "");
       if (!base)
         return false;
@@ -7262,7 +7260,7 @@ var EdbPlugin = class extends Plugin {
       this.cfg.usageLastAt = Date.now();
       this.saveConfig().catch(() => {
       });
-      console.log("[siyuan-edb] 匿名使用统计已上报（" + reason + "）");
+      console.log("[siyuan-edb] 心跳已上报（" + reason + "）");
       return true;
     } catch (e) {
       /* 统计失败完全静默，绝不影响用户使用 */
@@ -7272,8 +7270,6 @@ var EdbPlugin = class extends Plugin {
   /** v2.0.9 启动时安排统计上报：首次 30 秒后，之后每 24 小时一次 */
   scheduleUsageReport() {
     try {
-      if (!this.cfg || this.cfg.usageStats === false)
-        return;
       if (!this.edbOnlineUrl())
         return;
       const last = Number(this.cfg.usageLastAt) || 0;
@@ -13209,7 +13205,7 @@ var EdbPlugin = class extends Plugin {
   /** 当前插件版本（与 plugin.json 同步，发布时手工更新） */
   curVersion() {
     /* v1.6.63 必须与 plugin.json 的 version 保持一致（每次发版两处同步改） */
-    return "2.1.1";
+    return "2.1.2";
   }
   versionAtLeast(latest, cur) {
     const p = (s) => String(s || "").split(".").map((x) => parseInt(x, 10) || 0);
@@ -13657,33 +13653,6 @@ var EdbPlugin = class extends Plugin {
           showMessage("\u5DF2\u6E05\u7406 " + n + " \u7BC7\u672A\u52A0\u5165\u6B8B\u7559\u6587\u6863\uFF08\u5DF2\u81EA\u52A8\u5907\u4EFD\uFF0C\u53EF\u91CD\u65B0\u52A0\u5165\u6062\u5FA9\uFF09");
       }));
     const secGrid = mkGroup(this.t("grpSec"));
-    /* v2.0.9 匿名使用统计开关（默认开；只上报数字，绝不含笔记内容） */
-    try {
-      const usRow = document.createElement("div");
-      usRow.style.cssText = "display:flex;flex-direction:column;gap:4px;padding:6px 0;";
-      const usLbl = document.createElement("label");
-      usLbl.style.cssText = "display:flex;align-items:center;gap:8px;cursor:pointer;font-size:13px;";
-      const usCk = document.createElement("input");
-      usCk.type = "checkbox";
-      usCk.checked = this.cfg.usageStats !== false;
-      usLbl.appendChild(usCk);
-      usLbl.appendChild(document.createTextNode("\u{1F4CA} \u533F\u540D\u4F7F\u7528\u7EDF\u8BA1"));
-      const usTip = document.createElement("div");
-      usTip.style.cssText = "font-size:12px;color:#8590a6;line-height:1.6;padding-left:24px;";
-      usTip.textContent = "\u4EC5\u4E0A\u62A5\uFF1A\u8BBE\u5907\u6807\u8BC6 / \u63D2\u4EF6\u7248\u672C / \u6587\u6863\u6570\u91CF / \u5E93\u5927\u5C0F / \u8D44\u4EA7\u6570 / \u7CFB\u7EDF\u5E73\u53F0\u3002\n\u7EDD\u4E0D\u4E0A\u62A5\uFF1A\u6587\u6863\u6807\u9898\u3001\u6B63\u6587\u3001\u8DEF\u5F84\u3001\u5E93\u6587\u4EF6\u540D\u3002\u5173\u95ED\u540E\u5B8C\u5168\u4E0D\u53D1\u9001\u4EFB\u4F55\u6570\u636E\u3002";
-      usTip.style.whiteSpace = "pre-wrap";
-      usCk.addEventListener("change", async () => {
-        this.cfg.usageStats = !!usCk.checked;
-        await this.saveConfig();
-        showMessage(usCk.checked ? "\u5DF2\u5F00\u542F\u533F\u540D\u4F7F\u7528\u7EDF\u8BA1\uFF08\u4EC5\u4E0A\u62A5\u6570\u5B57\uFF09" : "\u5DF2\u5173\u95ED\u533F\u540D\u4F7F\u7528\u7EDF\u8BA1");
-        if (usCk.checked)
-          this.reportUsage("manual").catch(() => { });
-      });
-      usRow.appendChild(usLbl);
-      usRow.appendChild(usTip);
-      secGrid.appendChild(usRow);
-    } catch (e) {
-    }
     if (unlocked) {
       if (!this.noPwd)
         secGrid.appendChild(btn(this.t("lock"), () => this.lockVault()));

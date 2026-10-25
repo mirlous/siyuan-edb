@@ -5911,6 +5911,89 @@ var require_license = __commonJS({
       /* v2.1.1 统一从 EDB_PRICE_TABLE 取（云端下发时会覆盖） */
       return Number(EDB_PRICE_TABLE[t] || 0);
     }
+    /* ===== v2.1.9 指纹稳定化工具（全部向后兼容）===== */
+    /** 稳定机器标识：MachineGuid + 系统盘卷序列号（换网卡/开热点/切网络都不变） */
+    function fpMachineGuid() {
+      try {
+        const cp = require("child_process");
+        const out = cp.execSync('reg query "HKLM\\SOFTWARE\\Microsoft\\Cryptography" /v MachineGuid', { encoding: "utf8", timeout: 3000, windowsHide: true });
+        const m = String(out || "").match(/MachineGuid\s+REG_SZ\s+([0-9a-fA-F-]+)/);
+        return m ? m[1].toLowerCase() : "";
+      } catch (e) {
+        return "";
+      }
+    }
+    function fpVolumeSerial() {
+      try {
+        const cp = require("child_process");
+        const drv = process.env.SystemDrive || "C:";
+        const out = cp.execSync("cmd /c vol " + drv, { encoding: "utf8", timeout: 3000, windowsHide: true });
+        const m = String(out || "").match(/([0-9A-F]{4}-[0-9A-F]{4})/i);
+        return m ? m[1].toUpperCase() : "";
+      } catch (e) {
+        return "";
+      }
+    }
+    let _fpS = null;
+    /** 稳定指纹（v2）：与网卡完全无关。拿不到 MachineGuid 时返回 ""（调用方需容错） */
+    function fpStable() {
+      if (_fpS !== null)
+        return _fpS;
+      try {
+        const g = fpMachineGuid();
+        if (!g) {
+          _fpS = "";
+          return _fpS;
+        }
+        const h = crypto3.createHash("sha256").update("edb-fps:" + g + "|" + fpVolumeSerial()).digest("hex").slice(0, 16).toUpperCase();
+        _fpS = h.slice(0, 4) + "-" + h.slice(4, 8) + "-" + h.slice(8, 12) + "-" + h.slice(12, 16);
+      } catch (e) {
+        _fpS = "";
+      }
+      return _fpS;
+    }
+    /** 所有非内网 MAC（排序，避免顺序影响） */
+    function fpAllMacs() {
+      try {
+        const os = require("os");
+        const ifs = os.networkInterfaces() || {};
+        const out = [];
+        for (const k of Object.keys(ifs)) {
+          for (const i of ifs[k] || []) {
+            if (i && !i.internal && i.mac && i.mac !== "00:00:00:00:00:00" && out.indexOf(i.mac) < 0)
+              out.push(i.mac);
+          }
+        }
+        return out.sort();
+      } catch (e) {
+        return [];
+      }
+    }
+    /** 旧算法指纹（可指定 MAC；mac 为空表示"没有非内网 MAC"的情况） */
+    function fpLegacyWith(mac) {
+      try {
+        const os = require("os");
+        const parts = [os.hostname(), os.userInfo().username];
+        if (mac)
+          parts.push(mac);
+        parts.push(os.platform(), os.arch());
+        const h = crypto3.createHash("sha256").update(parts.join("|")).digest("hex").slice(0, 16).toUpperCase();
+        return h.slice(0, 4) + "-" + h.slice(4, 8) + "-" + h.slice(8, 12) + "-" + h.slice(12, 16);
+      } catch (e) {
+        return "";
+      }
+    }
+    /** 候选指纹列表：当前指纹 + 每个网卡的旧算法指纹 + 无 MAC 指纹 + 稳定指纹 */
+    function deviceFingerprintCandidates() {
+      const out = [];
+      const push = (v) => { const s = String(v || ""); if (s && out.indexOf(s) < 0) out.push(s); };
+      try { push(deviceFingerprint()); } catch (e) { }
+      for (const mac of fpAllMacs())
+        push(fpLegacyWith(mac));
+      push(fpLegacyWith(""));
+      push(fpStable());
+      return out;
+    }
     function deviceFingerprint() {
       const os = require("os");
       const parts = [os.hostname(), os.userInfo().username];
@@ -13286,7 +13369,7 @@ var EdbPlugin = class extends Plugin {
   /** 当前插件版本（与 plugin.json 同步，发布时手工更新） */
   curVersion() {
     /* v1.6.63 必须与 plugin.json 的 version 保持一致（每次发版两处同步改） */
-    return "2.1.8";
+    return "2.1.9";
   }
   versionAtLeast(latest, cur) {
     const p = (s) => String(s || "").split(".").map((x) => parseInt(x, 10) || 0);
@@ -16480,14 +16563,54 @@ var EdbPlugin = class extends Plugin {
           } catch (e) {
           }
         }
+        /* v2.1.9 绑定校验（向后兼容）：
+           旧逻辑 raw.fp !== 当前指纹 就判绑定不符 —— 但指纹含 MAC，
+           开热点/切网卡/插网线都会变 → 已付费用户被误锁。
+           新逻辑：当前指纹 或 任一网卡对应的旧指纹 或 稳定指纹 命中即通过。 */
         const fp = lic.deviceFingerprint();
-        if (authOk && raw.fp && raw.fp !== fp) {
-          this.cfg.bindMismatch = true;
-          try {
-            await this.saveConfig();
-          } catch (e) {
+        const fpS = (typeof lic.fpStable === "function") ? lic.fpStable() : "";
+        let boundOk = true;
+        if (authOk && raw.fp) {
+          boundOk = (raw.fp === fp);
+          if (!boundOk && typeof lic.deviceFingerprintCandidates === "function") {
+            try {
+              boundOk = lic.deviceFingerprintCandidates().indexOf(String(raw.fp)) >= 0;
+            } catch (e) {
+              boundOk = false;
+            }
           }
-          return;
+          /* 网卡全换掉时的兜底一：本机曾成功校验过同一稳定指纹 */
+          if (!boundOk && fpS && this.cfg.boundFpS && String(this.cfg.boundFpS) === fpS)
+            boundOk = true;
+          /* 兜底二（v2.1.9 一次性信任迁移）：老授权 + 本机从未记录过稳定指纹
+             → 网卡集合可能已彻底变化（如改开手机热点），候选指纹无法覆盖。
+             授权文件签名有效即信任本机一次，并记录稳定指纹；此后按稳定指纹严格校验。 */
+          if (!boundOk && fpS && !this.cfg.boundFpS)
+            boundOk = true;
+          if (!boundOk) {
+            this.cfg.bindMismatch = true;
+            try {
+              await this.saveConfig();
+            } catch (e) {
+            }
+            return;
+          }
+          /* 通过后：清掉历史误判 + 记住本机稳定指纹 */
+          let _dirty = false;
+          if (this.cfg.bindMismatch) {
+            this.cfg.bindMismatch = false;
+            _dirty = true;
+          }
+          if (fpS && this.cfg.boundFpS !== fpS) {
+            this.cfg.boundFpS = fpS;
+            _dirty = true;
+          }
+          if (_dirty) {
+            try {
+              await this.saveConfig();
+            } catch (e) {
+            }
+          }
         }
         if (authOk) {
           const activatedAt = raw.activatedAt != null ? Number(raw.activatedAt) : Date.now();
@@ -17049,14 +17172,42 @@ var EdbPlugin = class extends Plugin {
   hwId() {
     if (this._hwId)
       return this._hwId;
-    const parts = [lic.deviceFingerprint(), this.hwMachineGuid(), this.hwVolumeSerial()];
+    /* v2.1.9 试用键改用【稳定指纹】作基：
+       旧实现含 deviceFingerprint()（依赖 MAC），开热点就换键 → 同一台机器拿到多份试用、
+       且本地镜像文件路径跟着变。稳定指纹与网卡无关，一个机器一个键。 */
+    let base = "";
+    try {
+      base = (typeof lic.fpStable === "function") ? lic.fpStable() : "";
+    } catch (e) {
+    }
+    if (!base) {
+      try { base = lic.deviceFingerprint(); } catch (e) { }
+    }
+    const parts = [base, this.hwMachineGuid(), this.hwVolumeSerial()];
     this._hwId = crypto2.createHash("sha256").update(parts.join("|")).digest("hex").slice(0, 32).toUpperCase();
     return this._hwId;
+  }
+  /** v2.1.9 旧版试用键（含 MAC 的指纹作基）——仅供云端回溯老锚点，不用于新判定 */
+  hwIdLegacy() {
+    try {
+      const parts = [lic.deviceFingerprint(), this.hwMachineGuid(), this.hwVolumeSerial()];
+      return crypto2.createHash("sha256").update(parts.join("|")).digest("hex").slice(0, 32).toUpperCase();
+    } catch (e) {
+      return "";
+    }
   }
   /** 设备键哈希前缀（= 服务端 substr(sha256("edb-hw:"+hw),0,16)，租约 payload 里的 k 就是这个） */
   hwKeyPrefix() {
     try {
       return crypto2.createHash("sha256").update("edb-hw:" + String(this.hwId()).toLowerCase()).digest("hex").slice(0, 16);
+    } catch (e) {
+      return "";
+    }
+  }
+  /** v2.1.9 旧版设备键前缀（含 MAC 的旧 hwId）——用于兼容升级前签发的租约 */
+  hwKeyPrefixLegacy() {
+    try {
+      return crypto2.createHash("sha256").update("edb-hw:" + String(this.hwIdLegacy()).toLowerCase()).digest("hex").slice(0, 16);
     } catch (e) {
       return "";
     }
@@ -17124,8 +17275,15 @@ var EdbPlugin = class extends Plugin {
     const info = this.trialLeaseInfo();
     if (!info)
       return false;
-    if (info.k && this.hwKeyPrefix() !== String(info.k).toLowerCase())
-      return false;
+    /* v2.1.9 hwId 改用稳定指纹后，升级前签发的租约里 k 还是旧前缀。
+       两者都接受，避免升级瞬间"试用到期"。下次申请会自动换成新前缀。 */
+    if (info.k) {
+      const _k = String(info.k).toLowerCase();
+      const _kNew = String(this.hwKeyPrefix() || "").toLowerCase();
+      const _kOld = String(this.hwKeyPrefixLegacy() || "").toLowerCase();
+      if (_k !== _kNew && _k !== _kOld)
+        return false;
+    }
     return this.nowTs() < info.exp;
   }
   trialLeasePath() {
@@ -17176,7 +17334,7 @@ var EdbPlugin = class extends Plugin {
       const res = await fetch(base + "/api.php?action=triallease", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ fp: lic.deviceFingerprint(), hw: this.hwId(), trialStart: this.refreshTrialEff() || Number(this.cfg.trialStart) || 0, v: this.curVersion() })
+        body: JSON.stringify({ fp: lic.deviceFingerprint(), hw: this.hwId(), hwOld: this.hwIdLegacy(), trialStart: this.refreshTrialEff() || Number(this.cfg.trialStart) || 0, v: this.curVersion() })
       });
       j = await res.json();
     } catch (e) {
@@ -17205,8 +17363,13 @@ var EdbPlugin = class extends Plugin {
       }
       throw new Error("租约验签失败：" + (this._leaseErr || "未知原因"));
     }
-    if (info.k && this.hwKeyPrefix() !== String(info.k).toLowerCase())
-      throw new Error("租约与当前设备不匹配");
+    if (info.k) {
+      const _k2 = String(info.k).toLowerCase();
+      const _n2 = String(this.hwKeyPrefix() || "").toLowerCase();
+      const _o2 = String(this.hwKeyPrefixLegacy() || "").toLowerCase();
+      if (_k2 !== _n2 && _k2 !== _o2)
+        throw new Error("租约与当前设备不匹配");
+    }
     this.cfg.trialLease = String(j.lease);
     this.cfg.trialLeaseExp = Number(j.exp) || info.exp;
     if (!this.cfg.trialSrv && j.firstAt)

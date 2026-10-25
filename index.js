@@ -7223,8 +7223,43 @@ var EdbPlugin = class extends Plugin {
         return false;
       const tier = this.isLicensed() ? "paid" : (this.trialLeaseValid() ? "trial" : "free");
       let docs = 0, assets = 0, vaultMB = 0;
+      /* v2.1.5 产品分析字段：套餐 / 剩余天数 / 密库数 / 上限状态 / 同步 / 解锁状态 */
+      let plan = "N", leftDays = 0, forever = 0, vaults = 0, freed = 0, sync = 0, unlocked = 0;
+      try {
+        if (this.isLicensed() && this.licState) {
+          plan = String(this.licState.t || "M");
+          const ea = Number(this.licState.expAt) || 0;
+          if (ea > 0)
+            leftDays = Math.max(0, Math.ceil((ea - this.nowTs()) / 864e5));
+          else
+            forever = 1;   /* expAt=0 即永久 */
+        } else {
+          const li = this.trialLeaseInfo();
+          if (li && this.trialLeaseValid()) {
+            plan = "T";
+            leftDays = Math.max(0, Math.ceil((Number(li.exp) - this.nowTs()) / 864e5));
+          }
+        }
+      } catch (e) {
+      }
       try {
         docs = (this.cfg.watchlist || []).length;
+      } catch (e) {
+      }
+      try {
+        vaults = Array.isArray(this.cfg.vaults) ? this.cfg.vaults.length : 0;
+      } catch (e) {
+      }
+      try {
+        freed = (tier === "free" && docs >= this.freeDocLimit()) ? 1 : 0;
+      } catch (e) {
+      }
+      try {
+        sync = (this.cfg.webdavUrl && this.cfg.webdavUser) ? 1 : 0;
+      } catch (e) {
+      }
+      try {
+        unlocked = this.isUnlocked() ? 1 : 0;
       } catch (e) {
       }
       try {
@@ -7248,6 +7283,15 @@ var EdbPlugin = class extends Plugin {
         vaultMB,
         assets,
         os: String(process.platform || "").slice(0, 16),
+        /* v2.1.5 产品分析字段 */
+        plan,
+        leftDays,
+        forever,
+        vaults,
+        freed,
+        sync,
+        unlocked,
+        reason: String(reason || ""),
       };
       const ctrl = typeof AbortController !== "undefined" ? new AbortController() : null;
       const to = ctrl ? setTimeout(() => { try { ctrl.abort(); } catch (e) { } }, 10000) : null;
@@ -7273,25 +7317,29 @@ var EdbPlugin = class extends Plugin {
       return false;
     }
   }
-  /** v2.0.9 启动时安排统计上报：首次 30 秒后，之后每 24 小时一次 */
+  /** v2.1.5 上报调度：打开思源就报（5 秒后），常驻期间每 6 小时一次
+   *  · 5 秒延迟：不阻塞启动，等配置/解锁状态就绪后再报，数据更准
+   *  · 与上次间隔 <10 分钟则顺延（避免频繁重启刷记录）
+   *  · 每 6 小时一次（原 24 小时）→ 活跃度/文档增长曲线更细 */
   scheduleUsageReport() {
     try {
       if (!this.edbOnlineUrl())
         return;
       const last = Number(this.cfg.usageLastAt) || 0;
       const gap = Date.now() - last;
-      /* 距上次不足 20 小时则本次不报（避免频繁启动重复上报） */
-      const delay = gap > 20 * 36e5 ? 30000 : Math.max(30000, 24 * 36e5 - gap);
+      const MIN_GAP = 10 * 60e3;
+      const delay = gap > MIN_GAP ? 5000 : Math.max(5000, MIN_GAP - gap);
       setTimeout(() => {
         this.reportUsage("startup").catch(() => {
         });
       }, delay);
       if (this._usageTimer)
         clearInterval(this._usageTimer);
+      /* 每 6 小时一次：常驻用户也能持续上报（含文档数变化） */
       this._usageTimer = setInterval(() => {
-        this.reportUsage("daily").catch(() => {
+        this.reportUsage("periodic").catch(() => {
         });
-      }, 24 * 36e5);
+      }, 6 * 36e5);
     } catch (e) {
     }
   }
@@ -13211,7 +13259,7 @@ var EdbPlugin = class extends Plugin {
   /** 当前插件版本（与 plugin.json 同步，发布时手工更新） */
   curVersion() {
     /* v1.6.63 必须与 plugin.json 的 version 保持一致（每次发版两处同步改） */
-    return "2.1.4";
+    return "2.1.5";
   }
   versionAtLeast(latest, cur) {
     const p = (s) => String(s || "").split(".").map((x) => parseInt(x, 10) || 0);

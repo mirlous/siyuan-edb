@@ -6866,6 +6866,9 @@ var EdbPlugin = class extends Plugin {
          只上报：设备标识 / 版本 / 文档数 / 库大小 / 资产数 / 平台 / 档位
          绝不上报：文档标题、正文、路径、库文件名 */
       usageLastAt: 0,
+      /* v2.2.0 用户反馈 */
+      firstRunAt: 0,
+      fbPrompted: false,
     };
     this.state = null;
     this.syncTimer = null;
@@ -6920,6 +6923,18 @@ var EdbPlugin = class extends Plugin {
         this.migrateRecoveryKeyFile();
       }, 1500);
     }, 800);
+    /* v2.2.0 记录首次运行时间（用于"用过 ≥2 天才提示反馈"） */
+    try {
+      if (!this.cfg.firstRunAt) {
+        this.cfg.firstRunAt = Date.now();
+        this.saveConfig().catch(() => {
+        });
+      }
+      setTimeout(() => {
+        this.maybeShowFeedbackPrompt();
+      }, 6000);
+    } catch (e) {
+    }
     /* v2.1.1 启动时拉一次云端价格（改价后无需等 check 周期） */
     setTimeout(() => {
       this.fetchPriceTable().catch(() => {
@@ -7813,6 +7828,198 @@ var EdbPlugin = class extends Plugin {
       const css = ".edb-hide-vault-hit{display:none !important;}";
       if (st.textContent !== css)
         st.textContent = css;
+    } catch (e) {
+    }
+  }
+  /* ============ v2.2.0 用户反馈（「💡 想要什么功能」） ============
+   * 只收集用户【主动填写】的内容；设备标识仅用于去重与联系，不做他用。
+   * 选项键必须与云端白名单一致（mobile/device/export/share/search/backup/perf/price/support/other） */
+  feedbackOptions() {
+    return [
+      ["mobile", "\u{1F4F1}", "\u624B\u673A / \u5E73\u677F\u67E5\u770B"],
+      ["device", "\u{1F4BB}", "\u6362\u7535\u8111\u66F4\u65B9\u4FBF\uFF08\u591A\u8BBE\u5907\uFF09"],
+      ["export", "\u{1F4E4}", "\u6279\u91CF\u5BFC\u51FA / \u8FC1\u79FB"],
+      ["share", "\u{1F465}", "\u591A\u4EBA\u5171\u4EAB\u5BC6\u5E93"],
+      ["search", "\u{1F50D}", "\u52A0\u5BC6\u5185\u5BB9\u4E5F\u80FD\u641C\u7D22"],
+      ["backup", "\u2601", "\u81EA\u52A8\u4E91\u5907\u4EFD\u66F4\u7701\u5FC3"],
+      ["perf", "\u26A1", "\u66F4\u5FEB / \u66F4\u7701\u7535"],
+      ["price", "\u{1F4B0}", "\u4EF7\u683C / \u5957\u9910\u5EFA\u8BAE"],
+      ["support", "\u{1F91D}", "\u5BA2\u670D / \u552E\u540E"],
+      ["other", "\u270F\uFE0F", "\u5176\u4ED6\uFF08\u5199\u5728\u4E0B\u9762\uFF09"],
+    ];
+  }
+  /** 提交反馈到云端 */
+  async submitFeedback(items, text, contact) {
+    try {
+      const base = String(this.edbOnlineUrl() || "").replace(/\/+$/, "").replace(/\/api\.php$/i, "");
+      if (!base)
+        return { ok: false, err: "\u4E91\u7AEF\u5730\u5740\u672A\u914D\u7F6E" };
+      let tier = "free", plan = "N";
+      try {
+        if (this.isLicensed() && this.licState) { tier = "paid"; plan = String(this.licState.t || "M"); }
+        else if (this.trialLeaseValid()) { tier = "trial"; plan = "T"; }
+      } catch (e) {
+      }
+      const res = await fetch(base + "/api.php?action=feedback", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          fp: lic.deviceFingerprint(), hw: this.hwId(), v: this.curVersion(),
+          items: items || [], text: String(text || "").slice(0, 1000),
+          contact: String(contact || "").slice(0, 80), tier, plan,
+        }),
+      });
+      const j = await res.json();
+      if (j && j.ok)
+        this.cfg.fbPrompted = true;
+      return (j && j.ok) ? { ok: true } : { ok: false, err: (j && j.msg) || "\u63D0\u4EA4\u5931\u8D25" };
+    } catch (e) {
+      return { ok: false, err: "\u7F51\u7EDC\u5931\u8D25\uFF0C\u8BF7\u7A0D\u540E\u91CD\u8BD5" };
+    }
+  }
+  /** 打开反馈弹窗 */
+  openFeedbackDialog() {
+    try {
+      const old = document.getElementById("edb-fb-mask");
+      if (old)
+        old.remove();
+      const mask = document.createElement("div");
+      mask.id = "edb-fb-mask";
+      mask.style.cssText = "position:fixed;left:0;top:0;right:0;bottom:0;background:rgba(0,0,0,.45);z-index:99999;display:flex;align-items:center;justify-content:center;";
+      const box = document.createElement("div");
+      box.style.cssText = "width:520px;max-width:92vw;max-height:86vh;overflow:auto;background:var(--b3-theme-background,#1e1e1e);color:var(--b3-theme-on-background,#ddd);border-radius:10px;padding:16px 18px;box-shadow:0 10px 40px rgba(0,0,0,.5);font-size:13px;";
+      const h = document.createElement("div");
+      h.style.cssText = "font-size:15px;font-weight:700;margin-bottom:4px;";
+      h.textContent = "\u{1F4A1} \u60F3\u8981\u4EC0\u4E48\u529F\u80FD\uFF1F";
+      const sub = document.createElement("div");
+      sub.style.cssText = "font-size:12px;color:#8b93a1;line-height:1.7;margin-bottom:10px;";
+      sub.textContent = "\u544A\u8BC9\u6211\u4F60\u6700\u9700\u8981\u4EC0\u4E48\uFF0C\u6211\u4F1A\u4F18\u5148\u505A\u5927\u5BB6\u6700\u60F3\u8981\u7684\u3002\u9009\u597D\u540E\u70B9\u3010\u63D0\u4EA4\u3011\u5373\u53EF\u3002";
+      box.appendChild(h);
+      box.appendChild(sub);
+      const grid = document.createElement("div");
+      grid.style.cssText = "display:grid;grid-template-columns:1fr 1fr;gap:6px 10px;margin-bottom:10px;";
+      const picked = new Set();
+      for (const [key, icon, label] of this.feedbackOptions()) {
+        const lab = document.createElement("label");
+        lab.style.cssText = "display:flex;align-items:center;gap:6px;padding:6px 8px;border:1px solid var(--b3-border-color,#333);border-radius:6px;cursor:pointer;font-size:12px;line-height:1.4;";
+        const ck = document.createElement("input");
+        ck.type = "checkbox";
+        ck.value = key;
+        ck.addEventListener("change", () => {
+          if (ck.checked)
+            picked.add(key);
+          else
+            picked.delete(key);
+          lab.style.borderColor = ck.checked ? "#3370ff" : "var(--b3-border-color,#333)";
+          lab.style.background = ck.checked ? "rgba(51,112,255,.12)" : "transparent";
+        });
+        lab.appendChild(ck);
+        const tx = document.createElement("span");
+        tx.textContent = icon + " " + label;
+        lab.appendChild(tx);
+        grid.appendChild(lab);
+      }
+      box.appendChild(grid);
+      const ta = document.createElement("textarea");
+      ta.className = "b3-text-field";
+      ta.placeholder = "\u8FD8\u60F3\u8981\u4EC0\u4E48\uFF1F\u4EFB\u4F55\u60F3\u6CD5\u90FD\u884C\uFF08\u9009\u586B\uFF09";
+      ta.style.cssText = "width:100%;height:74px;resize:vertical;font-size:12px;padding:8px;box-sizing:border-box;";
+      box.appendChild(ta);
+      const ci = document.createElement("input");
+      ci.className = "b3-text-field";
+      ci.placeholder = "\u8054\u7CFB\u65B9\u5F0F\uFF08\u5FAE\u4FE1/\u90AE\u7BB1\uFF0C\u9009\u586B\uFF1B\u65B9\u4FBF\u529F\u80FD\u505A\u597D\u540E\u544A\u8BC9\u4F60\uFF09";
+      ci.style.cssText = "width:100%;margin-top:8px;font-size:12px;padding:8px;box-sizing:border-box;";
+      box.appendChild(ci);
+      const msg = document.createElement("div");
+      msg.style.cssText = "font-size:12px;margin-top:8px;min-height:16px;";
+      box.appendChild(msg);
+      const row = document.createElement("div");
+      row.style.cssText = "display:flex;gap:8px;justify-content:flex-end;margin-top:10px;";
+      const cancel = document.createElement("button");
+      cancel.className = "b3-button b3-button--cancel";
+      cancel.textContent = "\u6682\u4E0D\u586B\u4E86";
+      const ok = document.createElement("button");
+      ok.className = "b3-button b3-button--text";
+      ok.textContent = "\u63D0\u4EA4";
+      row.appendChild(cancel);
+      row.appendChild(ok);
+      box.appendChild(row);
+      const tip = document.createElement("div");
+      tip.style.cssText = "font-size:11px;color:#6b7280;margin-top:8px;line-height:1.6;";
+      tip.textContent = "\u4E0A\u62A5\u5185\u5BB9\uFF1A\u4F60\u9009\u7684\u9879\u76EE \u00B7 \u4F60\u5199\u7684\u6587\u5B57 \u00B7 \u63D2\u4EF6\u7248\u672C\u3002\u4E0D\u4F1A\u4E0A\u4F20\u4EFB\u4F55\u7B14\u8BB0\u5185\u5BB9\u3002";
+      box.appendChild(tip);
+      mask.appendChild(box);
+      document.body.appendChild(mask);
+      const close = () => { try { mask.remove(); } catch (e) { } };
+      cancel.addEventListener("click", close);
+      mask.addEventListener("click", (ev) => { if (ev.target === mask) close(); });
+      ok.addEventListener("click", async () => {
+        if (!picked.size && !ta.value.trim()) {
+          msg.innerHTML = "<span style='color:#fbbf24'>\u8BF7\u81F3\u5C11\u9009\u4E00\u9879\uFF0C\u6216\u5199\u4E00\u53E5\u8BDD</span>";
+          return;
+        }
+        ok.disabled = true;
+        msg.innerHTML = "<span style='color:#8b93a1'>\u63D0\u4EA4\u4E2D\u2026</span>";
+        const r = await this.submitFeedback(Array.from(picked), ta.value.trim(), ci.value.trim());
+        ok.disabled = false;
+        if (r.ok) {
+          this.cfg.fbPrompted = true;
+          try { await this.saveConfig(); } catch (e) { }
+          msg.innerHTML = "<span style='color:#7ee787'>\u2705 \u611F\u8C22\u53CD\u9988\uFF01\u6211\u4F1A\u4F18\u5148\u505A\u5927\u5BB6\u6700\u60F3\u8981\u7684\u529F\u80FD\u3002</span>";
+          setTimeout(close, 1400);
+        } else {
+          msg.innerHTML = "<span style='color:#f87171'>\u274C " + (r.err || "\u63D0\u4EA4\u5931\u8D25") + "</span>";
+        }
+      });
+    } catch (e) {
+      showMessage("\u6253\u5F00\u53CD\u9988\u7A97\u53E3\u5931\u8D25\uFF1A" + (e && e.message));
+    }
+  }
+  /** v2.2.0 一次性温和提示：用过 ≥2 天、从未提交过，才提示一次 */
+  maybeShowFeedbackPrompt() {
+    try {
+      if (this.cfg.fbPrompted)
+        return;
+      if (!this.cfg.firstRunAt)
+        return;
+      if (Date.now() - Number(this.cfg.firstRunAt) < 2 * 864e5)
+        return;
+      if (document.getElementById("edb-fb-toast"))
+        return;
+      const box = document.createElement("div");
+      box.id = "edb-fb-toast";
+      box.style.cssText = "position:fixed;right:18px;bottom:18px;z-index:99998;max-width:290px;background:var(--b3-theme-background,#222);color:var(--b3-theme-on-background,#ddd);border:1px solid var(--b3-border-color,#3a3a3a);border-radius:10px;padding:12px 14px;box-shadow:0 8px 28px rgba(0,0,0,.45);font-size:12px;line-height:1.7;";
+      const t1 = document.createElement("div");
+      t1.style.cssText = "font-weight:700;margin-bottom:4px;";
+      t1.textContent = "\u{1F4A1} \u60F3\u8981\u4EC0\u4E48\u529F\u80FD\uFF1F";
+      const t2 = document.createElement("div");
+      t2.style.cssText = "color:#8b93a1;margin-bottom:8px;";
+      t2.textContent = "\u544A\u8BC9\u6211\u4F60\u6700\u9700\u8981\u4EC0\u4E48\uFF0C\u6211\u4F18\u5148\u505A\u5927\u5BB6\u6700\u60F3\u8981\u7684\u3002";
+      const row = document.createElement("div");
+      row.style.cssText = "display:flex;gap:8px;align-items:center;";
+      const go = document.createElement("button");
+      go.className = "b3-button b3-button--text";
+      go.style.cssText = "font-size:12px;padding:2px 12px;";
+      go.textContent = "\u53BB\u53CD\u9988";
+      const no = document.createElement("button");
+      no.className = "b3-button b3-button--cancel";
+      no.style.cssText = "font-size:12px;padding:2px 10px;";
+      no.textContent = "\u4E0D\u518D\u63D0\u793A";
+      row.appendChild(go);
+      row.appendChild(no);
+      box.appendChild(t1);
+      box.appendChild(t2);
+      box.appendChild(row);
+      document.body.appendChild(box);
+      const bye = async (forever) => {
+        try { box.remove(); } catch (e) { }
+        if (forever) {
+          this.cfg.fbPrompted = true;
+          try { await this.saveConfig(); } catch (e) { }
+        }
+      };
+      go.addEventListener("click", () => { bye(true); this.openFeedbackDialog(); });
+      no.addEventListener("click", () => bye(true));
     } catch (e) {
     }
   }
@@ -13369,7 +13576,7 @@ var EdbPlugin = class extends Plugin {
   /** 当前插件版本（与 plugin.json 同步，发布时手工更新） */
   curVersion() {
     /* v1.6.63 必须与 plugin.json 的 version 保持一致（每次发版两处同步改） */
-    return "2.1.9";
+    return "2.2.0";
   }
   versionAtLeast(latest, cur) {
     const p = (s) => String(s || "").split(".").map((x) => parseInt(x, 10) || 0);
@@ -13941,6 +14148,15 @@ var EdbPlugin = class extends Plugin {
       secWrap.appendChild(scanBtn);
       secWrap.appendChild(resBox);
       sysGrid.appendChild(secWrap);
+
+      /* v2.2.0 用户反馈入口 */
+      const fbBtn = document.createElement("button");
+      fbBtn.className = "b3-button";
+      fbBtn.style.cssText = "margin-top:2px;";
+      fbBtn.textContent = "\u{1F4A1} \u60F3\u8981\u4EC0\u4E48\u529F\u80FD\uFF1F";
+      fbBtn.title = "\u544A\u8BC9\u6211\u4F60\u6700\u9700\u8981\u4EC0\u4E48\uFF0C\u6211\u4F18\u5148\u505A\u5927\u5BB6\u6700\u60F3\u8981\u7684\u529F\u80FD";
+      fbBtn.addEventListener("click", () => this.openFeedbackDialog());
+      sysGrid.appendChild(fbBtn);
     }
     const searchRow = document.createElement("div");
     searchRow.style.cssText = "display:flex;gap:6px;align-items:center;";

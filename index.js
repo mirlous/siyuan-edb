@@ -7434,6 +7434,217 @@ var EdbPlugin = class extends Plugin {
     }, 900);
   }
   /** 从库里直接注入显示：把可见文档的 图片/视频/音频/PDF/附件 全部替换为库内字节（工作区零明文） */
+  /* ============ v2.1.0 安全：明文残留检测与清理 ============
+   * 背景：密库只管住了「工作区明文」，但思源自己的三处仍存明文：
+   *   S1 索引库 temp\siyuan.db 的 blocks 表（标题/正文/资产名都在）
+   *   S2 历史快照 history\*.sy（删除/编辑前的旧版本）
+   *   S4 全文搜索（走思源自己的索引，能搜出密库文档）
+   *
+   * 红线：绝不写思源内部 sqlite（会破坏思源自己的索引与全文搜索）。
+   *       S1 只做只读检测 + 提示用户用思源官方方式重建索引；
+   *       S2 只删 history 目录里属于密库文档的 .sy 快照（删前二次确认）。
+   */
+  /** S1 只读检测：统计思源索引库里属于密库文档的明文块 */
+  async auditIndexPlaintext() {
+    const out = { ok: false, blocks: 0, chars: 0, docs: 0, samples: [], dbPath: "", note: "" };
+    try {
+      const wsDir = await this.wsDataDir();
+      if (!wsDir)
+        return out;
+      const root = path.dirname(wsDir); /* data 的上一级 = 工作区根 */
+      const dbPath = path.join(root, "temp", "siyuan.db");
+      out.dbPath = dbPath;
+      if (!fs.existsSync(dbPath)) {
+        out.ok = true;
+        out.note = "未找到思源索引库（temp\\siyuan.db），可能索引已重建或不在本工作区";
+        return out;
+      }
+      /* 只读打开思源索引：只 SELECT，绝不写 */
+      let SQL = null;
+      try {
+        SQL = require("sql.js");
+      } catch (e) {
+        out.note = "sql.js 不可用，跳过索引库检测";
+        return out;
+      }
+      const buf = fs.readFileSync(dbPath);
+      const db = new SQL.Database(buf);
+      const wl = new Set(this.cfg.watchlist || []);
+      const excl = new Set(this.cfg.excludedDocs || []);
+      const docs = new Set();
+      let blocks = 0, chars = 0;
+      const samples = [];
+      let stmt = null;
+      try {
+        stmt = db.prepare("SELECT id, root_id, type, content, markdown, hpath FROM blocks WHERE root_id IS NOT NULL");
+      } catch (e) {
+        out.note = "索引表结构不匹配，跳过";
+        return out;
+      }
+      while (stmt.step() && blocks < 20000) {
+        const row = stmt.getAsObject();
+        const rid = String(row.root_id || "");
+        if (!rid || !wl.has(rid) || excl.has(rid))
+          continue;
+        const c = String(row.content || "");
+        const md = String(row.markdown || "");
+        if (!c.trim() && !md.trim())
+          continue;
+        blocks++;
+        chars += c.length + md.length;
+        docs.add(rid);
+        if (samples.length < 8) {
+          samples.push({
+            id: String(row.id || ""),
+            type: String(row.type || ""),
+            content: c.slice(0, 40),
+            hpath: String(row.hpath || "").slice(0, 60),
+          });
+        }
+      }
+      out.ok = true;
+      out.blocks = blocks;
+      out.chars = chars;
+      out.docs = docs.size;
+      out.samples = samples;
+      out.note = "思源索引库中仍有已入库文档的明文块。可用思源「设置 → 关于 → 重建索引」清除（会清空全文搜索索引，需重建）。";
+    } catch (e) {
+      out.note = "检测失败：" + (e && e.message);
+    }
+    return out;
+  }
+  /** S2 检测：统计 history 目录里属于密库文档的 .sy 快照 */
+  async auditHistorySnapshots() {
+    const out = { ok: false, dirs: 0, files: 0, bytes: 0, samples: [], root: "" };
+    try {
+      const wsDir = await this.wsDataDir();
+      if (!wsDir)
+        return out;
+      const root = path.join(path.dirname(wsDir), "history");
+      out.root = root;
+      if (!fs.existsSync(root)) {
+        out.ok = true;
+        return out;
+      }
+      const wl = new Set(this.cfg.watchlist || []);
+      const excl = new Set(this.cfg.excludedDocs || []);
+      const targets = [];
+      let dirs = 0;
+      for (const d of fs.readdirSync(root)) {
+        const dp = path.join(root, d);
+        try {
+          if (!fs.statSync(dp).isDirectory())
+            continue;
+        } catch (e) {
+          continue;
+        }
+        dirs++;
+        let files = [];
+        try {
+          files = fs.readdirSync(dp);
+        } catch (e) {
+          continue;
+        }
+        for (const f of files) {
+          if (!f.endsWith(".sy"))
+            continue;
+          const id = f.slice(0, -3);
+          if (!wl.has(id) || excl.has(id))
+            continue;
+          const fp = path.join(dp, f);
+          let sz = 0;
+          try {
+            sz = fs.statSync(fp).size;
+          } catch (e) {
+          }
+          targets.push({ p: fp, size: sz, id });
+        }
+      }
+      out.ok = true;
+      out.dirs = dirs;
+      out.files = targets.length;
+      out.bytes = targets.reduce((a, b) => a + b.size, 0);
+      out.targets = targets;
+      out.samples = targets.slice(0, 8).map((x) => ({ p: x.p, size: x.size }));
+    } catch (e) {
+      out.note = "检测失败：" + (e && e.message);
+    }
+    return out;
+  }
+  /** S2 清理：删除指定的 history 快照文件（调用方已二次确认） */
+  cleanupHistorySnapshots(files) {
+    let del = 0, bytes = 0, fail = 0;
+    for (const f of files || []) {
+      try {
+        const p = String(f);
+        if (!fs.existsSync(p))
+          continue;
+        const sz = fs.statSync(p).size;
+        fs.unlinkSync(p);
+        del++;
+        bytes += sz;
+      } catch (e) {
+        fail++;
+      }
+    }
+    return { deleted: del, bytes, failed: fail };
+  }
+  /** v2.1.0 S4：锁定时拦截「搜索穿透」——
+   *  思源全文搜索走的是它自己的 blocks 索引，密库文档的标题/正文仍在索引里，
+   *  所以锁定状态下用户仍能搜出密库内容（功能性安全漏洞）。
+   *
+   *  做法：只隐藏【搜索结果面板】里属于密库文档的条目（纯 CSS + class），
+   *  不改数据、不改思源接口、解锁立即恢复。
+   *  范围严格限定在搜索结果容器内，绝不影响编辑器与文档树。 */
+  hideVaultSearchResults() {
+    try {
+      if (this.isUnlocked())
+        return 0;
+      const wl = new Set(this.cfg.watchlist || []);
+      const excl = new Set(this.cfg.excludedDocs || []);
+      if (!wl.size)
+        return 0;
+      /* 思源搜索结果条目：.b3-list-item[data-node-id]
+         容器（读源码确认）：块搜索 #searchResult / #searchPreview，资产搜索 #searchAssetList / #searchAssetPreview */
+      const SEARCH_SEL = "#searchResult,#searchPreview,#searchAssetList,#searchAssetPreview,.search__list,.search__layout,.search__preview";
+      const items = document.querySelectorAll(".b3-list-item[data-node-id],.b3-list-item[data-root-id]");
+      let hidden = 0;
+      for (const it of items) {
+        const id = it.getAttribute("data-node-id") || it.getAttribute("data-root-id") || "";
+        if (!id)
+          continue;
+        const isVault = wl.has(id) && !excl.has(id);
+        /* 只在思源搜索结果容器内处理，绝不误伤文档树/编辑器 */
+        const inSearch = !!(it.closest && it.closest(SEARCH_SEL));
+        if (isVault && inSearch) {
+          if (!it.classList.contains("edb-hide-vault-hit")) {
+            it.classList.add("edb-hide-vault-hit");
+            hidden++;
+          }
+        } else if (it.classList.contains("edb-hide-vault-hit")) {
+          it.classList.remove("edb-hide-vault-hit");
+        }
+      }
+      return hidden;
+    } catch (e) {
+      return 0;
+    }
+  }
+  /** v2.1.0 S4 配套 CSS：隐藏标记 + 提示条（说明"已隐藏 N 条密库结果"） */
+  ensureSearchHideCss() {
+    try {
+      let st = document.getElementById("edb-search-hide-style");
+      if (!st) {
+        st = document.createElement("style");
+        st.id = "edb-search-hide-style";
+        document.head.appendChild(st);
+      }
+      const css = ".edb-hide-vault-hit{display:none !important;}";
+      if (st.textContent !== css)
+        st.textContent = css;
+    } catch (e) {
+    }
+  }
   async injectOpenDocs() {
     if (!this.state)
       return;
@@ -8830,6 +9041,11 @@ var EdbPlugin = class extends Plugin {
       this._nbTimer = setInterval(() => {
         this.applyNotebookVisibility();
         this.applyDocMask();
+        /* v2.1.0 S4：锁定时隐藏搜索结果里的密库条目（思源搜索面板是动态出现的，需周期检查） */
+        if (!this.isUnlocked()) {
+          this.ensureSearchHideCss();
+          this.hideVaultSearchResults();
+        }
       }, 3000);
     } catch (e) {
       console.error("[siyuan-edb]", e);
@@ -8838,6 +9054,11 @@ var EdbPlugin = class extends Plugin {
   /** v1.6.45: 打开已加密文档时若未解锁 → 提示（隐藏为主，此为其兜底） */
   openDocGuard(e) {
     try {
+      /* v2.1.0 S4：切换文档时顺带处理搜索结果 */
+      if (!this.isUnlocked()) {
+        this.ensureSearchHideCss();
+        this.hideVaultSearchResults();
+      }
       /* v1.7.7 切换到其它文档时立刻重算遮罩标记（切换即生效，不会残留上一文档的遮罩） */
       Promise.resolve().then(() => {
         try {
@@ -12975,7 +13196,7 @@ var EdbPlugin = class extends Plugin {
   /** 当前插件版本（与 plugin.json 同步，发布时手工更新） */
   curVersion() {
     /* v1.6.63 必须与 plugin.json 的 version 保持一致（每次发版两处同步改） */
-    return "2.0.9";
+    return "2.1.0";
   }
   versionAtLeast(latest, cur) {
     const p = (s) => String(s || "").split(".").map((x) => parseInt(x, 10) || 0);
@@ -13489,6 +13710,82 @@ var EdbPlugin = class extends Plugin {
         }
       }));
       sysGrid.appendChild(btn("\u{1F4CB} " + (this.t("auditTitle") || "\u5BA1\u8BA1\u65E5\u5FD7"), () => this.openAuditDialog()));
+    }
+    /* ============ v2.1.0 安全工具：明文残留检测与清理 ============ */
+    {
+      const secTitle = document.createElement("div");
+      secTitle.style.cssText = "font-size:13px;font-weight:bold;margin:10px 0 4px;color:var(--b3-theme-on-background,#ddd);";
+      secTitle.textContent = "\u{1F6E1} \u660E\u6587\u6B8B\u7559\u5B89\u5168";
+      sysGrid.appendChild(secTitle);
+
+      const secTip = document.createElement("div");
+      secTip.style.cssText = "font-size:12px;color:#8590a6;line-height:1.7;margin-bottom:6px;";
+      secTip.textContent = "\u5BC6\u5E93\u4FDD\u62A4\u7684\u662F\u300C\u5DE5\u4F5C\u533A\u96F6\u660E\u6587\u300D\uFF0C\u4F46\u601D\u6E90\u81EA\u5DF1\u7684\u7D22\u5F15\u5E93\u4E0E\u5386\u53F2\u5FEB\u7167\u91CC\u4ECD\u53EF\u80FD\u5269\u7559\u660E\u6587\u3002\u4EE5\u4E0B\u5DE5\u5177\u53EF\u4EE5\u626B\u63CF\u5E76\u5904\u7406\u3002";
+      sysGrid.appendChild(secTip);
+
+      const resBox = document.createElement("div");
+      resBox.style.cssText = "font-size:12px;line-height:1.8;margin:6px 0;";
+      sysGrid.appendChild(resBox);
+
+      const scanBtn = document.createElement("button");
+      scanBtn.className = "b3-button";
+      scanBtn.textContent = "\u{1F50D} \u626B\u63CF\u660E\u6587\u6B8B\u7559";
+      scanBtn.addEventListener("click", async () => {
+        scanBtn.disabled = true;
+        resBox.innerHTML = "<span style='color:#8590a6'>\u626B\u63CF\u4E2D\u2026</span>";
+        try {
+          const idx = await this.auditIndexPlaintext();
+          const his = await this.auditHistorySnapshots();
+          const parts = [];
+          /* S1 索引库 */
+          if (!idx.ok) {
+            parts.push("<div style='color:#fbbf24'>S1 \u7D22\u5F15\u5E93\uFF1A" + this.esc(idx.note || "\u65E0\u6CD5\u68C0\u6D4B") + "</div>");
+          } else if (idx.blocks > 0) {
+            parts.push("<div style='color:#f87171'>\u{1F534} <b>S1 \u601D\u6E90\u7D22\u5F15\u5E93\uFF1A</b>" + idx.blocks + " \u4E2A\u660E\u6587\u5757\u3001" + idx.chars + " \u5B57\u3001\u6D89\u53CA " + idx.docs + " \u7BC7\u5DF2\u5165\u5E93\u6587\u6863</div>");
+            parts.push("<div style='color:#8590a6;margin-left:12px'>" + this.esc(idx.note || "") + "</div>");
+            if (idx.samples && idx.samples.length) {
+              parts.push("<div style='color:#6b7280;margin-left:12px;font-size:11px'>" +
+                idx.samples.map((s) => "\u00B7 " + this.esc(s.hpath || s.id) + " \u2014 " + this.esc(s.content)).join("<br>") + "</div>");
+            }
+          } else {
+            parts.push("<div style='color:#7ee787'>\u2705 S1 \u601D\u6E90\u7D22\u5F15\u5E93\uFF1A\u65E0\u660E\u6587\u6B8B\u7559</div>");
+          }
+          /* S2 历史快照 */
+          if (!his.ok) {
+            parts.push("<div style='color:#fbbf24'>S2 \u5386\u53F2\u5FEB\u7167\uFF1A\u65E0\u6CD5\u68C0\u6D4B</div>");
+          } else if (his.files > 0) {
+            parts.push("<div style='color:#f87171'>\u{1F534} <b>S2 \u5386\u53F2\u5FEB\u7167\uFF1A</b>" + his.files + " \u4E2A\u5C5E\u4E8E\u5DF2\u5165\u5E93\u6587\u6863\u7684 .sy \u660E\u6587\u5FEB\u7167\uFF08" + this.fmtSize(his.bytes) + "\uFF09</div>");
+            this._histTargets = his.targets || [];
+            const clr = document.createElement("button");
+            clr.className = "b3-button";
+            clr.style.cssText = "margin:4px 0 0 12px;font-size:12px;";
+            clr.textContent = "\u{1F9F9} \u6E05\u7406\u8FD9\u4E9B\u5FEB\u7167";
+            clr.addEventListener("click", async () => {
+              const ok2 = await this.confirmBox("\u5C06\u5220\u9664 " + this._histTargets.length + " \u4E2A\u5C5E\u4E8E\u5DF2\u5165\u5E93\u6587\u6863\u7684\u5386\u53F2\u660E\u6587\u5FEB\u7167\u3002\n\n\u5F71\u54CD\uFF1A\u65E0\u6CD5\u518D\u56DE\u9000\u5230\u8FD9\u4E9B\u7248\u672C\u3002\n\u786E\u5B9A\u5220\u9664\uFF1F");
+              if (!ok2)
+                return;
+              const r = this.cleanupHistorySnapshots(this._histTargets.map((x) => x.p));
+              resBox.innerHTML = "<div style='color:#7ee787'>\u2705 \u5DF2\u5220\u9664 " + r.deleted + " \u4E2A\u5FEB\u7167\uFF08" + this.fmtSize(r.bytes) + "\uFF09</div>";
+            });
+            resBox.innerHTML += "";
+            resBox.appendChild(clr);
+          } else {
+            parts.push("<div style='color:#7ee787'>\u2705 S2 \u5386\u53F2\u5FEB\u7167\uFF1A\u65E0\u660E\u6587\u6B8B\u7559</div>");
+          }
+          /* S4 搜索 */
+          parts.push("<div style='color:#7ee787'>\u2705 S4 \u641C\u7D22\u7A7F\u900F\uFF1A\u9501\u5B9A\u65F6\u5DF2\u81EA\u52A8\u9690\u85CF\u641C\u7D22\u7ED3\u679C\u4E2D\u5C5E\u4E8E\u5BC6\u5E93\u7684\u6761\u76EE</div>");
+          resBox.innerHTML = parts.join("") +
+            "<div style='margin-top:8px'><button class='b3-button' id='edb-sec-rescan' style='font-size:12px'>\u{1F504} \u91CD\u65B0\u626B\u63CF</button></div>";
+          const rb = document.getElementById("edb-sec-rescan");
+          if (rb)
+            rb.onclick = () => scanBtn.click();
+        } catch (e) {
+          resBox.innerHTML = "<span style='color:#f87171'>\u626B\u63CF\u5931\u8D25\uFF1A" + this.esc(e && e.message) + "</span>";
+        } finally {
+          scanBtn.disabled = false;
+        }
+      });
+      sysGrid.appendChild(scanBtn);
     }
     const searchRow = document.createElement("div");
     searchRow.style.cssText = "display:flex;gap:6px;align-items:center;";

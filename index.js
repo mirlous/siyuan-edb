@@ -4,6 +4,11 @@ var __commonJS = (cb, mod) => function __require() {
 };
 
 /* v1.6.51 云端授权地址（内置默认，买家零配置；卖家更换服务器需重新打包发布） */
+/* v2.1.1 价格单一数据源：所有显示价格的地方（typePrice / 购买区 / 试用结束提示）都从这里取。
+   * 改价只需改这一处（或改云端下发的 price 字段），不会再出现"改了 A 忘了 B"。
+   * plan: M=月卡 Y=年卡 H=三年 F=永久 */
+var EDB_PRICE_TABLE = { M: 6, Y: 39, H: 89, F: 199 };
+var EDB_PRICE_TABLE_CN = { M: "\u6708\u5361", Y: "\u5E74\u5361", H: "\u4E09\u5E74", F: "\u6C38\u4E45" };
 const EDB_DEFAULT_ONLINE = "https://mirlous.site/siyuan-edb/api.php";
 /* v1.6.64 试用租约验签公钥（Ed25519 SPKI PEM 的 base64；私钥只在服务器 api.php，插件只验签） */
 const EDB_TRIAL_PUB_PEM_B64 = "LS0tLS1CRUdJTiBQVUJMSUMgS0VZLS0tLS0KTUNvd0JRWURLMlZ3QXlFQTJzdWoxVmNiNmF3TUtIS1VLSlhtK1kyVC9RazNkaHhoZ1Y0aFYyc093Q1E9Ci0tLS0tRU5EIFBVQkxJQyBLRVktLS0tLQo=";
@@ -5903,7 +5908,8 @@ var require_license = __commonJS({
       return t === "M" ? "\u6708" : t === "H" ? "\u534A\u5E74" : t === "Y" ? "\u5E74" : "\u6C38\u4E45";
     }
     function typePrice(t) {
-      return t === "M" ? 9.9 : t === "H" ? 29.9 : t === "Y" ? 49.9 : 99;
+      /* v2.1.1 统一从 EDB_PRICE_TABLE 取（云端下发时会覆盖） */
+      return Number(EDB_PRICE_TABLE[t] || 0);
     }
     function deviceFingerprint() {
       const os = require("os");
@@ -6826,6 +6832,11 @@ var EdbPlugin = class extends Plugin {
         this.migrateRecoveryKeyFile();
       }, 1500);
     }, 800);
+    /* v2.1.1 启动时拉一次云端价格（改价后无需等 check 周期） */
+    setTimeout(() => {
+      this.fetchPriceTable().catch(() => {
+      });
+    }, 2000);
     /* v2.0.9 匿名使用统计（首次 30 秒后，之后每 24 小时；可在设置里关闭） */
     this.scheduleUsageReport();
     /* v1.9.0 U7 首次使用向导（延迟 2.5s，等思源 UI 完全就绪；已用过的用户不会弹） */
@@ -11319,7 +11330,9 @@ var EdbPlugin = class extends Plugin {
             : offlineLock
               ? "\u23F3 " + this.t("offlineLockMsg").replace("{0}", this.onlineGraceDaysEff())
               : !this.licState
-                ? "\u23F3 " + this.t("trialOverMsg")
+                ? "\u23F3 \u8BD5\u7528\u5DF2\u7ED3\u675F\uFF1A\u5BC6\u5E93\u6570\u636E\u5B8C\u6574\u4FDD\u7559\u3002"
+                  + "\u8D2D\u4E70\u6FC0\u6D3B\u7801\u5728\u300C\u{1F511} \u6388\u6743\u6FC0\u6D3B\u300D\u8F93\u5165\u5373\u53EF\u89E3\u9501\uFF08"
+                  + this.priceText() + "\uFF09\uFF0C\u8054\u7CFB\u5356\u5BB6\u8D2D\u4E70\u3002"
                 : "\u23F3 " + this.t("licExpired");
           setTimeout(() => showMessage(expMsg), 1500);
         }
@@ -13196,7 +13209,7 @@ var EdbPlugin = class extends Plugin {
   /** 当前插件版本（与 plugin.json 同步，发布时手工更新） */
   curVersion() {
     /* v1.6.63 必须与 plugin.json 的 version 保持一致（每次发版两处同步改） */
-    return "2.1.0";
+    return "2.1.1";
   }
   versionAtLeast(latest, cur) {
     const p = (s) => String(s || "").split(".").map((x) => parseInt(x, 10) || 0);
@@ -15226,7 +15239,9 @@ var EdbPlugin = class extends Plugin {
     payPlanRow.style.cssText = "display:flex;gap:6px;flex-wrap:wrap;";
     /* v2.0.5 价格更新：年付为主推（默认选中），永久约等于 5 年费用 */
     let selPlan = "Y";
-    const plans = [["M", "\u6708\u5361 \u00A56"], ["Y", "\u5E74\u5361 \u00A539"], ["H", "\u4E09\u5E74 \u00A589"], ["F", "\u6C38\u4E45 \u00A5199"]];
+    /* v2.1.1 价格从统一数据源生成（云端下发后自动跟随） */
+    const _pt = this.priceTable();
+    const plans = ["M", "Y", "H", "F"].map((k) => [k, EDB_PRICE_TABLE_CN[k] + " \u00A5" + _pt[k]]);
     for (const [k, label] of plans) {
       const b = document.createElement("button");
       b.textContent = label;
@@ -16509,6 +16524,63 @@ var EdbPlugin = class extends Plugin {
   edbOnlineUrl() {
     return String(this.cfg.onlineUrl || EDB_DEFAULT_ONLINE || "").trim();
   }
+  /** v2.1.1 拉取云端价格表（改价后即时生效，不等 check 周期） */
+  async fetchPriceTable() {
+    try {
+      const url = String(this.edbOnlineUrl() || "").replace(/\/+$/, "").replace(/\/api\.php$/i, "");
+      if (!url)
+        return false;
+      const res = await fetch(url + "/api.php?action=ping");
+      const j = await res.json();
+      if (!j || !j.price || typeof j.price !== "object")
+        return false;
+      this.cfg.priceTable = { M: Number(j.price.M) || 0, Y: Number(j.price.Y) || 0, H: Number(j.price.H) || 0, F: Number(j.price.F) || 0 };
+      this._priceTable = null;
+      this._priceTableAt = 0;
+      await this.saveConfig();
+      console.log("[siyuan-edb] 价格表已更新:", JSON.stringify(this.cfg.priceTable));
+      return true;
+    } catch (e) {
+      return false;
+    }
+  }
+  /** v2.1.1 价格表（本地默认 + 云端下发覆盖）——
+   *  云端 ping 会带 price 字段；拿到后覆盖本地表，改价只需改云端一处。 */
+  priceTable() {
+    try {
+      if (this._priceTable && Date.now() - (this._priceTableAt || 0) < 6 * 36e5)
+        return this._priceTable;
+      const t = Object.assign({}, EDB_PRICE_TABLE);
+      const p = this.cfg.priceTable;
+      if (p && typeof p === "object") {
+        for (const k in t) {
+          const v = Number(p[k]);
+          if (v > 0)
+            t[k] = v;
+        }
+      }
+      this._priceTable = t;
+      this._priceTableAt = Date.now();
+      return t;
+    } catch (e) {
+      return EDB_PRICE_TABLE;
+    }
+  }
+  /** v2.1.1 价格文案（用于各类提示，格式统一） */
+  priceText() {
+    try {
+      const t = this.priceTable();
+      const parts = [];
+      for (const k of ["M", "Y", "H", "F"]) {
+        if (!t[k])
+          continue;
+        parts.push(EDB_PRICE_TABLE_CN[k] + " " + t[k] + " \u5143");
+      }
+      return parts.join(" / ");
+    } catch (e) {
+      return "";
+    }
+  }
   /** v1.6.35 云端登记（激活时联网一次）：防一码多机 / 防改公钥自造码；服务器 emergency 时放行 */
   async onlineRegister(code, bindCode, fp, n) {
     const url = String(this.edbOnlineUrl()).replace(/\/+$/, "").replace(/\/api\.php$/i, "");
@@ -16561,6 +16633,16 @@ var EdbPlugin = class extends Plugin {
       this.cfg.checkLastOkAt = Date.now();
       this.cfg.checkLastErr = "";
       let _graceDirty = false;
+      /* v2.1.1 云端下发价格表：保存到本地（改价只改云端一处） */
+      if (j && j.price && typeof j.price === "object") {
+        const _pt = { M: Number(j.price.M) || 0, Y: Number(j.price.Y) || 0, H: Number(j.price.H) || 0, F: Number(j.price.F) || 0 };
+        if (JSON.stringify(this.cfg.priceTable || {}) !== JSON.stringify(_pt)) {
+          this.cfg.priceTable = _pt;
+          this._priceTable = null;
+          this._priceTableAt = 0;
+          _graceDirty = true;
+        }
+      }
       if (j && j.grace) {
         const g = Number(j.grace) || 0;
         if (g >= 1 && g <= 120 && g !== Number(this.cfg.srvGraceDays)) {

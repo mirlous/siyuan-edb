@@ -296,7 +296,7 @@
   "maskLocked": "Vault locked\nUnlock it in the Secret Database panel first",
   "licRevoked": "License revoked by the seller: data fully kept. Contact the seller to reactivate and restore access.",
   "offlineLockMsg": "No online verification for over {0} days: data fully kept. Go online and unlock again to verify.",
-  "trialOverMsg": "Trial ended: data fully kept. Buy an activation code and enter it under 🔑 License to unlock (M 9.9 / H 29.9 / Y 49.9 / F 99 CNY). Contact the seller.",
+  "trialOverMsg": "Trial ended: data fully kept. Buy an activation code and enter it under 🔑 License to unlock ({0}). Contact the seller.",
   "nbAllIn": "All {0} document(s) in this notebook are already in the vault",
   "lockNow": "Lock Vault Now",
   "alreadyLocked": "Vault is already locked",

@@ -7242,12 +7242,38 @@ var EdbPlugin = class extends Plugin {
         }
       } catch (e) {
       }
+      /* v2.1.6 文档数：优先读加密索引（权威），锁定/异常时退回配置。
+         之前只读 cfg.watchlist —— 锁定时它是空的，导致上报永远是 0。 */
       try {
-        docs = (this.cfg.watchlist || []).length;
+        let n1 = -1;
+        if (this.isUnlocked() && this.state && this.state.db) {
+          const rows2 = core.listDocs(this.state.db) || [];
+          n1 = rows2.length;
+        }
+        if (n1 >= 0)
+          docs = n1;
+        else
+          docs = (this.cfg.watchlist || []).length;
       } catch (e) {
+        try {
+          docs = (this.cfg.watchlist || []).length;
+        } catch (e2) {
+        }
       }
       try {
         vaults = Array.isArray(this.cfg.vaults) ? this.cfg.vaults.length : 0;
+      } catch (e) {
+      }
+      /* 文档总数（跨全部库，用于"用户到底存了多少"） */
+      let docsAll = docs;
+      try {
+        if (Array.isArray(this.cfg.vaults) && this.cfg.vaults.length > 1) {
+          let s2 = 0;
+          for (const vv of this.cfg.vaults)
+            s2 += ((vv && vv.watchlist) || []).length;
+          if (s2 > docsAll)
+            docsAll = s2;
+        }
       } catch (e) {
       }
       try {
@@ -7288,6 +7314,7 @@ var EdbPlugin = class extends Plugin {
         leftDays,
         forever,
         vaults,
+        docsAll,
         freed,
         sync,
         unlocked,
@@ -13259,7 +13286,7 @@ var EdbPlugin = class extends Plugin {
   /** 当前插件版本（与 plugin.json 同步，发布时手工更新） */
   curVersion() {
     /* v1.6.63 必须与 plugin.json 的 version 保持一致（每次发版两处同步改） */
-    return "2.1.5";
+    return "2.1.6";
   }
   versionAtLeast(latest, cur) {
     const p = (s) => String(s || "").split(".").map((x) => parseInt(x, 10) || 0);

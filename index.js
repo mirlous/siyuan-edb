@@ -13205,7 +13205,7 @@ var EdbPlugin = class extends Plugin {
   /** 当前插件版本（与 plugin.json 同步，发布时手工更新） */
   curVersion() {
     /* v1.6.63 必须与 plugin.json 的 version 保持一致（每次发版两处同步改） */
-    return "2.1.2";
+    return "2.1.3";
   }
   versionAtLeast(latest, cur) {
     const p = (s) => String(s || "").split(".").map((x) => parseInt(x, 10) || 0);
@@ -13695,19 +13695,26 @@ var EdbPlugin = class extends Plugin {
     }
     /* ============ v2.1.0 安全工具：明文残留检测与清理 ============ */
     {
+      /* v2.1.3 修复标题看不清：emoji 与文字叠加会"衍射"发虚 →
+         改为【纯文字标题 + 独立图标行】，并加明确的颜色/字重/行高。 */
+      const secWrap = document.createElement("div");
+      secWrap.style.cssText = "margin:12px 0 8px;padding:10px 12px;border:1px solid var(--b3-border-color,#333);border-radius:8px;background:rgba(255,255,255,.03);";
+      const secIcon = document.createElement("div");
+      secIcon.style.cssText = "font-size:15px;line-height:1.4;margin-bottom:2px;";
+      secIcon.textContent = "\u{1F6E1}\uFE0F";
       const secTitle = document.createElement("div");
-      secTitle.style.cssText = "font-size:13px;font-weight:bold;margin:10px 0 4px;color:var(--b3-theme-on-background,#ddd);";
-      secTitle.textContent = "\u{1F6E1} \u660E\u6587\u6B8B\u7559\u5B89\u5168";
-      sysGrid.appendChild(secTitle);
-
+      secTitle.style.cssText = "font-size:14px;font-weight:700;line-height:1.5;color:var(--b3-theme-on-background,#e5e5e5);letter-spacing:.3px;";
+      secTitle.textContent = "\u660E\u6587\u6B8B\u7559\u5B89\u5168";
       const secTip = document.createElement("div");
-      secTip.style.cssText = "font-size:12px;color:#8590a6;line-height:1.7;margin-bottom:6px;";
+      secTip.style.cssText = "font-size:12px;color:#8b93a1;line-height:1.75;margin:6px 0 8px;";
       secTip.textContent = "\u5BC6\u5E93\u4FDD\u62A4\u7684\u662F\u300C\u5DE5\u4F5C\u533A\u96F6\u660E\u6587\u300D\uFF0C\u4F46\u601D\u6E90\u81EA\u5DF1\u7684\u7D22\u5F15\u5E93\u4E0E\u5386\u53F2\u5FEB\u7167\u91CC\u4ECD\u53EF\u80FD\u5269\u7559\u660E\u6587\u3002\u4EE5\u4E0B\u5DE5\u5177\u53EF\u4EE5\u626B\u63CF\u5E76\u5904\u7406\u3002";
-      sysGrid.appendChild(secTip);
+      secWrap.appendChild(secIcon);
+      secWrap.appendChild(secTitle);
+      secWrap.appendChild(secTip);
+      sysGrid.appendChild(secWrap);
 
       const resBox = document.createElement("div");
-      resBox.style.cssText = "font-size:12px;line-height:1.8;margin:6px 0;";
-      sysGrid.appendChild(resBox);
+      resBox.style.cssText = "font-size:12px;line-height:1.8;margin:8px 0 0;";
 
       const scanBtn = document.createElement("button");
       scanBtn.className = "b3-button";
@@ -13767,7 +13774,9 @@ var EdbPlugin = class extends Plugin {
           scanBtn.disabled = false;
         }
       });
-      sysGrid.appendChild(scanBtn);
+      secWrap.appendChild(scanBtn);
+      secWrap.appendChild(resBox);
+      sysGrid.appendChild(secWrap);
     }
     const searchRow = document.createElement("div");
     searchRow.style.cssText = "display:flex;gap:6px;align-items:center;";

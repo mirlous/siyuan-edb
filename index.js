@@ -6237,6 +6237,12 @@ var zipMod = require_zip();
 var fs = require("fs");
 var path = require("path");
 var crypto2 = require("crypto");
+/* v2.1.4 🔴 关键修复：类方法（verifyTrialLease / verifyDocLock / setDocLock 等）一直引用
+   crypto3，但顶层只定义了 crypto2 —— 这些调用全部抛 ReferenceError 并被 catch 静默吞掉，
+   表现为「租约验签失败（可能被篡改）」等误导性报错。
+   补上顶层 crypto3（与 crypto2 同为 require("crypto")，零行为变化；
+   函数内已有的局部 const crypto3 会自然遮蔽外层，不受影响）。 */
+var crypto3 = require("crypto");
 var WASM_B64 = require_wasm().b64;
 var SYNC_DEBOUNCE_MS = 2500;
 var DEFAULT_DB_PATH = "__AUTO__";
@@ -13205,7 +13211,7 @@ var EdbPlugin = class extends Plugin {
   /** 当前插件版本（与 plugin.json 同步，发布时手工更新） */
   curVersion() {
     /* v1.6.63 必须与 plugin.json 的 version 保持一致（每次发版两处同步改） */
-    return "2.1.3";
+    return "2.1.4";
   }
   versionAtLeast(latest, cur) {
     const p = (s) => String(s || "").split(".").map((x) => parseInt(x, 10) || 0);
@@ -16738,7 +16744,9 @@ var EdbPlugin = class extends Plugin {
       if (!dataDir)
         return "";
       const p = path.join(dataDir, "plugins", "siyuan-edb", "index.js");
-      const buf = fs2.readFileSync(p);
+      /* v2.1.4 同类修复：fs2 从未定义 → ReferenceError 被 catch 吞掉 → 一直返回 ""，
+         导致「官方版本指纹比对」形同虚设。顶层已有 var fs = require("fs")。 */
+      const buf = fs.readFileSync(p);
       return crypto3.createHash("sha256").update(buf).digest("hex");
     } catch (e) {
       return "";
@@ -16981,22 +16989,47 @@ var EdbPlugin = class extends Plugin {
   trialPubPem() {
     return Buffer.from(EDB_TRIAL_PUB_PEM_B64, "base64").toString("utf8");
   }
-  /** 验签租约 → {exp, k} 或 null */
+  /** 验签租约 → {exp, k} 或 null；v2.1.4 记录具体失败原因到 this._leaseErr */
   verifyTrialLease(lease) {
+    this._leaseErr = "";
     try {
       const s = String(lease || "");
       const dot = s.indexOf(".");
-      if (dot <= 0)
+      if (dot <= 0) {
+        this._leaseErr = "格式错误（缺少分隔符，lease 长度 " + s.length + "）";
         return null;
+      }
       const payload = Buffer.from(s.slice(0, dot), "base64");
       const sig = Buffer.from(s.slice(dot + 1), "base64");
-      if (!crypto3.verify(null, payload, crypto3.createPublicKey(this.trialPubPem()), sig))
+      if (sig.length !== 64) {
+        this._leaseErr = "签名长度异常（" + sig.length + " 字节，应为 64）";
         return null;
-      const obj = JSON.parse(payload.toString("utf8"));
-      if (!obj || obj.plan !== "T" || !Number(obj.exp))
+      }
+      let okv = false;
+      try {
+        okv = !!crypto3.verify(null, payload, crypto3.createPublicKey(this.trialPubPem()), sig);
+      } catch (e2) {
+        this._leaseErr = "验签抛异常：" + (e2 && e2.message || String(e2));
         return null;
+      }
+      if (!okv) {
+        this._leaseErr = "签名与公钥不匹配（payload " + payload.length + " 字节）";
+        return null;
+      }
+      let obj = null;
+      try {
+        obj = JSON.parse(payload.toString("utf8"));
+      } catch (e3) {
+        this._leaseErr = "payload 解析失败：" + (e3 && e3.message || String(e3));
+        return null;
+      }
+      if (!obj || obj.plan !== "T" || !Number(obj.exp)) {
+        this._leaseErr = "payload 字段异常";
+        return null;
+      }
       return { exp: Number(obj.exp), k: String(obj.k || "") };
     } catch (e) {
+      this._leaseErr = "未知异常：" + (e && e.message || String(e));
       return null;
     }
   }
@@ -17090,8 +17123,13 @@ var EdbPlugin = class extends Plugin {
       return false;
     }
     const info = this.verifyTrialLease(j.lease);
-    if (!info)
-      throw new Error("租约验签失败（可能被篡改）");
+    if (!info) {
+      try {
+        this.savePanelError("lease-verify", new Error(this._leaseErr || "verify=false"));
+      } catch (e) {
+      }
+      throw new Error("租约验签失败：" + (this._leaseErr || "未知原因"));
+    }
     if (info.k && this.hwKeyPrefix() !== String(info.k).toLowerCase())
       throw new Error("租约与当前设备不匹配");
     this.cfg.trialLease = String(j.lease);

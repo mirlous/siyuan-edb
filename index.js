@@ -6767,6 +6767,11 @@ var EdbPlugin = class extends Plugin {
       maxSeenSavedAt: 0,
       /* v1.6.53 单篇独立加密：docId → {salt, hash}（整库解锁后仍需本篇独立密码） */
       docLocks: {},
+      /* v2.0.9 匿名使用统计（默认开启，用户可在设置里关闭）
+         只上报：设备标识 / 版本 / 文档数 / 库大小 / 资产数 / 平台 / 档位
+         绝不上报：文档标题、正文、路径、库文件名 */
+      usageStats: true,
+      usageLastAt: 0,
     };
     this.state = null;
     this.syncTimer = null;
@@ -6821,6 +6826,8 @@ var EdbPlugin = class extends Plugin {
         this.migrateRecoveryKeyFile();
       }, 1500);
     }, 800);
+    /* v2.0.9 匿名使用统计（首次 30 秒后，之后每 24 小时；可在设置里关闭） */
+    this.scheduleUsageReport();
     /* v1.9.0 U7 首次使用向导（延迟 2.5s，等思源 UI 完全就绪；已用过的用户不会弹） */
     setTimeout(() => {
       this.maybeShowGuide();
@@ -7028,6 +7035,11 @@ var EdbPlugin = class extends Plugin {
         this._domObs.disconnect();
         this._domObs = null;
       }
+      /* v2.0.9 清理统计定时器 */
+      if (this._usageTimer) {
+        clearInterval(this._usageTimer);
+        this._usageTimer = null;
+      }
     } catch (e) {
     }
     if (this.syncTimer)
@@ -7184,6 +7196,92 @@ var EdbPlugin = class extends Plugin {
     return !!(this.state && this.state.db);
   }
   /** 无密码模式：库无密码时启动即自动解锁并自动同步；有密码库保持锁定 */
+  /** v2.0.9 匿名使用统计上报（可在设置里关闭）
+   *  隐私边界：只发数字与设备标识；不含任何笔记内容/标题/路径/库名。
+   *  服务端用途：统计免费版用户量、版本分布、文档数分布（指导定价与运营）。 */
+  async reportUsage(reason) {
+    try {
+      if (!this.cfg || this.cfg.usageStats === false)
+        return false;
+      const base = String(this.edbOnlineUrl() || "").replace(/\/+$/, "").replace(/\/api\.php$/i, "");
+      if (!base)
+        return false;
+      const tier = this.isLicensed() ? "paid" : (this.trialLeaseValid() ? "trial" : "free");
+      let docs = 0, assets = 0, vaultMB = 0;
+      try {
+        docs = (this.cfg.watchlist || []).length;
+      } catch (e) {
+      }
+      try {
+        if (this.state && this.state.db) {
+          const rows = core.listAssets(this.state.db) || [];
+          assets = rows.length;
+        }
+      } catch (e) {
+      }
+      try {
+        if (this.cfg.dbPath && fs.existsSync(this.cfg.dbPath))
+          vaultMB = Math.round(fs.statSync(this.cfg.dbPath).size / 1048576);
+      } catch (e) {
+      }
+      const body = {
+        fp: lic.deviceFingerprint(),
+        hw: this.hwId(),
+        v: this.curVersion(),
+        tier,
+        docs,
+        vaultMB,
+        assets,
+        os: String(process.platform || "").slice(0, 16),
+      };
+      const ctrl = typeof AbortController !== "undefined" ? new AbortController() : null;
+      const to = ctrl ? setTimeout(() => { try { ctrl.abort(); } catch (e) { } }, 10000) : null;
+      try {
+        const res = await fetch(base + "/api.php?action=usage", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          signal: ctrl ? ctrl.signal : void 0,
+          body: JSON.stringify(body),
+        });
+        await res.json();
+      } finally {
+        if (to)
+          clearTimeout(to);
+      }
+      this.cfg.usageLastAt = Date.now();
+      this.saveConfig().catch(() => {
+      });
+      console.log("[siyuan-edb] 匿名使用统计已上报（" + reason + "）");
+      return true;
+    } catch (e) {
+      /* 统计失败完全静默，绝不影响用户使用 */
+      return false;
+    }
+  }
+  /** v2.0.9 启动时安排统计上报：首次 30 秒后，之后每 24 小时一次 */
+  scheduleUsageReport() {
+    try {
+      if (!this.cfg || this.cfg.usageStats === false)
+        return;
+      if (!this.edbOnlineUrl())
+        return;
+      const last = Number(this.cfg.usageLastAt) || 0;
+      const gap = Date.now() - last;
+      /* 距上次不足 20 小时则本次不报（避免频繁启动重复上报） */
+      const delay = gap > 20 * 36e5 ? 30000 : Math.max(30000, 24 * 36e5 - gap);
+      setTimeout(() => {
+        this.reportUsage("startup").catch(() => {
+        });
+      }, delay);
+      if (this._usageTimer)
+        clearInterval(this._usageTimer);
+      this._usageTimer = setInterval(() => {
+        this.reportUsage("daily").catch(() => {
+        });
+      }, 24 * 36e5);
+    } catch (e) {
+    }
+  }
   async tryAutoUnlock() {
     try {
       if (this.isUnlocked())
@@ -10981,6 +11079,9 @@ var EdbPlugin = class extends Plugin {
         } catch (e) {
           console.error("[siyuan-edb] 解锁后立即注入失败", e);
         }
+        /* v2.0.9 解锁后补报一次使用统计（此时才能拿到准确的文档数/资产数） */
+        this.reportUsage("unlock").catch(() => {
+        });
         if (r.migrated)
           showMessage(this.t("vaultUpgraded") || "\u52A0\u5BC6\u5F15\u64CE\u5DF2\u5347\u7EA7\uFF08MK \u4FE1\u5C01\uFF09\uFF0C\u6570\u636E\u5B8C\u6574");
         showMessage(this.t("unlocked"));
@@ -12874,7 +12975,7 @@ var EdbPlugin = class extends Plugin {
   /** 当前插件版本（与 plugin.json 同步，发布时手工更新） */
   curVersion() {
     /* v1.6.63 必须与 plugin.json 的 version 保持一致（每次发版两处同步改） */
-    return "2.0.8";
+    return "2.0.9";
   }
   versionAtLeast(latest, cur) {
     const p = (s) => String(s || "").split(".").map((x) => parseInt(x, 10) || 0);
@@ -13322,6 +13423,33 @@ var EdbPlugin = class extends Plugin {
           showMessage("\u5DF2\u6E05\u7406 " + n + " \u7BC7\u672A\u52A0\u5165\u6B8B\u7559\u6587\u6863\uFF08\u5DF2\u81EA\u52A8\u5907\u4EFD\uFF0C\u53EF\u91CD\u65B0\u52A0\u5165\u6062\u5FA9\uFF09");
       }));
     const secGrid = mkGroup(this.t("grpSec"));
+    /* v2.0.9 匿名使用统计开关（默认开；只上报数字，绝不含笔记内容） */
+    try {
+      const usRow = document.createElement("div");
+      usRow.style.cssText = "display:flex;flex-direction:column;gap:4px;padding:6px 0;";
+      const usLbl = document.createElement("label");
+      usLbl.style.cssText = "display:flex;align-items:center;gap:8px;cursor:pointer;font-size:13px;";
+      const usCk = document.createElement("input");
+      usCk.type = "checkbox";
+      usCk.checked = this.cfg.usageStats !== false;
+      usLbl.appendChild(usCk);
+      usLbl.appendChild(document.createTextNode("\u{1F4CA} \u533F\u540D\u4F7F\u7528\u7EDF\u8BA1"));
+      const usTip = document.createElement("div");
+      usTip.style.cssText = "font-size:12px;color:#8590a6;line-height:1.6;padding-left:24px;";
+      usTip.textContent = "\u4EC5\u4E0A\u62A5\uFF1A\u8BBE\u5907\u6807\u8BC6 / \u63D2\u4EF6\u7248\u672C / \u6587\u6863\u6570\u91CF / \u5E93\u5927\u5C0F / \u8D44\u4EA7\u6570 / \u7CFB\u7EDF\u5E73\u53F0\u3002\n\u7EDD\u4E0D\u4E0A\u62A5\uFF1A\u6587\u6863\u6807\u9898\u3001\u6B63\u6587\u3001\u8DEF\u5F84\u3001\u5E93\u6587\u4EF6\u540D\u3002\u5173\u95ED\u540E\u5B8C\u5168\u4E0D\u53D1\u9001\u4EFB\u4F55\u6570\u636E\u3002";
+      usTip.style.whiteSpace = "pre-wrap";
+      usCk.addEventListener("change", async () => {
+        this.cfg.usageStats = !!usCk.checked;
+        await this.saveConfig();
+        showMessage(usCk.checked ? "\u5DF2\u5F00\u542F\u533F\u540D\u4F7F\u7528\u7EDF\u8BA1\uFF08\u4EC5\u4E0A\u62A5\u6570\u5B57\uFF09" : "\u5DF2\u5173\u95ED\u533F\u540D\u4F7F\u7528\u7EDF\u8BA1");
+        if (usCk.checked)
+          this.reportUsage("manual").catch(() => { });
+      });
+      usRow.appendChild(usLbl);
+      usRow.appendChild(usTip);
+      secGrid.appendChild(usRow);
+    } catch (e) {
+    }
     if (unlocked) {
       if (!this.noPwd)
         secGrid.appendChild(btn(this.t("lock"), () => this.lockVault()));

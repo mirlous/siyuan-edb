@@ -13576,7 +13576,7 @@ var EdbPlugin = class extends Plugin {
   /** 当前插件版本（与 plugin.json 同步，发布时手工更新） */
   curVersion() {
     /* v1.6.63 必须与 plugin.json 的 version 保持一致（每次发版两处同步改） */
-    return "2.2.0";
+    return "2.2.6";
   }
   versionAtLeast(latest, cur) {
     const p = (s) => String(s || "").split(".").map((x) => parseInt(x, 10) || 0);
@@ -14947,16 +14947,14 @@ var EdbPlugin = class extends Plugin {
     licInput.className = "b3-text-field";
     licInput.placeholder = this.t("licPlaceholder");
     licInput.style.cssText = "flex:1;";
+    /* v2.2.2 加 id：供云端下发的绑定码自动定位填入 */
+    licInput.id = "siyuan-edb-lic-input";
     const licBtn = document.createElement("button");
     licBtn.textContent = this.t("licActivate");
     licBtn.className = "b3-button b3-button--primary";
-    licBtn.addEventListener("click", async () => {
-      const ok = await this.activateLicense(licInput.value);
-      if (ok) {
-        licInput.value = "";
-        licStatus.textContent = this.licenseText();
-      }
-    });
+    /* v2.2.2 修复：此处原本还有第二个 click 监听器，调用 activateLicense(licInput.value)
+       只传激活码、不传绑定码；它和下面那个传两个码的监听器**同时生效**，于是每次点「激活」
+       都会先弹一次假的「绑定码无效或与本机不匹配」，让买家以为码坏了。旧监听器已删除。 */
     licInputRow.appendChild(licInput);
     licInputRow.appendChild(licBtn);
     const fpRow = document.createElement("div");
@@ -14981,6 +14979,8 @@ var EdbPlugin = class extends Plugin {
     bindInput.className = "b3-text-field";
     bindInput.placeholder = this.t("bindPlaceholder") || "\u7C98\u8D34\u7ED1\u5B9A\u7801\uFF08EDBB-\u2026\uFF0C\u627E\u5356\u5BB6\u6362\u53D6\uFF09";
     bindInput.style.cssText = "flex:1;";
+    /* v2.2.2 加 id：购买区拿到云端绑定码后自动填进来 */
+    bindInput.id = "siyuan-edb-bind-input";
     licInputRow.appendChild(bindInput);
     const bindHint = document.createElement("div");
     bindHint.style.cssText = "font-size:12px;color:var(--b3-theme-on-background,#888);";
@@ -15574,6 +15574,36 @@ var EdbPlugin = class extends Plugin {
     payQrImg.style.cursor = "zoom-in";
     payQrImg.title = "\u70B9\u51FB\u653E\u5927\u6536\u6B3E\u7801";
     payQrImg.addEventListener("click", showPayQrLarge);
+    payQrImg.style.visibility = "hidden"; /* v2.2.6 未点档位前不显示收款码 */
+    /* v2.2.4 每档固定金额收款码（B 方案）：云端 ping 下发 pay_qr_map，
+       卖家给 M/Y/H/F 各一张「微信收款码·设置金额」导出的图，金额由码本身锁定。
+       插件按所选套餐换图 —— 买家扫的就是那一档的固定金额，没法只付 ¥6 却报 ¥39。
+       没配 map 时回退 pay_qr（旧的单张码）→ 再回退内置收款码，行为不变。 */
+    let payQrMap = {};
+    let payQrFallback = "";
+    let payQrMode = "";
+    let payQrLoaded = false;
+    const applyPayQr = () => {
+      const u = payQrMap[selPlan] || payQrFallback;
+      if (u) payQrImg.src = u;
+      if (!payQrLoaded) return;
+      /* v2.2.6 没点档位前不显示收款码：此前面板默认点亮「年卡」，买家却可能扫了别处的月卡码，
+         这正是「付 ¥6 发年卡」的起点 —— 先逼一次明确的档位选择。 */
+      if (!selPlan) {
+        payQrImg.style.visibility = "hidden";
+        payQrHint.textContent = "\u8BF7\u5148\u70B9\u9009\u4E0B\u65B9\u6863\u4F4D\uFF08\u6708\u5361 \u00A56 / \u5E74\u5361 \u00A539 / \u4E09\u5E74 \u00A589 / \u6C38\u4E45 \u00A5199\uFF09\uFF0C\u6536\u6B3E\u7801\u4F1A\u81EA\u52A8\u5207\u6362\u6210\u8BE5\u6863\u4E13\u7528\u7801";
+        return;
+      }
+      payQrImg.style.visibility = "";
+      if (!u) {
+        payQrHint.textContent = "\u5DF2\u663E\u793A\u5185\u7F6E\u6536\u6B3E\u7801\uFF0C\u626B\u7801\u4ED8\u6B3E\u540E\u586B\u652F\u4ED8\u5355\u53F7\uFF1B\u70B9\u51FB\u4E8C\u7EF4\u7801\u53EF\u653E\u5927";
+        return;
+      }
+      payQrHint.textContent = (payQrMap[selPlan]
+        ? "\u5DF2\u663E\u793A\u300C" + (EDB_PRICE_TABLE_CN[selPlan] || selPlan) + "\u300D\u4E13\u7528\u6536\u6B3E\u7801\uFF1A\u91D1\u989D\u5DF2\u56FA\u5B9A\uFF0C\u626B\u7801\u5373\u4ED8"
+        : (payQrMode === "auto" ? "\u5168\u81EA\u52A8\u652F\u4ED8\u6A21\u5F0F" : "\u5FAE\u4FE1\u626B\u7801\u4ED8\u6B3E\uFF0C\u4ED8\u6B3E\u540E\u586B\u5355\u53F7"))
+        + "\uFF1B\u70B9\u51FB\u4E8C\u7EF4\u7801\u53EF\u653E\u5927";
+    };
     (async () => {
       try {
         const url = String(this.edbOnlineUrl()).replace(/\/+$/, "").replace(/\/api\.php$/i, "");
@@ -15583,22 +15613,51 @@ var EdbPlugin = class extends Plugin {
         }
         const res = await fetch(url + "/api.php?action=ping");
         const j = await res.json();
-        if (j && j.pay_qr) {
-          payQrImg.src = j.pay_qr;
-          payQrHint.textContent = (j.pay_mode === "auto" ? "\u5168\u81EA\u52A8\u652F\u4ED8\u6A21\u5F0F" : "\u5FAE\u4FE1\u626B\u7801\u70B9\u5355\u4ED8\u6B3E\uFF0C\u4ED8\u6B3E\u540E\u586B\u5355\u53F7") + "\uFF1B\u70B9\u51FB\u4E8C\u7EF4\u7801\u53EF\u653E\u5927";
-        } else {
-          payQrHint.textContent = "\u5DF2\u663E\u793A\u5185\u7F6E\u6536\u6B3E\u7801\uFF0C\u626B\u7801\u4ED8\u6B3E\u540E\u586B\u652F\u4ED8\u5355\u53F7\uFF1B\u70B9\u51FB\u4E8C\u7EF4\u7801\u53EF\u653E\u5927";
-        }
+        if (j && j.pay_qr_map && typeof j.pay_qr_map === "object") payQrMap = j.pay_qr_map;
+        if (j && j.pay_qr) payQrFallback = String(j.pay_qr);
+        if (j && j.pay_mode) payQrMode = String(j.pay_mode);
+        payQrLoaded = true;
+        applyPayQr();
+        syncPayAmt();
       } catch (e) {
         payQrHint.textContent = "\u70B9\u5355\u7801\u52A0\u8F7D\u5931\u8D25\uFF0C\u8BF7\u8054\u7F51\u540E\u5237\u65B0";
       }
     })();
     const payPlanRow = document.createElement("div");
     payPlanRow.style.cssText = "display:flex;gap:6px;flex-wrap:wrap;";
-    /* v2.0.5 价格更新：年付为主推（默认选中），永久约等于 5 年费用 */
-    let selPlan = "Y";
+    /* v2.2.6 取消档位默认选中：v2.0.5 起默认点亮「年卡 ¥39」，而买家常常扫的是别处保存的月卡码 ——
+       面板亮年卡、钱付月卡；v2.2.5 又把「实付金额」按默认档位自动填成 39，两个信号同源，
+       云端等值校验变成自己验自己 → 实付 ¥6 直接发成年卡（生产事故 R301F66）。
+       现在档位必须买家自己点，金额必须买家自己填。 */
+    let selPlan = "";
     /* v2.1.1 价格从统一数据源生成（云端下发后自动跟随） */
     const _pt = this.priceTable();
+    /* v2.2.2 应付金额提示 + 实付金额输入：修「实付 ¥6 月卡却拿到 ¥39 年卡」
+       （此前套餐纯客户端自选、云端零金额校验，选错或漏选都会发错档） */
+    const payAmtTip = document.createElement("div");
+    payAmtTip.style.cssText = "font-size:13px;font-weight:bold;color:#e6a23c;";
+    const payAmtInput = document.createElement("input");
+    payAmtInput.className = "b3-text-field";
+    payAmtInput.style.cssText = "width:100px;";
+    /* v2.2.3 实付金额默认留空、必须手填：v2.2.2 默认自动填成套餐价，买家留在默认「年卡 ¥39」
+       没动金额框、实际只付了 ¥6 时，金额与套餐价"看起来一致" → 云端校验失效、照样发年卡。
+       留空强制买家填真实金额，点错套餐时金额与套餐不符，云端就不发码。 */
+    payAmtInput.placeholder = "\u4F60\u5B9E\u9645\u4ED8\u4E86\u591A\u5C11";
+    let _amtWarned = "";
+    const syncPayAmt = () => {
+      const price = Number(_pt[selPlan]) || 0;
+      applyPayQr();
+      /* v2.2.6 删掉「按所选档位自动填金额」：v2.2.5 的自动填等于替买家申报实付金额，
+         金额与档位两个信号同源 → 云端等值校验自己验自己（生产实测付 ¥6 发年卡 R301F66）。
+         金额框从此永远由买家自己填，插件不写它。 */
+      if (!selPlan) {
+        payAmtTip.textContent = "\u{1F449} \u8BF7\u5148\u70B9\u9009\u6863\u4F4D\uFF1A\u6708\u5361 \u00A56 / \u5E74\u5361 \u00A539 / \u4E09\u5E74 \u00A589 / \u6C38\u4E45 \u00A5199";
+      } else {
+        payAmtTip.textContent = "\u{1F449} \u5DF2\u9009\uFF1A" + (EDB_PRICE_TABLE_CN[selPlan] || selPlan) + "\u3000\u8BF7\u652F\u4ED8 \u00A5" + price + " \u5143" + (payQrMap[selPlan] ? "\uFF08\u8BF7\u626B\u4E0B\u65B9\u300C" + (EDB_PRICE_TABLE_CN[selPlan] || selPlan) + "\u300D\u4E13\u7528\u6536\u6B3E\u7801\uFF0C\u91D1\u989D\u5DF2\u56FA\u5B9A\uFF09" : "\uFF08\u8BF7\u5728\u4E0B\u65B9\u586B\u4F60\u5B9E\u9645\u652F\u4ED8\u7684\u91D1\u989D\uFF09");
+      }
+      payAmtInput.placeholder = "\u5B9E\u9645\u4ED8\u4E86\u591A\u5C11";
+      _amtWarned = "";
+    };
     const plans = ["M", "Y", "H", "F"].map((k) => [k, EDB_PRICE_TABLE_CN[k] + " \u00A5" + _pt[k]]);
     for (const [k, label] of plans) {
       const b = document.createElement("button");
@@ -15610,10 +15669,24 @@ var EdbPlugin = class extends Plugin {
         selPlan = k;
         for (const c of payPlanRow.children) c.style.outline = "";
         b.style.outline = "2px solid #3370ff";
+        syncPayAmt();
       });
       payPlanRow.appendChild(b);
     }
     payBox.appendChild(payPlanRow);
+    payBox.appendChild(payAmtTip);
+    const payAmtRow = document.createElement("div");
+    payAmtRow.style.cssText = "display:flex;gap:6px;align-items:center;flex-wrap:wrap;font-size:12px;";
+    const payAmtLabel = document.createElement("span");
+    payAmtLabel.textContent = "\u5B9E\u4ED8\u91D1\u989D\uFF08\u5143\uFF09";
+    const payAmtHint = document.createElement("span");
+    payAmtHint.style.cssText = "color:var(--b3-theme-on-background,#888);";
+    payAmtHint.textContent = "\u8BF7\u81EA\u5DF1\u586B\u4F60\u5728\u5FAE\u4FE1\u91CC\u5B9E\u9645\u4ED8\u51FA\u7684\u91D1\u989D\uFF08\u5143\uFF09\uFF1B\u5FC5\u987B\u7B49\u4E8E\u4E0A\u65B9\u6240\u9009\u6863\u4F4D\u7684\u4EF7\u683C\u624D\u4F1A\u81EA\u52A8\u53D1\u7801\uFF0C\u4E0D\u7B26\u5219\u8F6C\u4EBA\u5DE5\u6838\u5BF9\u3001\u4E0D\u4F1A\u81EA\u52A8\u53D1\u7801";
+    payAmtRow.appendChild(payAmtLabel);
+    payAmtRow.appendChild(payAmtInput);
+    payAmtRow.appendChild(payAmtHint);
+    payBox.appendChild(payAmtRow);
+    syncPayAmt();
     const payNote = document.createElement("input");
     payNote.className = "b3-text-field";
     payNote.placeholder = "\u5FAE\u4FE1\u652F\u4ED8\u5355\u53F7\uFF08\u4ED8\u6B3E\u540E\u4ECE\u5FAE\u4FE1\u652F\u4ED8\u8BE6\u60C5\u590D\u5236\uFF09";
@@ -15628,6 +15701,41 @@ var EdbPlugin = class extends Plugin {
     const payStatus = document.createElement("div");
     payStatus.style.cssText = "font-size:13px;color:var(--b3-theme-on-background,#666);min-height:20px;word-break:break-all;";
     payBox.appendChild(payStatus);
+    /* v2.2.2 云端下发绑定码后自动填进授权区，买家只需点一次「激活」 */
+    const fillCred = (c, b) => {
+      try {
+        const ci = document.getElementById("siyuan-edb-lic-input");
+        const bi = document.getElementById("siyuan-edb-bind-input");
+        if (ci && c) ci.value = String(c);
+        if (bi && b) {
+          bi.value = String(b);
+          showMessage("\u5DF2\u81EA\u52A8\u586B\u5165\u6FC0\u6D3B\u7801\u548C\u7ED1\u5B9A\u7801\uFF0C\u70B9\u300C\u6FC0\u6D3B\u300D\u5373\u53EF");
+        }
+      } catch (e) {
+      }
+    };
+    /* 绑定码由卖家面板签发后推送到云端，通常几秒内到；还没到就轮询等待（最多 24 次 × 5 秒） */
+    const startBindPoll = (url, reqId, code) => {
+      let bn = 0;
+      const bt = setInterval(async () => {
+        bn++;
+        try {
+          const rb = await fetch(url + "/api.php?action=payquery", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ reqId })
+          });
+          const jb = await rb.json();
+          if (jb && jb.ok && jb.bind) {
+            clearInterval(bt);
+            fillCred(code || jb.code, jb.bind);
+            return;
+          }
+        } catch (e) {
+        }
+        if (bn >= 24) clearInterval(bt);
+      }, 5000);
+    };
     payBtn.addEventListener("click", async () => {
       const note = payNote.value.trim();
       if (!note) {
@@ -15641,14 +15749,47 @@ var EdbPlugin = class extends Plugin {
           return;
         }
         const fp = (typeof lic !== "undefined" && lic.deviceFingerprint) ? lic.deviceFingerprint() : "";
+        /* v2.2.6 没点档位不提交：不让「默认档位」替买家做决定 */
+        if (!selPlan) {
+          showMessage("\u8BF7\u5148\u70B9\u9009\u4F60\u8981\u8D2D\u4E70\u7684\u6863\u4F4D\uFF08\u6708\u5361 \u00A56 / \u5E74\u5361 \u00A539 / \u4E09\u5E74 \u00A589 / \u6C38\u4E45 \u00A5199\uFF09\uFF0C\u518D\u70B9\u300C\u63D0\u4EA4\u8BA2\u5355\u300D");
+          return;
+        }
+        /* v2.2.2 实付金额随单上报：与所选套餐价不符时云端不发码，转卖家人工核对 */
+        /* v2.2.6 删掉 v2.2.5 的「空 → 按套餐价自动补」兜底：那等于替买家申报实付金额，
+           校验就自己验自己了（生产实测付 ¥6 发年卡）。空就是空 → 本地拦下，不发请求、不消耗单号。 */
+        const amt = Number(String(payAmtInput.value).replace(/[^0-9.]/g, ""));
+        if (!(amt > 0)) {
+          /* v2.2.3 金额框默认空：必须手填，否则不提交（避免 0 元/漏填被当成"未填而已"） */
+          showMessage("\u8BF7\u5728\u300C\u5B9E\u4ED8\u91D1\u989D\u300D\u91CC\u586B\u4F60\u5B9E\u9645\u652F\u4ED8\u7684\u91D1\u989D\uFF08\u5143\uFF09\uFF0C\u5982 6 \u6216 39");
+          try { payAmtInput.focus(); } catch (e) {}
+          return;
+        }
+        /* v2.2.3 提交前先拦一次「金额与所选套餐不符」：绝大多数是点错/漏点套餐按钮，
+           本地提示比转人工快；确认确实按这个金额付的，再点一次就转人工核对。 */
+        const _price = Number(_pt[selPlan]) || 0;
+        if (_price > 0 && Math.abs(amt - _price) > 0.01) {
+          const _sig = selPlan + ":" + amt;
+          if (_amtWarned !== _sig) {
+            _amtWarned = _sig;
+            showMessage("\u26A0 \u4F60\u9009\u7684\u662F\u300C" + (EDB_PRICE_TABLE_CN[selPlan] || selPlan) + "\u300D\u5E94\u4ED8 \u00A5" + _price + "\uFF0C\u4F46\u5B9E\u4ED8\u586B\u7684\u662F \u00A5" + amt + "\u3002\u5982\u679C\u70B9\u9519\u4E86\u5957\u9910\uFF0C\u8BF7\u5148\u70B9\u4E0A\u9762\u5BF9\u5E94\u7684\u5957\u9910\u6309\u94AE\uFF1B\u4F60\u786E\u5B9E\u4ED8\u4E86 \u00A5" + amt + "\uFF0C\u8BF7\u518D\u70B9\u4E00\u6B21\u300C\u63D0\u4EA4\u8BA2\u5355\u300D\u8F6C\u4EBA\u5DE5\u6838\u5BF9\u3002");
+            return;
+          }
+        } else {
+          _amtWarned = "";
+        }
         const res = await fetch(url + "/api.php?action=buyreq", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ plan: selPlan, note, fp })
+          body: JSON.stringify({ plan: selPlan, note, fp, amt })
         });
         const j = await res.json();
         if (!j.ok) {
           showMessage(j.msg || "\u63D0\u4EA4\u5931\u8D25");
+          return;
+        }
+        /* v2.2.2 金额与所选套餐不符：云端刻意不发码，等卖家核对收款后再发 */
+        if (j.amtMismatch) {
+          payStatus.textContent = "\u26A0 \u4F60\u9009\u7684\u662F\u300C" + (EDB_PRICE_TABLE_CN[selPlan] || selPlan) + "\u300D\u5E94\u4ED8 \u00A5" + (j.expect || 0) + "\uFF0C\u4F46\u5B9E\u4ED8\u586B\u7684\u662F \u00A5" + amt + "\uFF0C\u4E0D\u7B26\uFF08\u5DF2\u8F6C\u5356\u5BB6\u4EBA\u5DE5\u6838\u5BF9\uFF0C\u4E0D\u4F1A\u81EA\u52A8\u53D1\u7801\uFF09\u3002\u5355\u53F7 " + j.reqId + "\uFF1B\u5982\u679C\u53EA\u662F\u70B9\u9519\u4E86\u5957\u9910\uFF0C\u6539\u9009\u5BF9\u5E94\u5957\u9910\u540E\u91CD\u65B0\u63D0\u4EA4\u5373\u53EF\u3002";
           return;
         }
         /* v1.6.56 库存自动发码：提交即已发码（云端从库存池直接取码返回），零等待直接显示 */
@@ -15663,6 +15804,16 @@ var EdbPlugin = class extends Plugin {
           });
           payStatus.innerHTML = "\u2705 \u5DF2\u53D1\u7801\uFF1A<b style='color:#7ee787'>" + j.code + "</b>";
           payStatus.appendChild(cp);
+          /* v2.2.2 绑定码：云端已下发就直接填入授权区；还没签发就等卖家面板推送后自动填 */
+          if (j.bind) {
+            fillCred(j.code, j.bind);
+          } else {
+            const wt = document.createElement("div");
+            wt.style.cssText = "color:#e6a23c;font-size:12px;margin-top:4px;";
+            wt.textContent = "\u23F3 \u7ED1\u5B9A\u7801\u7531\u5356\u5BB6\u9762\u677F\u81EA\u52A8\u7B7E\u53D1\u4E2D\uFF0C\u7A0D\u5019\u4F1A\u81EA\u52A8\u586B\u5165\u4E0A\u65B9\u6388\u6743\u533A\u2026";
+            payStatus.appendChild(wt);
+            startBindPoll(url, j.reqId, j.code);
+          }
           return;
         }
         payStatus.textContent = "\u8BA2\u5355\u5DF2\u63D0\u4EA4\uFF1A" + j.reqId + "\uFF0C\u7B49\u5F85\u5356\u5BB6\u6838\u5BF9\u53D1\u7801\u2026";
@@ -15692,6 +15843,9 @@ var EdbPlugin = class extends Plugin {
               });
               payStatus.innerHTML = "\u2705 \u5DF2\u53D1\u7801\uFF1A<b style='color:#7ee787'>" + j2.code + "</b>";
               payStatus.appendChild(cp);
+              /* v2.2.2 绑定码：有就自动填入，没有就继续等（卖家面板签发后会推送到云端） */
+              if (j2.bind) fillCred(j2.code, j2.bind);
+              else startBindPoll(url, j.reqId, j2.code);
               return;
             }
             if (n >= 24) {

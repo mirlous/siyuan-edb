@@ -13576,7 +13576,7 @@ var EdbPlugin = class extends Plugin {
   /** 当前插件版本（与 plugin.json 同步，发布时手工更新） */
   curVersion() {
     /* v1.6.63 必须与 plugin.json 的 version 保持一致（每次发版两处同步改） */
-    return "2.2.7";
+    return "2.2.8";
   }
   versionAtLeast(latest, cur) {
     const p = (s) => String(s || "").split(".").map((x) => parseInt(x, 10) || 0);
@@ -15740,65 +15740,142 @@ var EdbPlugin = class extends Plugin {
        所以界面一关（重启思源 / 关掉设置面板）买家就再也拿不到这张码，只能找卖家。
        现在 buyreq 成功即把 reqId 记进 config.json，购买区显示「上次订单 … 查询激活码」，
        点一下走 payquery 取回 code + bind（云端本来就存着，不含任何金额放宽）。 */
-    const _LO = {"last": "\u4e0a\u6b21\u8ba2\u5355 ", "query": "\u67e5\u8be2\u6fc0\u6d3b\u7801", "queryTip": "\u91cd\u542f\u601d\u6e90\u540e\u4e5f\u80fd\u7528\u5b83\u53d6\u56de\u5df2\u53d1\u51fa\u7684\u6fc0\u6d3b\u7801", "noServer": "\u672a\u914d\u7f6e\u670d\u52a1\u5668\u5730\u5740", "fail": "\u67e5\u8be2\u5931\u8d25", "wait1": "\u23f3 \u8ba2\u5355 ", "wait2": " \u4ecd\u5728\u7b49\u5f85\u5356\u5bb6\u6838\u5bf9\u53d1\u7801\uff0c\u7a0d\u540e\u518d\u70b9\u300c\u67e5\u8be2\u6fc0\u6d3b\u7801\u300d", "copy": "\u590d\u5236", "copied": "\u5df2\u590d\u5236\u6fc0\u6d3b\u7801", "copyManual": "\u8bf7\u624b\u52a8\u590d\u5236\uff1a", "got": "\u2705 \u5df2\u53d6\u56de\u6fc0\u6d3b\u7801\uff1a", "failNet": "\u67e5\u8be2\u5931\u8d25\uff08\u7f51\u7edc\uff09\uff1a"};
+    /* v2.2.8 修「老订单反而取不回」：lastPayOrder 只在 v2.2.7 起的客户端成功提交时才写入，
+       升级前（≤v2.2.6）提交的订单本地根本没有这条记录 → 上面那一行对这些买家不渲染，
+       最需要找回的人恰好看不到入口（卖家 14:0x 丢的 R0764B6 就是这个情况）。
+       现在：① 面板打开时若本地无记录，用本机指纹问云端「我这台机器最近的订单」并自动补出该行；
+             ② 入口常驻：没有记录时显示「找回我上次买的激活码」，点一下即取回激活码 + 绑定码。
+       云端契约：payquery 传 {fp}（不带 reqId）→ {ok,found,reqId,plan,amt,ts,status,code,bind,count}。 */
+    const _LO = {
+      last: "上次订单 ", query: "查询激活码", queryTip: "重启思源后也能用它取回已发出的激活码",
+      noServer: "未配置服务器地址", fail: "查询失败",
+      wait1: "⏳ 订单 ", wait2: " 仍在等待卖家核对发码，稍后再点「查询激活码」",
+      copy: "复制", copied: "已复制激活码", copyManual: "请手动复制：", got: "✅ 已取回激活码：",
+      failNet: "查询失败（网络）：",
+      look: "🔎 找回我上次买的激活码", lookTip: "用本机设备指纹向云端找回最近一单，不需要记得支付单号",
+      looking: "正在向云端查找…", none: "云端没有这台设备的订单记录（换过电脑或重装过系统的话请找卖家）"
+    };
+    const edbPayBase = () => String(this.edbOnlineUrl()).replace(/\/+$/, "").replace(/\/api\.php$/i, "");
+    const edbFp = () => {
+      try { return (typeof lic !== "undefined" && lic.deviceFingerprint) ? String(lic.deviceFingerprint() || "") : ""; } catch (e) { return ""; }
+    };
+    const rememberPayOrder = (lo) => {
+      try {
+        this.cfg.lastPayOrder = lo;
+        this.saveData("config.json", JSON.stringify(this.cfg)).catch(() => {});
+      } catch (e) {}
+    };
+    /* 取回：拿 reqId 问云端要 code + bind，回来了就回显 + 自动填进授权区 */
+    const doQueryOrder = async (lo, btn) => {
+      if (btn) btn.disabled = true;
+      try {
+        const url = edbPayBase();
+        if (!url) { showMessage(_LO.noServer); return; }
+        const rl = await fetch(url + "/api.php?action=payquery", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ reqId: lo.reqId })
+        });
+        const jl = await rl.json();
+        if (!jl || !jl.ok) { showMessage((jl && jl.msg) || _LO.fail); return; }
+        if (jl.status !== "issued" || !jl.code) {
+          payStatus.textContent = _LO.wait1 + lo.reqId + _LO.wait2;
+          return;
+        }
+        const cpl = document.createElement("button");
+        cpl.textContent = _LO.copy;
+        cpl.className = "b3-button";
+        cpl.style.cssText = "font-size:12px;padding:2px 10px;margin-left:8px;";
+        cpl.addEventListener("click", () => {
+          try { navigator.clipboard.writeText(jl.code); showMessage(_LO.copied); }
+          catch (e) { showMessage(_LO.copyManual + jl.code); }
+        });
+        payStatus.innerHTML = _LO.got + "<b style='color:#7ee787'>" + jl.code + "</b>";
+        payStatus.appendChild(cpl);
+        if (jl.bind) fillCred(jl.code, jl.bind);
+        else startBindPoll(url, lo.reqId, jl.code);
+      } catch (e) {
+        showMessage(_LO.failNet + (e && e.message ? e.message : e));
+      } finally {
+        if (btn) btn.disabled = false;
+      }
+    };
+    /* v2.2.8 按本机指纹从云端找最近一单（老订单本地没记录，靠这条补出来） */
+    const lookupPayOrder = async (silent) => {
+      const url = edbPayBase();
+      if (!url) { if (!silent) showMessage(_LO.noServer); return null; }
+      const fp = edbFp();
+      if (!fp) { if (!silent) showMessage(_LO.fail + "：取不到本机设备指纹"); return null; }
+      const rq = await fetch(url + "/api.php?action=payquery", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ fp })
+      });
+      const j = await rq.json();
+      if (!j || !j.ok) { if (!silent) showMessage((j && j.msg) || _LO.fail); return null; }
+      if (!j.found || !j.reqId) { if (!silent) showMessage(_LO.none); return null; }
+      const tsMs = Date.parse(String(j.ts || "")) || Date.now();
+      const lo = { reqId: String(j.reqId), plan: String(j.plan || ""), amt: j.amt, ts: tsMs, fromServer: true };
+      rememberPayOrder(lo);
+      return { lo: lo, resp: j };
+    };
     const renderLastOrder = () => {
       try {
         const old = payBox.querySelector("#edb-last-order");
         if (old) old.remove();
       } catch (e) {}
       const lo = this.cfg && this.cfg.lastPayOrder;
-      if (!lo || !lo.reqId) return;
       const row = document.createElement("div");
       row.id = "edb-last-order";
       row.style.cssText = "font-size:12px;color:var(--b3-theme-on-background,#666);display:flex;gap:6px;align-items:center;flex-wrap:wrap;";
-      const txt = document.createElement("span");
-      let when = "";
-      try { when = lo.ts ? " " + new Date(lo.ts).toLocaleString() : ""; } catch (e) {}
-      txt.textContent = _LO.last + lo.reqId + "\uFF08" + (EDB_PRICE_TABLE_CN[lo.plan] || lo.plan || "") + " \u00A5" + (lo.amt || 0) + when + "\uFF09";
-      const qb = document.createElement("button");
-      qb.className = "b3-button b3-button--outline";
-      qb.style.cssText = "font-size:12px;padding:1px 8px;";
-      qb.textContent = _LO.query;
-      qb.title = _LO.queryTip;
-      qb.addEventListener("click", async () => {
-        qb.disabled = true;
-        try {
-          const url = String(this.edbOnlineUrl()).replace(/\/+$/, "").replace(/\/api\.php$/i, "");
-          if (!url) { showMessage(_LO.noServer); return; }
-          const rl = await fetch(url + "/api.php?action=payquery", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ reqId: lo.reqId })
-          });
-          const jl = await rl.json();
-          if (!jl || !jl.ok) { showMessage((jl && jl.msg) || _LO.fail); return; }
-          if (jl.status !== "issued" || !jl.code) {
-            payStatus.textContent = _LO.wait1 + lo.reqId + _LO.wait2;
-            return;
+      if (lo && lo.reqId) {
+        const txt = document.createElement("span");
+        let when = "";
+        try { when = lo.ts ? " " + new Date(lo.ts).toLocaleString() : ""; } catch (e) {}
+        txt.textContent = _LO.last + lo.reqId + "（" + (EDB_PRICE_TABLE_CN[lo.plan] || lo.plan || "") + " ¥" + (lo.amt || 0) + when + "）";
+        const qb = document.createElement("button");
+        qb.className = "b3-button b3-button--outline";
+        qb.style.cssText = "font-size:12px;padding:1px 8px;";
+        qb.textContent = _LO.query;
+        qb.title = _LO.queryTip;
+        qb.addEventListener("click", () => { doQueryOrder(lo, qb); });
+        row.appendChild(txt);
+        row.appendChild(qb);
+      } else {
+        /* 本地没有记录（升级前买的 / 换过工作区）也保留入口：先用指纹问云端，找不到再提示找卖家 */
+        const lb = document.createElement("button");
+        lb.className = "b3-button b3-button--outline";
+        lb.style.cssText = "font-size:12px;padding:1px 8px;";
+        lb.textContent = _LO.look;
+        lb.title = _LO.lookTip;
+        lb.addEventListener("click", async () => {
+          lb.disabled = true;
+          try {
+            payStatus.textContent = _LO.looking;
+            const r = await lookupPayOrder(false);
+            if (r) {
+              renderLastOrder();
+              await doQueryOrder(r.lo, null);
+            }
+          } catch (e) {
+            showMessage(_LO.failNet + (e && e.message ? e.message : e));
+          } finally {
+            lb.disabled = false;
           }
-          const cpl = document.createElement("button");
-          cpl.textContent = _LO.copy;
-          cpl.className = "b3-button";
-          cpl.style.cssText = "font-size:12px;padding:2px 10px;margin-left:8px;";
-          cpl.addEventListener("click", () => {
-            try { navigator.clipboard.writeText(jl.code); showMessage(_LO.copied); }
-            catch (e) { showMessage(_LO.copyManual + jl.code); }
-          });
-          payStatus.innerHTML = _LO.got + "<b style='color:#7ee787'>" + jl.code + "</b>";
-          payStatus.appendChild(cpl);
-          if (jl.bind) fillCred(jl.code, jl.bind);
-          else startBindPoll(url, lo.reqId, jl.code);
-        } catch (e) {
-          showMessage(_LO.failNet + (e && e.message ? e.message : e));
-        } finally {
-          qb.disabled = false;
-        }
-      });
-      row.appendChild(txt);
-      row.appendChild(qb);
+        });
+        row.appendChild(lb);
+      }
       payBox.appendChild(row);
     };
     renderLastOrder();
+    /* v2.2.8 面板打开时静默补一次：老买家不用点也能看见自己那一单（失败不打扰） */
+    (async () => {
+      try {
+        if (this.cfg && this.cfg.lastPayOrder && this.cfg.lastPayOrder.reqId) return;
+        const r = await lookupPayOrder(true);
+        if (r && r.lo) renderLastOrder();
+      } catch (e) {}
+    })();
     payBtn.addEventListener("click", async () => {
       const note = payNote.value.trim();
       if (!note) {

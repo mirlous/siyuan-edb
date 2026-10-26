@@ -13576,7 +13576,7 @@ var EdbPlugin = class extends Plugin {
   /** 当前插件版本（与 plugin.json 同步，发布时手工更新） */
   curVersion() {
     /* v1.6.63 必须与 plugin.json 的 version 保持一致（每次发版两处同步改） */
-    return "2.2.6";
+    return "2.2.7";
   }
   versionAtLeast(latest, cur) {
     const p = (s) => String(s || "").split(".").map((x) => parseInt(x, 10) || 0);
@@ -15736,6 +15736,69 @@ var EdbPlugin = class extends Plugin {
         if (bn >= 24) clearInterval(bt);
       }, 5000);
     };
+    /* v2.2.7 取回已发出的激活码：云端「同一微信支付单号只能用一次」（重复提交会被拒），
+       所以界面一关（重启思源 / 关掉设置面板）买家就再也拿不到这张码，只能找卖家。
+       现在 buyreq 成功即把 reqId 记进 config.json，购买区显示「上次订单 … 查询激活码」，
+       点一下走 payquery 取回 code + bind（云端本来就存着，不含任何金额放宽）。 */
+    const _LO = {"last": "\u4e0a\u6b21\u8ba2\u5355 ", "query": "\u67e5\u8be2\u6fc0\u6d3b\u7801", "queryTip": "\u91cd\u542f\u601d\u6e90\u540e\u4e5f\u80fd\u7528\u5b83\u53d6\u56de\u5df2\u53d1\u51fa\u7684\u6fc0\u6d3b\u7801", "noServer": "\u672a\u914d\u7f6e\u670d\u52a1\u5668\u5730\u5740", "fail": "\u67e5\u8be2\u5931\u8d25", "wait1": "\u23f3 \u8ba2\u5355 ", "wait2": " \u4ecd\u5728\u7b49\u5f85\u5356\u5bb6\u6838\u5bf9\u53d1\u7801\uff0c\u7a0d\u540e\u518d\u70b9\u300c\u67e5\u8be2\u6fc0\u6d3b\u7801\u300d", "copy": "\u590d\u5236", "copied": "\u5df2\u590d\u5236\u6fc0\u6d3b\u7801", "copyManual": "\u8bf7\u624b\u52a8\u590d\u5236\uff1a", "got": "\u2705 \u5df2\u53d6\u56de\u6fc0\u6d3b\u7801\uff1a", "failNet": "\u67e5\u8be2\u5931\u8d25\uff08\u7f51\u7edc\uff09\uff1a"};
+    const renderLastOrder = () => {
+      try {
+        const old = payBox.querySelector("#edb-last-order");
+        if (old) old.remove();
+      } catch (e) {}
+      const lo = this.cfg && this.cfg.lastPayOrder;
+      if (!lo || !lo.reqId) return;
+      const row = document.createElement("div");
+      row.id = "edb-last-order";
+      row.style.cssText = "font-size:12px;color:var(--b3-theme-on-background,#666);display:flex;gap:6px;align-items:center;flex-wrap:wrap;";
+      const txt = document.createElement("span");
+      let when = "";
+      try { when = lo.ts ? " " + new Date(lo.ts).toLocaleString() : ""; } catch (e) {}
+      txt.textContent = _LO.last + lo.reqId + "\uFF08" + (EDB_PRICE_TABLE_CN[lo.plan] || lo.plan || "") + " \u00A5" + (lo.amt || 0) + when + "\uFF09";
+      const qb = document.createElement("button");
+      qb.className = "b3-button b3-button--outline";
+      qb.style.cssText = "font-size:12px;padding:1px 8px;";
+      qb.textContent = _LO.query;
+      qb.title = _LO.queryTip;
+      qb.addEventListener("click", async () => {
+        qb.disabled = true;
+        try {
+          const url = String(this.edbOnlineUrl()).replace(/\/+$/, "").replace(/\/api\.php$/i, "");
+          if (!url) { showMessage(_LO.noServer); return; }
+          const rl = await fetch(url + "/api.php?action=payquery", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ reqId: lo.reqId })
+          });
+          const jl = await rl.json();
+          if (!jl || !jl.ok) { showMessage((jl && jl.msg) || _LO.fail); return; }
+          if (jl.status !== "issued" || !jl.code) {
+            payStatus.textContent = _LO.wait1 + lo.reqId + _LO.wait2;
+            return;
+          }
+          const cpl = document.createElement("button");
+          cpl.textContent = _LO.copy;
+          cpl.className = "b3-button";
+          cpl.style.cssText = "font-size:12px;padding:2px 10px;margin-left:8px;";
+          cpl.addEventListener("click", () => {
+            try { navigator.clipboard.writeText(jl.code); showMessage(_LO.copied); }
+            catch (e) { showMessage(_LO.copyManual + jl.code); }
+          });
+          payStatus.innerHTML = _LO.got + "<b style='color:#7ee787'>" + jl.code + "</b>";
+          payStatus.appendChild(cpl);
+          if (jl.bind) fillCred(jl.code, jl.bind);
+          else startBindPoll(url, lo.reqId, jl.code);
+        } catch (e) {
+          showMessage(_LO.failNet + (e && e.message ? e.message : e));
+        } finally {
+          qb.disabled = false;
+        }
+      });
+      row.appendChild(txt);
+      row.appendChild(qb);
+      payBox.appendChild(row);
+    };
+    renderLastOrder();
     payBtn.addEventListener("click", async () => {
       const note = payNote.value.trim();
       if (!note) {
@@ -15787,6 +15850,11 @@ var EdbPlugin = class extends Plugin {
           showMessage(j.msg || "\u63D0\u4EA4\u5931\u8D25");
           return;
         }
+        /* v2.2.7 记住本次订单：单号只能用一次，界面关掉后靠这条记录 + 「查询激活码」取回 */
+        try {
+          this.cfg.lastPayOrder = { reqId: j.reqId, note, plan: selPlan, amt, ts: Date.now() };
+          this.saveData("config.json", JSON.stringify(this.cfg)).catch(() => {});
+        } catch (e) {}
         /* v2.2.2 金额与所选套餐不符：云端刻意不发码，等卖家核对收款后再发 */
         if (j.amtMismatch) {
           payStatus.textContent = "\u26A0 \u4F60\u9009\u7684\u662F\u300C" + (EDB_PRICE_TABLE_CN[selPlan] || selPlan) + "\u300D\u5E94\u4ED8 \u00A5" + (j.expect || 0) + "\uFF0C\u4F46\u5B9E\u4ED8\u586B\u7684\u662F \u00A5" + amt + "\uFF0C\u4E0D\u7B26\uFF08\u5DF2\u8F6C\u5356\u5BB6\u4EBA\u5DE5\u6838\u5BF9\uFF0C\u4E0D\u4F1A\u81EA\u52A8\u53D1\u7801\uFF09\u3002\u5355\u53F7 " + j.reqId + "\uFF1B\u5982\u679C\u53EA\u662F\u70B9\u9519\u4E86\u5957\u9910\uFF0C\u6539\u9009\u5BF9\u5E94\u5957\u9910\u540E\u91CD\u65B0\u63D0\u4EA4\u5373\u53EF\u3002";

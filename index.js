@@ -4521,12 +4521,31 @@ var require_core = __commonJS({
     function clearAudit(db) {
       db.run("DELETE FROM audit");
     }
+    /* v2.2.9 安全加固：恢复密钥的 12 个词此前用 Math.random() 选取 ——
+       而这串词在 createVault 里被直接当作 MK 的派生输入（mk = deriveKey(recWords, ...)），
+       等于主密钥的种子。Math.random 是可预测的 PRNG，改用 CSPRNG 无偏取词。 */
+    function csprngIdx(n) {
+      const m = Number(n) || 0;
+      if (m <= 0)
+        return 0;
+      try {
+        if (typeof crypto3.randomInt === "function")
+          return crypto3.randomInt(0, m);
+      } catch (e) {
+      }
+      const lim = Math.floor(4294967296 / m) * m;
+      let v;
+      do {
+        v = crypto3.randomBytes(4).readUInt32BE(0);
+      } while (v >= lim);
+      return v % m;
+    }
     function genRecoveryWords() {
       const n = RECOVERY_WORDS.length;
       const out = [];
       const seen = {};
       while (out.length < 12) {
-        const w = RECOVERY_WORDS[Math.floor(Math.random() * n)];
+        const w = RECOVERY_WORDS[csprngIdx(n)];
         if (!seen[w]) {
           seen[w] = 1;
           out.push(w);
@@ -5325,9 +5344,23 @@ var require_core = __commonJS({
       const fd = fs2.openSync(dbPath2, "r+");
       const pos = fs2.fstatSync(fd).size;
       try {
+        /* v2.2.9 可靠性修复（E4）：库文件是**唯一副本**，写入分两步 ——
+           ① 文件尾追加新加密索引；② **原地改写**开头 128 字节文件头指向新索引。
+           第 ② 步若被断电/蓝屏/强杀撕裂，头部成为垃圾 → readHeader 失败 → **整库打不开**。
+           而原实现全插件没有任何 fsync，"先数据后头"的顺序并不被存储栈保证
+           （page cache 可重排/延迟落盘），而 flushVault 在每次同步、每次改设置都会跑。
+           这里在改头之前先把数据区落盘，改头之后再落一次。 */
         fs2.writeSync(fd, idx, 0, idx.length, pos);
+        try {
+          fs2.fsyncSync(fd);
+        } catch (e) {
+        }
         const header = buildHeader(state.iters, state.salt, pos, idx.length, state.kdf, state.hint, state.rec);
         fs2.writeSync(fd, header, 0, HEADER_LEN, 0);
+        try {
+          fs2.fsyncSync(fd);
+        } catch (e) {
+        }
       } finally {
         fs2.closeSync(fd);
       }
@@ -5905,7 +5938,10 @@ var require_license = __commonJS({
       return { ok: true, t: obj.t, d, n: String(obj.n || ""), s: Number(obj.s) || 0 };
     }
     function typeLabel(t) {
-      return t === "M" ? "\u6708" : t === "H" ? "\u534A\u5E74" : t === "Y" ? "\u5E74" : "\u6C38\u4E45";
+      /* v2.2.9 修正客户可见错误：H 在卖家面板 TYPE_DAYS 里是 1095 天（三年，¥89），
+         EDB_PRICE_TABLE_CN 也写「三年」，只有这里显示成「半年」——
+         付三年钱的客户在激活成功提示里看到"半年"。 */
+      return t === "M" ? "\u6708" : t === "H" ? "\u4E09\u5E74" : t === "Y" ? "\u5E74" : "\u6C38\u4E45";
     }
     function typePrice(t) {
       /* v2.1.1 统一从 EDB_PRICE_TABLE 取（云端下发时会覆盖） */
@@ -5990,7 +6026,10 @@ var require_license = __commonJS({
       try { push(deviceFingerprint()); } catch (e) { }
       for (const mac of fpAllMacs())
         push(fpLegacyWith(mac));
-      push(fpLegacyWith(""));
+      /* v2.2.9 安全加固：原本这里无条件 push(fpLegacyWith(""))——该值只用
+         hostname/username/platform/arch，用户随时可改，且与机器不强绑定。
+         若将来导出候选指纹用于绑定校验，它会成为「买一份装全公司」的入口
+         （T36 受控实验已实测），故移除。 */
       push(fpStable());
       return out;
     }
@@ -6053,7 +6092,7 @@ var require_license = __commonJS({
       const body = code.replace(/^EDBB/, "");
       return "EDBB-" + body.replace(/(.{4})(?=.)/g, "$1-");
     }
-    module2.exports = { PUB_KEY, b32Encode, b32Decode, makeCode, prettyCode, verifyCode, typeLabel, typePrice, deviceFingerprint, makeBindCode, verifyBindCode, prettyBindCode, authHmac };
+    module2.exports = { PUB_KEY, b32Encode, b32Decode, makeCode, prettyCode, verifyCode, typeLabel, typePrice, deviceFingerprint, fpStable, makeBindCode, verifyBindCode, prettyBindCode, authHmac };
   }
 });
 
@@ -6335,6 +6374,57 @@ var OCR_WORKER_JS = "https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/worker
 var OCR_CORE_WASM = "https://cdn.jsdelivr.net/npm/tesseract.js-core@5.1.1/tesseract-core-simd.wasm.js";
 var OCR_LANG_PATH = "https://tessdata.projectnaptha.com/4.0.0";
 var OCR_IMG_EXT = ["png", "jpg", "jpeg", "webp", "bmp"];
+/* ===== v2.2.9 安全加固（密码学）=====
+   1) 文档锁 / 加密备份此前 4 处 scryptSync 漏传 N/r/p，静默退化为 Node 默认
+      N=16384（16MiB），强度只有主库 N=32768（32MiB）的一半。此处显式声明，
+      并由 scryptStrong/scryptLegacy 统一提供，避免再次退化。
+   2) 新增常量时间比较 safeEq，替换密钥/令牌的 === / !== 短路比较。
+   3) 新增 CSPRNG 令牌 randToken / 无偏随机数 randInt，替换 Math.random
+      （V8 的 xorshift128+ 输出可被预测，不能用于生成凭据）。 */
+var LOCK_SCRYPT_N = 32768;
+var LOCK_SCRYPT_R = 8;
+var LOCK_SCRYPT_P = 1;
+var LOCK_SCRYPT_MAXMEM = 128 * 1024 * 1024;
+var LEGACY_SCRYPT_N = 16384; /* Node scryptSync 未传 N 时的默认值；只用于读取旧数据 */
+function scryptStrong(pwd, salt) {
+  return crypto3.scryptSync(pwd, salt, 32, { N: LOCK_SCRYPT_N, r: LOCK_SCRYPT_R, p: LOCK_SCRYPT_P, maxmem: LOCK_SCRYPT_MAXMEM });
+}
+function scryptLegacy(pwd, salt) {
+  return crypto3.scryptSync(pwd, salt, 32, { N: LEGACY_SCRYPT_N, r: 8, p: 1, maxmem: LOCK_SCRYPT_MAXMEM });
+}
+/** 常量时间字符串比较：两侧先 sha256 成固定长度，再 timingSafeEqual（消除长度泄漏与短路返回） */
+function safeEq(a, b) {
+  try {
+    if (a == null || b == null)
+      return false;
+    const x = crypto3.createHash("sha256").update(String(a), "utf8").digest();
+    const y = crypto3.createHash("sha256").update(String(b), "utf8").digest();
+    return crypto3.timingSafeEqual(x, y);
+  } catch (e) {
+    return false;
+  }
+}
+/** CSPRNG 令牌（替换 Math.random().toString(36)） */
+function randToken(prefix, bytes) {
+  return String(prefix || "") + crypto3.randomBytes(bytes || 16).toString("hex");
+}
+/** CSPRNG 无偏随机整数 [0, n) */
+function randInt(n) {
+  const m = Number(n) || 0;
+  if (m <= 0)
+    return 0;
+  try {
+    if (typeof crypto3.randomInt === "function")
+      return crypto3.randomInt(0, m);
+  } catch (e) {
+  }
+  const lim = Math.floor(4294967296 / m) * m;
+  let v;
+  do {
+    v = crypto3.randomBytes(4).readUInt32BE(0);
+  } while (v >= lim);
+  return v % m;
+}
 var VIEWER_HTML = `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -6940,6 +7030,12 @@ var EdbPlugin = class extends Plugin {
       this.fetchPriceTable().catch(() => {
       });
     }, 2000);
+    /* v2.2.10 后台等待卖家发码：买家提交订单后哪怕关掉面板/重启思源，
+       只要卖家一确认收款并发码，插件就自动完成激活（无需买家再点「激活」）。
+       延迟 30s 启动（避开启动期网络竞争），之后由 _bgPayPoll 内部节奏控制。 */
+    setTimeout(() => {
+      this._bgPayPollStart().catch(() => {});
+    }, 30000);
     /* v2.0.9 匿名使用统计（首次 30 秒后，之后每 24 小时；可在设置里关闭） */
     this.scheduleUsageReport();
     /* v1.9.0 U7 首次使用向导（延迟 2.5s，等思源 UI 完全就绪；已用过的用户不会弹） */
@@ -7020,6 +7116,12 @@ var EdbPlugin = class extends Plugin {
         this.checkUpdate().catch((e) => console.error("[siyuan-edb] \u68C0\u67E5\u66F4\u65B0\u5931\u8D25", e));
       }, 8e3);
     }
+    /* v2.2.10 官方更新提醒：无论是否配置 updateUrl，启动 90 秒后向官方服务器检查新版本。
+       很多买家不知道插件已更新，还在用旧版。用 ping 接口拿 official.version 比对，
+       有新版本时弹窗提示并给出下载链接。 */
+    setTimeout(() => {
+      this.checkOfficialUpdate().catch((e) => console.error("[siyuan-edb] \u5B98\u65B9\u66F4\u65B0\u68C0\u67E5\u5931\u8D25", e));
+    }, 90e3);
     try {
       if (typeof document !== "undefined" && document.addEventListener) {
         document.addEventListener("mousemove", bump);
@@ -7203,11 +7305,14 @@ var EdbPlugin = class extends Plugin {
         this.cfg.watchlist = [];
       /* v1.6.36 试用时间完整性：trialStart 存在但指纹缺失/不匹配 = 试用状态被篡改 → 试用失效（不重置，防无限重置白嫖） */
       if (this.cfg.trialStart) {
-        if (!this.cfg.trialH) {
-          this.cfg.trialH = lic.authHmac("trial", this.cfg.trialStart);
-        } else if (this.cfg.trialH !== lic.authHmac("trial", this.cfg.trialStart)) {
+        /* v2.2.9 安全加固（C3）：原逻辑是"trialH 缺失 → 当成旧版文件并自动补签"，
+           于是把 trialStart 改成现在、**删掉 trialH**、再删掉 ~/.siyuan-edb/trial-*.json
+           镜像，三锚点全部换新 → 试用无限重置（注释自称"防无限重置白嫖"，但防线被
+           "删字段"而不是"改字段"绕过）。
+           trialH 自 v1.6.36 起由 saveConfig 无条件写入，正常升级路径上不存在"缺失"，
+           因此一律 fail-closed 判为篡改。 */
+        if (!this.cfg.trialH || !safeEq(this.cfg.trialH, lic.authHmac("trial", this.cfg.trialStart)))
           this.cfg.trialTampered = true;
-        }
       }
     }
     if (!this.cfg.dbPath || this.cfg.dbPath === "__AUTO__" || this.cfg.dbPath === DEFAULT_DB_PATH) {
@@ -7283,11 +7388,14 @@ var EdbPlugin = class extends Plugin {
     const _v = this.cfg.vaults && this.cfg.vaults[this.cfg.activeVault];
     if (_v && Array.isArray(this.cfg.watchlist))
       _v.watchlist = this.cfg.watchlist;
-    /* v1.6.36 试用时间完整性：每次保存时按当前 trialStart 重算 HMAC 指纹 */
+    /* v1.6.36 试用时间完整性：每次保存时按当前 trialStart 重算 HMAC 指纹。
+       v2.2.9 安全加固（C3）：原先这里**无条件**把 trialTampered 清成 false，
+       使 loadConfig 里的篡改判定形同虚设（判出来也活不过下一次保存）——
+       这是"删字段重置试用"能得手的真正原因。
+       现在：一旦判定篡改就保留标记，并且不再用被篡改的 trialStart 覆盖 trialH（保留证据）。 */
     if (this.cfg.trialStart) {
-      this.cfg.trialH = lic.authHmac("trial", this.cfg.trialStart);
-      if (this.cfg.trialTampered)
-        this.cfg.trialTampered = false;
+      if (!this.cfg.trialTampered)
+        this.cfg.trialH = lic.authHmac("trial", this.cfg.trialStart);
     }
     await this.saveData("config.json", JSON.stringify(this.cfg));
     /* v1.6.35 双写备份：防手动删除 config.json 重置试用/配置 */
@@ -7416,6 +7524,10 @@ var EdbPlugin = class extends Plugin {
         freed,
         sync,
         unlocked,
+        /* v2.2.9：授权/试用完整性被判定为篡改时上报一个布尔位。
+           此前 authTampered 只被写入、从不被读取（死标志），卖家看不到有人在改授权文件。
+           仅上报布尔值，不含任何内容/路径/标题，隐私边界不变。 */
+        tamper: (this.cfg.authTampered || this.cfg.trialTampered) ? 1 : 0,
         reason: String(reason || ""),
       };
       const ctrl = typeof AbortController !== "undefined" ? new AbortController() : null;
@@ -8037,6 +8149,24 @@ var EdbPlugin = class extends Plugin {
       }
     }
   }
+  /** v2.2.10 性能：编辑已入库文档时，每个事务都整篇 injectDocAssets（全 DOM 扫描 +
+      逐媒体元素重写）会让大文档打字掉帧。这里按文档 700ms 防抖合并：连续输入只注入最后一次，
+      且同一文档 700ms 内最多注入一次（媒体显示晚 <1s，无感知）。 */
+  scheduleInjectDoc(docId) {
+    try {
+      if (!docId)
+        return;
+      if (!this._injT)
+        this._injT = {};
+      if (this._injT[docId])
+        clearTimeout(this._injT[docId]);
+      this._injT[docId] = setTimeout(() => {
+        delete this._injT[docId];
+        this.injectDocAssets(docId).catch((e2) => console.error("[siyuan-edb] 注入失败", docId, e2));
+      }, 700);
+    } catch (e) {
+    }
+  }
   /** 该资产是否属于"内存注入型"（图片/视频/音频/PDF 可直接注入显示播放）；其余为"文件型"（xlsx/docx/zip 等需真实文件供点击打开/下载） */
   assetIsInline(name) {
     const ext = (name.split(".").pop() || "").toLowerCase();
@@ -8479,7 +8609,7 @@ var EdbPlugin = class extends Plugin {
     this._streamStarting = new Promise((resolve, reject) => {
       try {
         const http = require("http");
-        const token = "s" + Date.now().toString(36) + Math.random().toString(36).slice(2, 10);
+        const token = randToken("s", 16);
         const server = http.createServer((req, res) => this.handleStreamRequest(req, res));
         server.on("error", (e) => {
           console.error("[siyuan-edb] \u6D41\u5F0F\u670D\u52A1\u9519\u8BEF", e);
@@ -8493,7 +8623,7 @@ var EdbPlugin = class extends Plugin {
           this._streamServer = server;
           this._streamToken = token;
           this._streamBase = "http://127.0.0.1:" + addr.port + "/s/" + token + "/";
-          console.log("[siyuan-edb] \u5927\u9644\u4EF6\u6D41\u5F0F\u670D\u52A1\u5DF2\u542F\u52A8 " + this._streamBase);
+          console.log("[siyuan-edb] \u5927\u9644\u4EF6\u6D41\u5F0F\u670D\u52A1\u5DF2\u542F\u52A8 http://127.0.0.1:" + addr.port + "/s/****/ \uFF08\u4EE4\u724C\u4E0D\u8F93\u51FA\u5230\u65E5\u5FD7\uFF09");
           resolve(this._streamBase);
         });
       } catch (e) {
@@ -8522,7 +8652,7 @@ var EdbPlugin = class extends Plugin {
     try {
       const raw = req.url || "/";
       const m = /^\/s\/([^/]+)\/(.+)$/.exec(raw);
-      if (!m || m[1] !== this._streamToken) {
+      if (!m || !safeEq(m[1], this._streamToken)) {
         res.statusCode = 403;
         res.end("forbidden");
         return;
@@ -8722,12 +8852,25 @@ var EdbPlugin = class extends Plugin {
       if (dataDir) {
         const dir = path.join(dataDir, "storage", "petal", "siyuan-edb", "backup");
         fs.mkdirSync(dir, { recursive: true });
-        const fn = "orphan-backup-" + Date.now() + ".json";
-        fs.writeFileSync(path.join(dir, fn), JSON.stringify({
+        /* v2.2.9 安全加固：残留文档备份此前是【明文 Markdown】落盘
+           （backup/orphan-backup-*.json 内含 markdown 字段），与"全库加密、零明文"
+           的设计目标直接冲突。改用主密钥 AES-256-GCM 加密后落盘。 */
+        const fn = "orphan-backup-" + Date.now() + ".json.enc";
+        const _mk = this.state.mk || this.state.key;
+        const _iv = crypto3.randomBytes(12);
+        const _c = crypto3.createCipheriv("aes-256-gcm", _mk, _iv);
+        const _body = JSON.stringify({
           time: Date.now(),
           docs: orphans.map((d) => ({ doc_id: d.doc_id, notebook_id: d.notebook_id, title: d.title, hpath: d.hpath, markdown: d.markdown }))
-        }, null, 1), "utf8");
-        console.log("[siyuan-edb] \u5907\u4EFD\u672A\u52A0\u5165\u6B8B\u7559 ->", path.join(dir, fn));
+        });
+        const _ct = Buffer.concat([_c.update(Buffer.from(_body, "utf8")), _c.final()]);
+        fs.writeFileSync(path.join(dir, fn), JSON.stringify({
+          v: 2,
+          iv: _iv.toString("base64"),
+          tag: _c.getAuthTag().toString("base64"),
+          ct: _ct.toString("base64")
+        }), "utf8");
+        console.log("[siyuan-edb] \u5907\u4EFD\u672A\u52A0\u5165\u6B8B\u7559\uFF08\u5DF2\u7528\u4E3B\u5BC6\u94A5\u52A0\u5BC6\uFF09->", fn);
       }
     } catch (e) {
       console.error("[siyuan-edb] \u672A\u52A0\u5165\u6B8B\u7559\u5907\u4EFD\u5931\u8D25", e);
@@ -8745,6 +8888,75 @@ var EdbPlugin = class extends Plugin {
     this.flushVault();
     this.refreshPanel();
     return orphans.length;
+  }
+  /** v2.2.9 从【加密的】残留备份恢复文档（需已解锁；用主密钥解密）。
+   *  与 cleanOrphanDocs 配对：清理前加密备份，需要时可原样找回。 */
+  async restoreOrphanBackups() {
+    if (!this.isUnlocked() || !this.state) {
+      showMessage(this.t("needUnlock"));
+      return 0;
+    }
+    const dataDir = await this.wsDataDir();
+    if (!dataDir)
+      return 0;
+    const dir = path.join(dataDir, "storage", "petal", "siyuan-edb", "backup");
+    if (!fs.existsSync(dir)) {
+      showMessage("\u6CA1\u6709\u627E\u5230\u6B8B\u7559\u5907\u4EFD\u76EE\u5F55");
+      return 0;
+    }
+    const files = fs.readdirSync(dir).filter((f) => /^orphan-backup-.*\.json\.enc$/.test(f)).sort();
+    if (!files.length) {
+      showMessage("\u6CA1\u6709\u627E\u5230\u52A0\u5BC6\u6B8B\u7559\u5907\u4EFD");
+      return 0;
+    }
+    const mk = this.state.mk || this.state.key;
+    let n = 0;
+    const wl = new Set(this.cfg.watchlist);
+    for (const f of files) {
+      try {
+        const j = JSON.parse(fs.readFileSync(path.join(dir, f), "utf8"));
+        if (!j || !j.ct || !j.iv || !j.tag)
+          continue;
+        const dd = crypto3.createDecipheriv("aes-256-gcm", mk, Buffer.from(j.iv, "base64"));
+        dd.setAuthTag(Buffer.from(j.tag, "base64"));
+        const body = Buffer.concat([dd.update(Buffer.from(j.ct, "base64")), dd.final()]).toString("utf8");
+        const obj = JSON.parse(body);
+        for (const doc of obj.docs || []) {
+          if (!doc || !doc.doc_id)
+            continue;
+          try {
+            core.upsertDoc(this.state.db, {
+              doc_id: doc.doc_id,
+              notebook_id: doc.notebook_id || "",
+              title: doc.title || doc.doc_id,
+              hpath: doc.hpath || "",
+              markdown: doc.markdown || "",
+              created_at: Date.now(),
+              updated_at: Date.now()
+            });
+            if (!wl.has(doc.doc_id)) {
+              wl.add(doc.doc_id);
+              if (!Array.isArray(this.cfg.watchlist))
+                this.cfg.watchlist = [];
+              this.cfg.watchlist.push(doc.doc_id);
+            }
+            n++;
+          } catch (e) {
+          }
+        }
+      } catch (e) {
+      }
+    }
+    if (n > 0) {
+      this.flushVault();
+      try {
+        this.saveConfig();
+      } catch (e) {
+      }
+      this.refreshPanel();
+    }
+    showMessage("\u5DF2\u4ECE\u52A0\u5BC6\u6B8B\u7559\u5907\u4EFD\u6062\u590D " + n + " \u7BC7\u6587\u6863");
+    return n;
   }
   async cleanPlainAssets(onlyDocId, opts) {
     if (!this.state || this.cfg.keepPlain)
@@ -9079,7 +9291,18 @@ var EdbPlugin = class extends Plugin {
   applyNotebookVisibility() {
     try {
       /* v1.7.5 先重建 CSS（声明式、立即生效），JS 的 style.display 只作为兜底 */
-      this.rebuildHideCss();
+      /* v2.2.10 性能：CSS 内容只随「配置/锁态」变化，不随 DOM 变化。
+         MutationObserver/定时器的高频调用里配置没变 → 直接复用缓存，
+         跳过整条 rebuildHideCss（Set 构建 + 大字符串拼接 + style.textContent 比对）。 */
+      const _cssSig = (this.isUnlocked() ? "1" : "0") + "|" + (Number(this.cfg && this.cfg.activeVault) || 0)
+        + "|" + ((this.cfg && this.cfg.watchlist) || []).length
+        + "|" + ((this.cfg && this.cfg.excludedDocs) || []).length
+        + "|" + ((this.cfg && this.cfg.notebookInVault) || []).length
+        + "|" + ((this.cfg && this.cfg.vaults) || []).length;
+      if (this._visCssSig !== _cssSig) {
+        this._visCssSig = _cssSig;
+        this.rebuildHideCss();
+      }
       const nbMap = new Map();
       (this.cfg && Array.isArray(this.cfg.notebookInVault) ? this.cfg.notebookInVault : []).forEach((e) => {
         const bid = typeof e === "string" ? e : e && e.id;
@@ -9135,7 +9358,12 @@ var EdbPlugin = class extends Plugin {
       /* v1.9.2 U9 给文档树里已入库的文档加小锁标记 */
       this.markInVaultTree();
       /* v1.6.45: 隐藏 设置→资源→丢失的资源文件 中的密库加密资产条目（防泄露库内文件名） */
-      this.hideLostAssets();
+      /* v2.2.10 性能：内部已带「打字中跳过 + 20s 节流」，但整篇 TreeWalker 仍是大文档热路径，
+         这里再把调用频率与 markInVaultTree 对齐（配置签名变化才跑） */
+      if (_cssSig !== this._lostSig) {
+        this._lostSig = _cssSig;
+        this.hideLostAssets();
+      }
       /* v1.6.45: 密库已打开时每 60 秒刷新一次资产名缓存（未解锁也能用上次缓存隐藏） */
       const now = Date.now();
       if (this.state && this.state.db && (!this._assetSyncAt || now - this._assetSyncAt > 60000)) {
@@ -9248,9 +9476,30 @@ var EdbPlugin = class extends Plugin {
     const l = this.cfg.docLocks && this.cfg.docLocks[id];
     if (!l || !l.salt || !l.hash)
       return false;
+    const salt = Buffer.from(l.salt, "hex");
+    const pwd2 = String(pwd || "");
     try {
-      const h = crypto3.scryptSync(String(pwd || ""), Buffer.from(l.salt, "hex"), 32).toString("hex");
-      return h === l.hash;
+      /* v2.2.9：新参数优先（N=32768）。旧数据（漏传参数 → Node 默认 N=16384）
+         仍可验证，验证通过即透明重写为新参数，用户无感。 */
+      if (safeEq(scryptStrong(pwd2, salt).toString("hex"), l.hash)) {
+        if (l.v !== 2) {
+          try {
+            this.cfg.docLocks[id] = { salt: l.salt, hash: scryptStrong(pwd2, salt).toString("hex"), v: 2 };
+            this.saveConfig();
+          } catch (e2) {
+          }
+        }
+        return true;
+      }
+      if (safeEq(scryptLegacy(pwd2, salt).toString("hex"), l.hash)) {
+        try {
+          this.cfg.docLocks[id] = { salt: l.salt, hash: scryptStrong(pwd2, salt).toString("hex"), v: 2 };
+          this.saveConfig();
+        } catch (e2) {
+        }
+        return true;
+      }
+      return false;
     } catch (e) {
       return false;
     }
@@ -9348,10 +9597,11 @@ var EdbPlugin = class extends Plugin {
       return false;
     }
     const salt = crypto3.randomBytes(16);
-    const hash = crypto3.scryptSync(String(pwd), salt, 32).toString("hex");
+    /* v2.2.9：显式 N/r/p（此前漏传 → 静默退化为 Node 默认 N=16384，只有主库一半强度） */
+    const hash = scryptStrong(String(pwd), salt).toString("hex");
     if (!this.cfg.docLocks)
       this.cfg.docLocks = {};
-    this.cfg.docLocks[docId] = { salt: salt.toString("hex"), hash };
+    this.cfg.docLocks[docId] = { salt: salt.toString("hex"), hash, v: 2 };
     try {
       this.saveConfig();
     } catch (e) {
@@ -9391,17 +9641,32 @@ var EdbPlugin = class extends Plugin {
       if (!root || typeof MutationObserver === "undefined")
         return;
       let pending = false;
-      this._domObs = new MutationObserver(() => {
+      /* v2.2.10 性能：编辑器（.protyle）内部的每次击键都会产生 DOM 变更，
+         而隐藏 CSS 只作用于文档树/大纲/列表（v2.0.2 起 JS 兜底也只扫这些容器），
+         编辑器内变更绝不可能改变显隐结果 → 直接忽略。
+         其余变更（文档树增删、面板切换）走 120ms 真防抖合并（替代原来的微任务合并：
+         微任务在持续输入下仍每个事件循环触发一次完整 applyNotebookVisibility）。 */
+      this._domObs = new MutationObserver((muts) => {
         if (pending)
           return;
+        let inProtyle = true;
+        for (let i = 0; i < muts.length; i++) {
+          const t = muts[i].target;
+          if (!(t && t.nodeType === 1 && t.closest && t.closest(".protyle"))) {
+            inProtyle = false;
+            break;
+          }
+        }
+        if (inProtyle)
+          return;
         pending = true;
-        Promise.resolve().then(() => {
+        setTimeout(() => {
           pending = false;
           try {
             this.applyNotebookVisibility();
           } catch (e) {
           }
-        });
+        }, 120);
       });
       this._domObs.observe(root, { childList: true, subtree: true });
     } catch (e) {
@@ -9666,8 +9931,13 @@ var EdbPlugin = class extends Plugin {
   hideLostAssets() {
     try {
       /* v2.0.2 性能：整篇 body 文本节点遍历开销大，节流到 8 秒一次 */
+      /* v2.2.10 性能：① 正在输入（lastActive 2s 内）直接跳过 —— 输入时设置面板不可能打开，
+         此时遍历整个 body 的文本节点就是纯粹的卡顿来源；
+         ② 节流 8s → 20s（丢失资产列表是低频变化，20s 隐藏延迟无感知） */
+      if (this.lastActive && Date.now() - this.lastActive < 2000)
+        return;
       const _now = Date.now();
-      if (this._lostAt && _now - this._lostAt < 8000)
+      if (this._lostAt && _now - this._lostAt < 20000)
         return;
       this._lostAt = _now;
       let names = this.cfg.encryptedAssets || [];
@@ -10327,7 +10597,8 @@ var EdbPlugin = class extends Plugin {
             if (this.cfg.keepPlain)
               this.restoreOpenAssets(id).catch((e2) => console.error("[siyuan-edb]", e2));
             else
-              this.injectDocAssets(id).catch((e2) => console.error("[siyuan-edb] \u6CE8\u5165\u5931\u8D25", id, e2));
+              /* v2.2.10 每个事务都整篇注入会让大文档打字掉帧 → 700ms 防抖合并 */
+              this.scheduleInjectDoc(id);
           }
           // v1.6.26: 编辑已入库文档 → 单篇实时自动入库（防抖合并；替代原先每次编辑都全量扫描）
           this.scheduleAutoSyncDoc(id);
@@ -10741,8 +11012,13 @@ var EdbPlugin = class extends Plugin {
     if (!this.cfg.autoSync)
       return;
     if (!this.isUnlocked()) {
+      /* v2.2.10 性能：未解锁时每篇非密库文档的每个事务都会走到这里，
+         原来每次都 refreshPanel() 重建整个面板 DOM → 打字卡。
+         只有 pendingSync 从 false→true 的第一次才需要刷新面板显示"待同步"标记。 */
+      const wasPending = this.pendingSync;
       this.pendingSync = true;
-      this.refreshPanel();
+      if (!wasPending)
+        this.refreshPanel();
       return;
     }
     if (this.syncTimer)
@@ -12100,35 +12376,70 @@ var EdbPlugin = class extends Plugin {
     try {
       /* v1.9.3 支持指定库路径：新建/封存库时 this.cfg.dbPath 可能还是旧库 */
       const _dbp = dbPathOverride || this.cfg.dbPath;
-      const dir = path.dirname(_dbp);
+      /* v2.2.9 安全加固：恢复密钥 12 词 → deriveKey → 直接就是 MK 的种子。
+         此前它被写在 .sydb【同一个目录】，等于把主密钥明文和密文放在一起 ——
+         整个目录被拷贝 / 被云同步 / 丢电脑即全库失守，也与本函数上方注释自相矛盾。
+         现在默认写到用户主目录（离开思源工作区），可用 cfg.recKeyDir 覆盖。 */
+      const _vaultDir = path.dirname(_dbp);
+      let dir = _vaultDir;
+      try {
+        const _custom = String(this.cfg.recKeyDir || "").trim();
+        if (_custom) {
+          fs.mkdirSync(_custom, { recursive: true });
+          dir = _custom;
+        } else {
+          const _home = require("os").homedir();
+          if (_home) {
+            dir = path.join(_home, "\u5BC6\u5E93\u6062\u590D\u5BC6\u94A5");
+            fs.mkdirSync(dir, { recursive: true });
+          }
+        }
+      } catch (e) {
+        dir = _vaultDir;
+      }
       const name = path.basename(_dbp).replace(/\.sydb$/i, "") || "\u5BC6\u5E93";
       /* v1.9.1 文件名带库名前缀，避免多库互相覆盖（此前固定名会让第二个库覆盖第一个库的密钥） */
       const p = path.join(dir, name + "+\u{1F511} \u6062\u590D\u5BC6\u94A5.txt");
       const content = "\u3010\u5BC6\u5E93\u6062\u590D\u5BC6\u94A5\u3011\u8BF7\u59A5\u5584\u4FDD\u7BA1\uFF08\u4E0D\u8981\u5B58\u5728\u7535\u8111\u4E0A\u6216\u53EF\u622A\u56FE\u53D1\u7ED9\u4ED6\u4EBA\uFF09\n\n\u5BC6\u5E93\uFF1A" + name + "\n\u5BC6\u5E93\u6587\u4EF6\uFF1A" + _dbp + "\n\u751F\u6210\u65F6\u95F4\uFF1A" + (/* @__PURE__ */ new Date()).toLocaleString() + "\n\n\u6062\u590D\u5BC6\u94A5\uFF1A" + words + "\n\n\u7528\u9014\uFF1A\u5FD8\u8BB0\u5BC6\u7801\u65F6\uFF0C\u5728\u89E3\u9501\u5F39\u7A97\u9009\u300C\u4F7F\u7528\u6062\u590D\u5BC6\u94A5\u300D\uFF0C\u8F93\u5165\u8FD9 12 \u4E2A\u8BCD\u5373\u53EF\u89E3\u9501\u5E76\u91CD\u8BBE\u65B0\u5BC6\u7801\u3002\n";
       fs.writeFileSync(p, content, "utf8");
+      /* v2.2.9 迁移：把仍留在【密库目录】里的恢复密钥明文删掉（内容已写入上面的安全位置）。
+         只处理本库同名文件，不递归、不删目录。 */
+      try {
+        const _inVault = path.join(_vaultDir, name + "+\u{1F511} \u6062\u590D\u5BC6\u94A5.txt");
+        if (_inVault !== p && fs.existsSync(_inVault)) {
+          fs.unlinkSync(_inVault);
+          console.log("[siyuan-edb] \u5DF2\u4ECE\u5BC6\u5E93\u76EE\u5F55\u79FB\u9664\u6062\u590D\u5BC6\u94A5\u660E\u6587:", _inVault);
+        }
+      } catch (e) {
+      }
       /* 清理历史遗留的同内容副本（避免恢复密钥散落多份明文） */
       try {
         /* v1.9.1 同时清理历史命名：记事本默认名、<库名>-恢复密钥.txt、以及旧的「🔑 恢复密钥.txt」
-           （旧无前缀名只在"该目录下没有其它库的密钥文件"时才清理，避免误删别的库） */
+           （旧无前缀名只在"该目录下没有其它库的密钥文件"时才清理，避免误删别的库）
+           v2.2.9：扫描范围同时覆盖【密库目录】与新的恢复密钥目录。 */
         const legacy = ["\u65B0\u5EFA \u6587\u672C\u6587\u6863.txt", name + "-\u6062\u590D\u5BC6\u94A5.txt"];
-        try {
-          const noPrefix = path.join(dir, "\u{1F511} \u6062\u590D\u5BC6\u94A5.txt");
-          if (fs.existsSync(noPrefix)) {
-            const others = fs.readdirSync(dir).filter((f) => f.endsWith("+\u{1F511} \u6062\u590D\u5BC6\u94A5.txt") && !f.startsWith(name + "+"));
-            if (!others.length)
-              legacy.push("\u{1F511} \u6062\u590D\u5BC6\u94A5.txt");
+        for (const _scan of [_vaultDir, dir]) {
+          try {
+            const noPrefix = path.join(_scan, "\u{1F511} \u6062\u590D\u5BC6\u94A5.txt");
+            if (fs.existsSync(noPrefix)) {
+              const others = fs.readdirSync(_scan).filter((f) => f.endsWith("+\u{1F511} \u6062\u590D\u5BC6\u94A5.txt") && !f.startsWith(name + "+"));
+              if (!others.length && legacy.indexOf("\u{1F511} \u6062\u590D\u5BC6\u94A5.txt") < 0)
+                legacy.push("\u{1F511} \u6062\u590D\u5BC6\u94A5.txt");
+            }
+          } catch (e) {
           }
-        } catch (e) {
         }
         for (const lf of legacy) {
-          const lp = path.join(dir, lf);
-          if (lp === p)
-            continue;
-          if (fs.existsSync(lp)) {
-            try {
-              fs.unlinkSync(lp);
-              console.log("[siyuan-edb] \u5DF2\u6E05\u7406\u5386\u53F2\u6062\u590D\u5BC6\u94A5\u526F\u672C:", lp);
-            } catch (e) {
+          for (const _scan of [_vaultDir, dir]) {
+            const lp = path.join(_scan, lf);
+            if (lp === p)
+              continue;
+            if (fs.existsSync(lp)) {
+              try {
+                fs.unlinkSync(lp);
+                console.log("[siyuan-edb] \u5DF2\u6E05\u7406\u5386\u53F2\u6062\u590D\u5BC6\u94A5\u526F\u672C:", lp);
+              } catch (e) {
+              }
             }
           }
         }
@@ -12907,7 +13218,7 @@ var EdbPlugin = class extends Plugin {
     }
   }
   genToken() {
-    return "v" + Date.now().toString(36) + Math.random().toString(36).slice(2, 10) + Math.random().toString(36).slice(2, 8);
+    return randToken("v", 20);
   }
   currentVaultName() {
     const vs = this.vaultList();
@@ -12916,24 +13227,69 @@ var EdbPlugin = class extends Plugin {
   }
   /** 生成 6 位移动端写权限 PIN（10 分钟有效；要求插件处于解锁态） */
   genViewerPin() {
-    const pin = String(Math.floor(1e5 + Math.random() * 9e5));
+    /* v2.2.9：改用 CSPRNG（此前 Math.random），并清零失败计数 */
+    const pin = String(randInt(900000) + 1e5);
     this.cfg.viewerPin = pin;
     this.cfg.viewerPinExp = Date.now() + 10 * 60 * 1e3;
+    this.pinReset();
     this.saveConfig();
     return pin;
   }
   viewerPinValid() {
     return this.cfg.viewerPin && this.cfg.viewerPin.length === 6 && Number(this.cfg.viewerPinExp) > Date.now();
   }
+  /* v2.2.9 防盗刷：连续 5 次失败锁定 15 分钟；同一来源 IP 每分钟最多 10 次尝试。
+     此前 PIN 校验没有任何失败计数 / 锁定 / 限速，LAN 内 9×10^5 空间可被穷举。 */
+  pinThrottle(ip) {
+    const now = Date.now();
+    if (Number(this._pinLockUntil) > now)
+      return Math.ceil((this._pinLockUntil - now) / 1e3);
+    this._pinFailIp = this._pinFailIp || {};
+    const k = String(ip || "");
+    const rec = this._pinFailIp[k];
+    if (rec && now - rec.t0 < 6e4) {
+      if (rec.n >= 10)
+        return Math.ceil((6e4 - (now - rec.t0)) / 1e3);
+    } else {
+      this._pinFailIp[k] = { t0: now, n: 0 };
+    }
+    return 0;
+  }
+  pinFail(ip) {
+    const now = Date.now();
+    this._pinFailIp = this._pinFailIp || {};
+    const k = String(ip || "");
+    const rec = this._pinFailIp[k] || { t0: now, n: 0 };
+    if (now - rec.t0 >= 6e4) {
+      rec.t0 = now;
+      rec.n = 0;
+    }
+    rec.n++;
+    this._pinFailIp[k] = rec;
+    this._pinFail = (Number(this._pinFail) || 0) + 1;
+    if (this._pinFail >= 5) {
+      this._pinLockUntil = now + 15 * 60 * 1e3;
+      this._pinFail = 0;
+      try {
+        this.auditNote("pin_lock", "\u8BBF\u95EE\u7801\u8FDE\u7EED\u5931\u8D25\u8FBE 5 \u6B21\uFF0C\u5DF2\u9501\u5B9A 15 \u5206\u949F");
+      } catch (e) {
+      }
+    }
+  }
+  pinReset() {
+    this._pinFail = 0;
+    this._pinLockUntil = 0;
+    this._pinFailIp = {};
+  }
   /** 写会话令牌：PIN 校验通过后签发（内存态，10 分钟） */
   issueWriteTok() {
-    const t = "w" + Date.now().toString(36) + Math.random().toString(36).slice(2, 12);
+    const t = randToken("w", 24);
     this._writeTok = t;
     this._writeTokExp = Date.now() + 10 * 60 * 1e3;
     return t;
   }
   writeTokValid(t) {
-    return t && t === this._writeTok && Number(this._writeTokExp) > Date.now();
+    return t && safeEq(t, this._writeTok) && Number(this._writeTokExp) > Date.now();
   }
   localIPs() {
     try {
@@ -12970,7 +13326,7 @@ var EdbPlugin = class extends Plugin {
       showMessage(this.t("burnNoDoc") || "\u5E93\u5185\u4E0D\u5B58\u5728\u8BE5\u6587\u6863");
       return;
     }
-    const token = "s" + Date.now().toString(36) + Math.random().toString(36).slice(2, 12) + Math.random().toString(36).slice(2, 8);
+    const token = randToken("s", 24);
     const exp = Date.now() + 24 * 60 * 60 * 1e3;
     this._shares = this._shares || {};
     this._shares[token] = { docId, title: doc.title || docId, exp };
@@ -13056,7 +13412,7 @@ var EdbPlugin = class extends Plugin {
       }
       const qget = (k) => k in q ? q[k] : null;
       const token = qget("k") || "";
-      const authOk = token && token === this.cfg.viewerToken;
+      const authOk = token && safeEq(token, this.cfg.viewerToken);
       if (p === "/viewer") {
         if (!authOk) {
           res.statusCode = 403;
@@ -13250,10 +13606,18 @@ var EdbPlugin = class extends Plugin {
           try {
             const b = JSON.parse(body || "{}");
             const pin = String(b.pin || "");
-            if (!this.viewerPinValid() || pin !== this.cfg.viewerPin) {
+            const _ip = String(req.socket && req.socket.remoteAddress || "");
+            const _wait = this.pinThrottle(_ip);
+            if (_wait > 0) {
+              this.json(res, 200, { ok: false, msg: "\u5C1D\u8BD5\u8FC7\u4E8E\u9891\u7E41\uFF0C\u8BF7 " + _wait + " \u79D2\u540E\u518D\u8BD5" });
+              return;
+            }
+            if (!this.viewerPinValid() || !safeEq(pin, this.cfg.viewerPin)) {
+              this.pinFail(_ip);
               this.json(res, 200, { ok: false, msg: "\u8BBF\u95EE\u7801\u65E0\u6548\u6216\u5DF2\u8FC7\u671F\uFF0C\u8BF7\u5728\u7535\u8111\u7AEF\u9762\u677F\u5237\u65B0" });
               return;
             }
+            this.pinReset();
             if (!this.isUnlocked()) {
               this.json(res, 200, { ok: false, msg: "\u7535\u8111\u7AEF\u5BC6\u5E93\u5F53\u524D\u672A\u89E3\u9501\uFF0C\u8BF7\u5148\u5728\u7535\u8111\u9762\u677F\u89E3\u9501\u518D\u7F16\u8F91" });
               return;
@@ -13293,7 +13657,7 @@ var EdbPlugin = class extends Plugin {
             const title = String(b.title || "").slice(0, 200) || id;
             const db = this.state.db;
             if (b.isNew) {
-              const nid = "d" + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+              const nid = randToken("d", 6);
               core.upsertDoc(db, { doc_id: nid, notebook_id: "mobile", title, hpath: title, markdown, created_at: Date.now(), updated_at: Date.now() });
               this.json(res, 200, { ok: true, id: nid });
             } else {
@@ -13573,10 +13937,61 @@ var EdbPlugin = class extends Plugin {
     } catch (e) {
     }
   }
+  /* v2.2.10 官方更新提醒：通过 ping 接口拿 official.version 比对，发现集市已上架新版则提示用户去集市更新 */
+  async checkOfficialUpdate() {
+    try {
+      const base = String(this.edbOnlineUrl() || "").replace(/\/+$/, "").replace(/\/api\.php$/i, "");
+      if (!base)
+        return;
+      const res = await fetch(base + "/api.php?action=ping", { cache: "no-store" });
+      if (!res.ok)
+        return;
+      const j = await res.json();
+      if (!j || !j.ok || !j.official || !j.official.version)
+        return;
+      const latest = String(j.official.version).trim();
+      const cur = (this.curVersion() || "").trim();
+      if (!latest || !cur || this.versionAtLeast(latest, cur))
+        return;
+      /* 同一版本当天只提醒一次，避免每次启动都弹窗打扰 */
+      const today = new Date().toISOString().slice(0, 10);
+      const seenKey = "edbUpdateSeen_" + latest.replace(/\./g, "_");
+      let seen = "";
+      try {
+        seen = String((this.cfg && this.cfg[seenKey]) || "");
+      } catch (e) {
+      }
+      if (seen === today)
+        return;
+      /* 有新版：提示去集市更新（不直接给下载链接，避免用户绕过集市装错包） */
+      const notes = String(j.official.notes || "").trim();
+      let txt = "\uD83C\uDD99 " + (this.t("officialUpdateAvail") || "\u5E02\u96C6\u5DF2\u4E0A\u67B6\u65B0\u7248") + " v" + latest + "\uFF08\u5F53\u524D v" + cur + "\uFF09";
+      if (notes)
+        txt += "\n\n" + (this.t("updateNotes") || "\u66F4\u65B0\u8BF4\u660E") + "\uFF1A" + notes;
+      txt += "\n\n" + (this.t("updateHowOfficial") || "\u8BF7\u524D\u5F80\uFF1A\u8BBE\u7F6E \u2192 \u5E02\u96C6 \u2192 \u5DF2\u4E0B\u8F7D \u2192 \u627E\u5230\u300C\u5BC6\u5E93\u300D\u70B9\u51FB\u66F4\u65B0\u3002");
+      const ok = await this.confirmBox(txt);
+      if (ok) {
+        try {
+          if (this.cfg) {
+            this.cfg[seenKey] = today;
+            await this.saveData("config.json", JSON.stringify(this.cfg));
+          }
+        } catch (e) {
+        }
+        /* 尝试打开集市已下载页（不同思源版本入口可能不同，失败则忽略） */
+        try {
+          if (typeof window !== "undefined" && window.open)
+            window.open("siyuan://settings/bazaar", "_self");
+        } catch (e) {
+        }
+      }
+    } catch (e) {
+    }
+  }
   /** 当前插件版本（与 plugin.json 同步，发布时手工更新） */
   curVersion() {
     /* v1.6.63 必须与 plugin.json 的 version 保持一致（每次发版两处同步改） */
-    return "2.2.8";
+    return "2.2.10";
   }
   versionAtLeast(latest, cur) {
     const p = (s) => String(s || "").split(".").map((x) => parseInt(x, 10) || 0);
@@ -14686,12 +15101,19 @@ var EdbPlugin = class extends Plugin {
       const base = path.basename(src).replace(/\.sydb$/i, "");
       const data = fs.readFileSync(src);
       const salt = crypto3.randomBytes(16);
-      const key = crypto3.scryptSync(pwd, salt, 32);
+      /* v2.2.9：显式 scrypt 参数，并把 N/r/p 写进文件头（EDBBK2），
+         让强度可被导入端读取，而不是靠"默认值"猜 —— 旧版漏传参数 = 默认 N=16384。 */
+      const key = scryptStrong(pwd, salt);
       const iv = crypto3.randomBytes(12);
       const c = crypto3.createCipheriv("aes-256-gcm", key, iv);
       const ct = Buffer.concat([c.update(data), c.final()]);
       const tag = c.getAuthTag();
-      const out = Buffer.concat([Buffer.from("EDBBK1"), salt, iv, tag, ct]);
+      const hdr = Buffer.alloc(18);
+      hdr.write("EDBBK2", 0, "utf8");
+      hdr.writeUInt32BE(LOCK_SCRYPT_N, 6);
+      hdr.writeUInt32BE(LOCK_SCRYPT_R, 10);
+      hdr.writeUInt32BE(LOCK_SCRYPT_P, 14);
+      const out = Buffer.concat([hdr, salt, iv, tag, ct]);
       const dest = path.join(path.dirname(src), base + "-enc-" + new Date().toISOString().replace(/[:T]/g, "").slice(0, 14) + ".sydbk");
       fs.writeFileSync(dest, out);
       showMessage("\u2705 \u5DF2\u5BFC\u51FA\u52A0\u5BC6\u5907\u4EFD\uFF08" + this.fmtSize(out.length) + "\uFF09\uFF1A" + dest + "\uFF08\u5BC6\u7801\u4E0D\u4FDD\u5B58\uFF0C\u8BF7\u7262\u8BB0\uFF09");
@@ -14706,10 +15128,20 @@ var EdbPlugin = class extends Plugin {
     try {
       const crypto3 = require("crypto");
       const raw = fs.readFileSync(file);
-      if (raw.subarray(0, 6).toString() !== "EDBBK1")
+      const magic = raw.subarray(0, 6).toString();
+      if (magic !== "EDBBK1" && magic !== "EDBBK2")
         throw new Error("\u4E0D\u662F\u6709\u6548\u7684\u52A0\u5BC6\u5907\u4EFD\u5305\uFF08\u9700 .sydbk\uFF09");
-      const salt = raw.subarray(6, 22), iv = raw.subarray(22, 34), tag = raw.subarray(34, 50), ct = raw.subarray(50);
-      const key = crypto3.scryptSync(pwd, salt, 32);
+      /* v2.2.9：EDBBK1 = 旧格式（scrypt 默认参数 N=16384，无法从文件得知，只能按默认值试）；
+         EDBBK2 = 新格式，头部自带 N/r/p。两者都必须能导入，否则老备份作废。 */
+      let off = 6, kN = LEGACY_SCRYPT_N, kR = 8, kP = 1;
+      if (magic === "EDBBK2") {
+        kN = raw.readUInt32BE(6);
+        kR = raw.readUInt32BE(10);
+        kP = raw.readUInt32BE(14);
+        off = 18;
+      }
+      const salt = raw.subarray(off, off + 16), iv = raw.subarray(off + 16, off + 28), tag = raw.subarray(off + 28, off + 44), ct = raw.subarray(off + 44);
+      const key = crypto3.scryptSync(pwd, salt, 32, { N: kN, r: kR, p: kP, maxmem: LOCK_SCRYPT_MAXMEM });
       const d = crypto3.createDecipheriv("aes-256-gcm", key, iv);
       d.setAuthTag(tag);
       const plain = Buffer.concat([d.update(ct), d.final()]);
@@ -15524,12 +15956,47 @@ var EdbPlugin = class extends Plugin {
     payBox.style.cssText = "border:1px solid var(--b3-border-color,#333);border-radius:6px;padding:10px;display:flex;flex-direction:column;gap:8px;";
     const payTitle = document.createElement("div");
     payTitle.style.cssText = "font-size:14px;font-weight:bold;";
-    payTitle.textContent = "\u{1F6D2} \u8D2D\u4E70\u6FC0\u6D3B\u7801\uFF08\u626B\u7801\u70B9\u5355\uFF09";
+    payTitle.textContent = "🛒 购买激活码";
     payBox.appendChild(payTitle);
     const payFlow = document.createElement("div");
     payFlow.style.cssText = "font-size:12px;color:var(--b3-theme-on-background,#666);line-height:1.7;";
-    payFlow.textContent = "\u6B65\u9AA4\uFF1A\u2460 \u626B\u4E0B\u65B9\u70B9\u5355\u7801\u9009\u5957\u9910\u4ED8\u6B3E \u2192 \u2461 \u4ECE\u5FAE\u4FE1\u652F\u4ED8\u8BE6\u60C5\u590D\u5236\u201C\u652F\u4ED8\u5355\u53F7\u201D \u2192 \u2462 \u586B\u4E0B\u65B9\u5355\u53F7\u63D0\u4EA4 \u2192 \u2463 \u5356\u5BB6\u6838\u5BF9\u540E\u81EA\u52A8\u53D1\u7801";
+    payFlow.textContent = "步骤：①选择下方套餐，付款码显示，再下方的 实付金额（元）填写对应金额 →② 扫二维码付款后 →③ 点击 查看账单详情 →④ 把转账单号 填写到 微信支付单号中，点击 我已付款，提交订单，等待审核后自动激活。关闭窗口 不影响激活，激活后会有通知。";
     payBox.appendChild(payFlow);
+    /* 付款方式示意图 */
+    const payGuideBox = document.createElement('div');
+    payGuideBox.style.cssText = 'display:flex;align-items:center;gap:10px;margin-top:4px;';
+    const payGuideImg = document.createElement('img');
+    payGuideImg.style.cssText = 'width:200px;height:auto;border:1px solid var(--b3-border-color,#333);border-radius:6px;object-fit:contain;background:#fff;cursor:zoom-in;';
+    payGuideImg.alt = '付款方式';
+    payGuideImg.src = 'data:image/jpeg;base64,/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8UHRofHh0aHBwgJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPC4zNDL/2wBDAQkJCQwLDBgNDRgyIRwhMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjL/wAARCAESAZADASIAAhEBAxEB/8QAHwAAAQUBAQEBAQEAAAAAAAAAAAECAwQFBgcICQoL/8QAtRAAAgEDAwIEAwUFBAQAAAF9AQIDAAQRBRIhMUEGE1FhByJxFDKBkaEII0KxwRVS0fAkM2JyggkKFhcYGRolJicoKSo0NTY3ODk6Q0RFRkdISUpTVFVWV1hZWmNkZWZnaGlqc3R1dnd4eXqDhIWGh4iJipKTlJWWl5iZmqKjpKWmp6ipqrKztLW2t7i5usLDxMXGx8jJytLT1NXW19jZ2uHi4+Tl5ufo6erx8vP09fb3+Pn6/8QAHwEAAwEBAQEBAQEBAQAAAAAAAAECAwQFBgcICQoL/8QAtREAAgECBAQDBAcFBAQAAQJ3AAECAxEEBSExBhJBUQdhcRMiMoEIFEKRobHBCSMzUvAVYnLRChYkNOEl8RcYGRomJygpKjU2Nzg5OkNERUZHSElKU1RVVldYWVpjZGVmZ2hpanN0dXZ3eHl6goOEhYaHiImKkpOUlZaXmJmaoqOkpaanqKmqsrO0tba3uLm6wsPExcbHyMnK0tPU1dbX2Nna4uPk5ebn6Onq8vP09fb3+Pn6/9oADAMBAAIRAxEAPwD3Np5AxAbv6VajJaNSepFUH++31NXof9Sn0oAwdc8W22hXqwXFtOylQxkUcAE+nU4AJJ6dBVdPHNk9jZ3AtrjfcGQ+ScBwiJuZxnAIwU/76o1vwk+q6zJfxXS25aBFB2Fm8xGcoTzjaN5471WfwZcrpENpDeQCeL7RtnMJBxLyR16Ak/gF7jNAF208Yw3GlyXz2FxGsTqkimSLAJzj5i4GOnp1FQ6X47sdQ0e71OS2ltra0iklmd5YmVQpIx8rk5O04yKbB4WvbfTtRsfNsJobxkGyWJyiLghjjdknoR8w6dqLfwldxWGqWdze29/9vtyjXM9uFl3hcJu2/KVXqMAHPPJJNAF2HxXBJf6fZvZ3cct1HI7FoH2xlFBI3bcN1IyPT3FZ9v4/trm8sbdbC4X7YrOhcMCqhgORtznDA47cgkYrQh0CWDW4L2NoEiijclVDbpJXVFLHnAGEHQck59c0B4Quo5YLyO6tTfb3MnmQboo1Y5AjXsU4xnryTQBcvfFf2UMyWJnQXBgDR3UXJ3qmeWzjc4B9D1roInMkKOy7WZQSuQce2RXH6h4MvrnUJpotStXglnM3kXNoXC5kjkK8MMgmIZznqfauvgVkt40fZvVQG8tdq5x2HYUASUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFAGZqNxLHZ3ZR8FY3wR24Nc0mj6enhuDUGsHubho0ZlErAuScGug1T/AI8r3/rk/wDI0zRkWTw9Yo6K6GBcqwyD+FcVWlCriEqiTVuuvVHZTqzp0G4Np3W3ozjZpdNt7O3ml0TaZCN2bp8AZHPrznj8KsvHpAuXhXTFLKjtj7S2TtUsT6ADAz3+YV2iWlvGpVLWBA3UKgAP6Uj2VtI7O9pbs7HLM0YJJ9zir+pYb/n3H7kR9cxH87+9nH+GLfS/EEVy8mlrB5JUAJcu+c5+npW//wAIro//AD6t/wB/W/xrUit4oCTFbxRk9dihc/kKk+b0H50fUsN/z7j9yF9cxH/Px/ezH/4RXR/+fVv+/rf40f8ACK6P/wA+rf8Af1v8a0Z7pbdlEithgTuAJAx9KqjW7by2ZtyMP+WbDDduxx6is5YfBxdnCP3I0VfFtXUpfeyD/hFdH/59W/7+t/jR/wAIro//AD6t/wB/W/xqVdetGYD5ly20EkHncF7E9zViXUYor+OzYHzZMY9OQT/7KacMNg5q8YR+5BLEYuLtKcvvZS/4RXR/+fVv+/rf40f8Iro//Pq3/f1v8asXOs21rM8cofKfeIHA4z1/A9fSmDXrFlVlcsrNtDDkZyBjPrz+hpOhgle8I6eSGq+LdrSlr5si/wCEV0f/AJ9W/wC/rf40f8Iro/8Az6t/39b/ABqx/bNvs3bJD820Koyx5x09ORz7imnXLZWAkWSPdnBcDBxnOMH/AGTS9hgv5I/cg9tjP5pfeyH/AIRXR/8An1b/AL+t/jR/wiuj/wDPq3/f1v8AGnJ4itHk2BJQTgDcuBzUw1q2aR0G7KnbgKSSeOgA561MaeAkrqMfuQ3UxqdnKX3sr/8ACK6P/wA+rf8Af1v8aP8AhFdH/wCfVv8Av63+NTza3aQ7dxYhgGBA4wen6c0qazbvHvUMcsFVRyST7fTn6U/ZYG7XLHTyQe1xlr80vvZX/wCEV0f/AJ9W/wC/rf40f8Iro/8Az6t/39b/ABqwmsWzEbsx5YIpfjcSeMfWtD5vQfnWkcJhJq8YRa9EZyxWKi7SnL72Y/8Awiuj/wDPq3/f1v8AGj/hFdH/AOfVv+/rf41sfN6D86Pm9B+dV9Sw3/PuP3IX1zEf8/H97Mf/AIRXR/8An1b/AL+t/jWdrmh6fpuky3dpE8U8bKUcSMcfMPeup+b0H51jeKs/8I7c5A6p3/2hXPi8Jh4YecowSaT6Lsb4XFV5V4RlNtNrq+5pP99vqavQ/wCpT6VRf77fU1eh/wBSn0r0jzx9FFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAY+qf8eV7/ANcn/kaboQzoVjntAtO1T/jyvf8Ark/8jTNEIXQLMs20C3XLZxjjrXK/95/7d/VHSv8Ad3/iX5Ms3F5aWlvLPPMkcURAkcnhcnHP4ms1PFegyBfL1GOTcNw2KxyM4z06VZlg0u7sWtGmhaGQjdiVcuQQeT3PAzWdb+E9BEoMO95UKvu+0bnBDblJPXg9M/0FdEea3vHO7X0LK+KtAdplXU4d0GfNHzZTGc549jWrbyw3VvHPC2+KRQytzyKwIvCGhW/mbXm+aQF9111OcgH15PQ+ta1q+n6dbR2cV1CqRLhVeYE46+tUIzvEEgSe3UITlWBYKzcdxwOnHfg1jQTafFLJMfMeYx+WGZGYhd27r9fz/CuzS5t5EDpPEyk4DBwQe9KJoCwAliLE4ADDJ71zyw0ZTcrvX+uxvHESUVGy0OKFzayqElkkyJvMU+W5/jDY/HAH69qtwyXd9cTak9t5cUbrsc5BbHoP7o7Hvls4yMdV5sPP7yPgZPzDgetPBUj5SCPY0oYWEIqKb0CWIlJttLU4/Vb+21OExraSKj53SCJ9zjBHTZ70l5qFs1vF5Nu8IjwVRInBZ88cbRkfTueoxXXCeBgSs0ZAOCQ4wOcfzp7FR94qMeppyw6kmnJ2fp/kKNZxaaS09f8AM4cBWnd5xJJMVUrGY3+UDJOeCcZbIGOMDrjNSefJ5toUikSaVsbXjYEDdyxGTjjJzxjd9a7Brm3V0Vpog7j5AXGW+nrT9ybwu5d3YZGan6nTun1X6FfWqlmujOJkuYYlkaOdmbBUAwPgHGOBjn6f0p63UNqkUQbPkDGNj47DHCnsBXZGSIcF07nqO3X8qN8W7bvTdnGMjOeuPrSWCppcqbG8XNu7scUs42qzIVLERR4ViG2jqRjhSTyfalt7iNZBM0mEUMyK8bAJ94dSM45AA9Fz3rtPMi5O+PgkfeHBHWnbR6D8qSwVJO+o3i6jVjioJYrq+sFiVmUXCMQVOcgNk9BxzXa7R6UYHoKWuilSVKPLExqVHUlzMTaPSjaPSlorQzE2j0rG8VKB4dufqn/oQrarG8Vf8i7c/VP/AEIVy47/AHap/hf5HTg/94p+q/M0X++31NXof9Sn0qi/32+pq9D/AKlPpXUcw+iiigAooooAKKKKACiiigAorC8Vm4GmQ+RMsS/aEMjMSPlGSOR0+YKSfQGuQ0r7fL4fuI/PuJJrm8iKW8jv5qBpmc7g2NoKDPvg0AemUV5potvqEumahBIt08ot4mKLLhsiSQ88nnAHHBIxUdjb36eGNVeA3uUZQHaVvnKyBiAOWzzjI+lAHp9Fee6bPcx3Gux3N9NCWVpYZZ/NRcFgVI+6cZJXOAScgZxUenyX50TWlF3dRXX2eSSKO6WUOASWdgrMQRyArdc8mgD0aiuX0mK4j8UzRSXc0ggtdhi3hkUF/kzhRg7ex5+tdRQAUUUUAFFFFABRRRQAUUUUAY+qf8eV7/1yf+RrIXU4rPw9pto1vdzy3tsY40tYwzcLknkjoD61r6p/x5Xv/XJ/5GsiylhQeG4ntvMnkgl8mTdjy8Rgnjvkce1ckv8AeP8At39UdlJJ0XdX1/8AbWUtQ0YXuq2sM1vqDKHV/NS2BiBIA+ZmctxgZ9KvaRGLLUNQYafqQJUsXe3RFlKngKQ3JPYYHHWtC6fVV0NntY2e/wD4Q8a569xkDp6VUa48QLPdA2+Y8Yh2xjrhScnnnlvUcV1WZzc0bbGUdJtpEvtQXTNXV55Pnge3QuxLbsqN2Mdjzn9MRto0Vottdx2GrSySxlTGLSMlABtG8bhyQfU59q0jdeJRO6C0Jj+yBg7RrjzeMj1J69tvpUlhc+JJXRrq0EagNlGjGWODjkHjnHT1os+4+eN/hIRYFPs+jSQahLEr7jdC2TyiSvUndkYPoOvrTrCFY5Zy2n6qDbqXRnt0QvhdoCEHk4Jx06mtPUJ9ZSULY2EcqeWpLs4BDZORjIz2/Wh5dajsyyWlvNOGAI3bARxkjnH97qc9KLMXNHsY9vCYNPkuI7LWEYZgSL7LH5g3cl8ZwV6DnuPrVq1ddJiV4tM1eb7WFZkWJT5O1QgBG4Y47ZP1rQibWN8fmQw7T94MMAcdcgnv2we9VVn8Rs2H0+3jG08qwfJ+b3H+z+f4As+4+eF/hMWLw1awXv8AZiQat5RYE3IjXyu5+9u6c46dfWtIJZ3rvJe2d5ZLBEiGe9jRFfbuA+bcefnPpV+d9aEoEVvDt2ZJUbsN6ckf5x1yccT45WeRHmu3jimCrEsAOS0fmEiQ4JA54x61rQpe1qxpt7sic4xpylbZHUJ/YSfZP+JvaM1qm2MvOpPXknnn+lXbbTrGe8k1C0ut6y7w3kuCpLdeR3rzDf4Y80ZjcptH3S/XI/TrXXfDPH9k6ht+79q4/wC+RXo4nL40qTqJvS267nFSxLnNQdvkbU3he2nKs8rFgGBBXKfMck7fpx1q02jRtqg1Azv5gfcoCgADGNvHUe/Xk/hp0V5R2HPy+ErWePZJNJjPG3PA2sMck/3vyAFbsMSwQRwpnbGoUZOTgDFPooAKKKKACiiigArG8Vf8i7c/VP8A0IVs1jeKv+Rdufqn/oQrlx3+7VP8L/I6cH/vFP1X5mi/32+pq9D/AKlPpVF/vt9TV6H/AFKfSuo5h9FFFABRRRQAUUUUAFFFFABRXFeIfHbeFtevbXVLaJLH+zJL2ynDkGaSPAeI543cgjHY10egXWoXug2V1qttHbX00QklgjJIjJ52885Axn3zQBpUVyF54svJfiJZ+FtIt4JkigNzqk8mT5CH7irgj5z79iDXX0AFFeda/wCMPE934zufDPg6w0+WewgSa8uL92CKW5VFCnrgj/62Km0f4lR3Pw81PxHqVl9nutJeSC8tEbOJkIG0E9iSv0z3xQB39FeT2fj/AMZaZc6HfeKdH02HRNamSGJrV2822aQZTfkkHI6/j06V6xQAUUUUAFFFFABRRRQAUUUUAY+qf8eV7/1yf+Rrn5hc3WkaHpkEVm6XkDCVruBpFARQwGFZep9+1dBqn/Hle/8AXJ/5Gsi2uLq007RLlPNNjHbsbsRIXJ+UBPlALH5s9Pxrkl/vH/bv6o7aDapXW9//AG12/wCB5jpfDdvJNb2Aj0f+z433G1a2cuGI+cqfMwM/Q/jTZNDiN6lzetozeXHtsW+zOrR7TlMkyYIHoAPwq1LqOl4XVPL1RfNcqAlnKWyB3TbkfUilu7rSzPawSRaiPMCvEsdpIUUN6kKQvuCRj2rotAj2mI8/63/4JUj0YxPc3Yk0b+1JW5uEs5MFW4YMvmZJPrkfSm/8IyI9IEFqmixRT4+1BrOQpKQflwvmAjHuTV8T6bNfzW2zUfOTJZjbOEO3nh9u0+2DzninQ6vpzabK8cWoiKBgWDWMof5ieilct1PQHHelaA/aYjz6dPu/4BSl8O2kzQwbNHbSIG3Lbm3cspYfNht+Bk+1A0MSXzXVy+jPcRKEtJBauGiZT8mf3hyB6DH1q0dT0yDT45THqZhmbCr9ilZ1Knuu3I/Ec1JLfacLyC2kj1BpJdpQi1kKAMc4LBcL75II9qdoC9piPP7vv/4JQj0BrcXM4fRE1OZ2EkwtHCsjD5lZfMzknvn8KZ/wjSCxSxtBoaRy7WuYzaOyyuDwVAkBGB6k1pLfabPe3EIi1ASx5d2a2lCkp0KsVwxHbBOfemRanpZtnvEh1LZC2CGs5g+W64XbuOe5A/KlywH7TEef3fd/wCCfwrFJPbwTW+lNpMDERW7Wz703dcPvxy3P3ayNZvI/D091LqNtpl9dTQxqIorVoyY92F3szMCBjoBnPNdJPr9ilnbzvHqJjmJKhbGVm+U/xKFyvPqBmuf8W6c/iG7lt7Gyk+1R28b/AGiXckbLvJ8sEjG7nd+lb4ZUvbR59rq5lWnXdKSd9n/X37mO+veXjf4HtF3dMoOf/HavWPi2ebTNTttP0iKyu7WISRxxrvXJcKcqAMnnNVpNF8XyiMNaWGI/u4lHH61LpfhrxFaf2rd5hgvLiFUi8qYdd6knPbgH869jFLDuhLVXtpaTev3nmYX2irxutL63Vl89DqpYtTWzEf8AbtmlzG7ebKbLIIxkDbv4I9c80s5vRNBIuuWccCqoljNpkyEfeIO/5c+mDj3qEXtpdPdznTdXQopZw1qy+Z2woP3jjsKjNxY/YBdHTNYI83YIvsreYOM529dvv614Oh6tqnb8F1LqrfLezSPrFq9schIFtPmTP3ctu5x9Bn2psdtqw0+Uya1atK5XypvsO1Uwecrv+bP1GKrT3NrGYC1hrD/aFWTCWpby+ejYHyn1B7VbS9g+1/2WLLUQFZj55tz5XQk/P0xyRT0F+87fgun9fMjki1M2cKJrtmlwuTJKbLIcHphd/GPqc1P5GozXsTwava/Z0C+bD9k3M/rht/Gfoce9VItRtp7ad/7O1hVgVW2SWhUvzgbRj5jTo9Ttra0W8TTNX+ZygjFoxkGO5Xrj3NL3QtV2t+C6lqOz1VbybzNVt3idW8qIWe0p6Etv+bH0GfakTT9bFnJG+r2zXBYFJhY4CjuCu/nPrnikl1pIrm1zYao5ljBBS1Zgm4jhyPukY5B6VMmtq+oPZ/YNQBTP75rZhEcDPD9Dnt609A/eb2X3Lp8iKXT9ba1gSLV7aOdc+bIbHcJOeMLv+XH1Oax/FqX0VjIz38X2ViifZxbfMW6537uORnp7VsReIkltZ5xpmqIIduUezZXfJ/hXq2O+OlY3ifUBe+H1kFheJ5kwA86BkMW3+JgegPQZ65rlxtvq1T/C/wAjpwimsRC66rovX+vwOhf77fU1eh/1KfSqL/fb6mr0P+pT6V2Hnj6KKKACiiigAooooAKKKKAPIPi14G17xLrelXWn26XNstxDGU+1SgxDnc5UfKq9MsvzV6La/adB8IKbsefc2VoWkCSvJvZVJIDP8zZx1PNbVIQCMEZFAHz9omi63/wgGpfEe18XXNrqt15moSwxhfIfYzYjcHqcAgDoMgYr2vwtq0uu+FNK1WeLypby1jmdAOAWUE49vSuVm+DXhWa7kcf2jHZSS+dJpsV2y2rNnP3P8DXUah4Y0/ULzSLl/OhOkyb7aOCTYnQDDKOowBxQBxfhEiL42+PIn4kkjs5EU9WUIASPbkVwsqNdfCr4nXEA3wya7I6MOjKJEJI9sV6x4o+HGh+KtRi1G5e9tL5I/KNxYz+U7p/dbg5HWtTS/Cei6R4Z/wCEetbJP7MaNo3ic7vMDfeLHuTmgDgfiRcw3PgPwcsMiu1zqdgYQvO8bTyPzFesCuF0T4SeGtC1e21GFr+4ezJa0hurkyRW5PdFx/PPr1ru6ACiiigAooooAKKKKACiiigDH1T/AI8r3/rk/wDI1X03ePC0BjcI/wBlG1i23acHnParGqf8eV7/ANcn/kag0u3S68MW9vISEltVRiOuCPeuV/7z/wBu/qjpX+7v/EvyZjQJr0Vvbi41iJ3Vz5h+0ou8DjA4pjHWS8G3W42Hmjcv2lDuBYZAIx0GRjvmtMeE9NaWKXfITEMR7SoA4x6Uq+F7Jcf6TPlSSpDBccg9uvSuo5i5qP8AaPkwG3Yhg2ZdjqoA9Tu7VkXsevtdXVxb6vDBZyEC2LSoVB+XjkdDhsd+a3ZrSKcyg3EuZFII84kLznIXoOlUm0GyNtbW80xbyMlSSBnOO34D/JpXQWM4yasyO/8Ablso8rbkTocSbv8Ad9OOtSXkOtonyX6QRiN1SR7gZJwcE54PY89KevhHS0SYedJiaTzHOU5br1x681ev9ItdVso7W6uZJEiYtvVlDdxyR04OKLoLGCDr8McH2jXLQPEcT5uFA5LY7cnp6dK1tP1CYW7xSalYzXZbeA9yCApAx90Z6/z4NMuPCenXNqbdpphEX3uqsPnPHXI5/rmo4/COkxuCJ5mGxUKvIrAhcY6j2ouFid76c6k5W+gEH2csMXMe3OODj7w579Kj066ujZNHf6jbvM84MZjnXJTrjI+h/AUyTwhYMZGa8nAePyjxHgKBjrtzn3zSf8IfpJuBMs84k8oRHbKMMoBAyMc9TRdBYoRy6yiGObXrYytLuQfaox+7HJHTn0rR02e9hmRrvULeWGRwQwuARj5sjk+69KY/grSmkt2WaZVhQqqAqQQc5zxnvUsfhDSY/I2NJ+4+584PPqeKLgVpo/EF19qNjfI8ZlHl7LiMFFycgsFPt2/lTxY+J2NyftuzdtEQMqnb0yeFx/8ArrW03So9N3+RcSOjEkqQuM8eg7f1NaNMDnbW08QpeBp7rfH5DL8zKVEmODgDnmniLxI8kitPAig7VdQvPH3gMH2/XtW/RQBQtxqi2rCX7K0+4gE5VSuODx71DLHqjahKEfZAYSFOV2B8cED72c1q0UAc0tn4mDRs13GxXAYBwAw45Ax14PX1qGKx8VEQrJeFf3u6RvtCnKegwg/Ln611dFAHLNZeJpGk/f7Ruyn+kADHpwP51e8TBh4YmDfeHl5+uRmtusbxV/yLtz9U/wDQhXLjf92qf4X+R04P/eIeq/M0X++31NXof9Sn0qi/32+pq9D/AKlPpXUcw+iiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKAMfUwTZ3gAyTG/8AI1maZqumroNvbS6hBG/2cIwLcqcVtyf61/qajFjaFSTaQE46+Uv+Fc1WlUdTng1tbU6KdWCg4TT3voY73GkOYz/bEACEkANx1zikE2jruxq9v83qfatB0sku54ms7VUijRyxiHfPt7Ux5tIjEZeOyUSNtQmNeT+XuK51QqP+X8f8zT6xR/vfh/kUxPowZj/asADA8Bsc0jS6MZVf+14CFGAGIPbmrP27Q97Jix3K2wjyxw3p0qV5dJjDF4rJdpCnMa8E9O1P6vV/u/c/8w9vR/vfev8AIoLLo67saxCMjHDfTNIr6OokH9swYcYOMCrstzo8DMssVopXrmH/AOt7ipc6Z9l+1eRaeRjO/wAoYx+VL6vU/u/j/mP6xS/vfh/kUDNoxJ/4m0A3YzhvTH+H60hm0YyBzqtrkDuc+p9fer8T6XMyLHBaMzruUCIcj8qR5tIjjMjx2QQYy3lrjnp270/YVP7v3P8AzF7ej/e+9f5Ge0mkSbN+swHaxbtznr/KpTc6PvLDVoP+BEH1/wAasi40coGCWO0gEHy16H8KnCaeYTMLe08oDO/y1xij2FVfy/j/AJh7ej/e/D/IyxLpO6QnV7Yhl2/hx/h/OhpdHdlJ1iD5Rgc8/n+NaUn9mxEiSC0UhdxzGOB+VRxzaTLIkccVmzuMqoiGSPypfV6n938f8w+sUf734f5EdpqWk2oP/E1tmyc9cVE19prOB/bcRTqcvk57VdkGmwuEkgs1YgsAY1zgVH5+j7lGyyJY4GIxz+lX7Ota3u/j/mL2tC9/e/D/ACIYtQ0uKVGXWYiobc4Mn3uP/wBX5Vc/t7Sf+gjbf991B9o0fnCWJI7CMH+lKZtIXdmOyG0bj+7XgflVRjiIqycfuf8AmS54eW6l96/yJv7e0n/oI23/AH3R/b2k/wDQRtv++6r/AGrRuPksuc4/dDt+FL9o0fYHMdmFJxkxD/Cq/wBp7x+5/wCYubDdpfev8if+3tJ/6CNt/wB90f29pP8A0Ebb/vuoJLjR4iRIlipBwcxj/Cpo106VysdvaMw64iX/AAo/2nvH7n/mHNhu0vvX+Qv9vaT/ANBG2/77rL8Rarp93ok8FveQyysU2ojZJ+YVsC0tCQPsdt/36X/Cp4bK0WYMtrArA5BEagj9Kzq08RVpyptqzVtn1+ZdKrQpzU4p3Tvuv8hr/fb6mr0P+pT6VRf77fU1eh/1KfSu45CjeaslpcLB5TvIxAAHcnGAP1/KopdbEflFbWVhLEZFzgH2GPepr3SIbyYyF3Quhjk2n7y8ce3TqOaZJoyyvG73EmUTy8gAZH4e2RQAs+sJDDDL9nlImOF3FVHfPJPoCR61egmE8KyqCA3IyQf5Eiqg04qsYSdh5KFItyghcnr7nGBVq2gW2to4VJIRcZPU0AS0UUUAYPiXxRb+GYbeS4gaQTPtBEsaAADLE7mHRQTwO2O4qje+PLGyS3ke2kMc0bygieE5VWVTtw5Dtlvug549cVr6xoFnrK7pgVmEMsKSqBkLIhUjntznHqBVGfwbZ3CbWvL0FkmSVlZMyrKwZwfl45AwVwRQBX1HxvDp2pLaPYySbnZA6yqAWDBQBuxzySc4AC9TkVfufEaRaHe6lDbmQWs0sJR5Vj3MjFTgnjBI478iql/4NhvpZZGvZlaVWUkorEAtkAZ6ADAH09anm8KQSWl5ai8uPs91M0rRSLG6xlnLMUyuQTk4JJxnigCrJ4zNtFdvd6cYTBPFDtN1HkmTbgnJG0fMeT6fhXQafd/b7CK6CqokGQFkWQdf7ykg/hWNaeDdOgWUSKjF7iOYeXEsYAjxsTAHI45z1PNdCiJGgRFCqOAFGAKAHUUUUAFFFFABRRRQAUUUUAFFFFABRRRQBnyf61/qaev3D9BTJP8AWv8AU09fuH6CgDNuPLF9fmVS0fkRlgBkkfPWdNJpXlxQvBNtXdIoAxtPf69K22tGa9nlO0pJGi4P+zuz/OnNZRu254o2I7lQTWcU1+P5kJM5eOPw9crhYJisrbuGPPucHjrWlNZabbYH2d2FydrbWPzADv7da1RYwjGIIRjkfIOKc9okihXjRgBjBFVqOxgK2lXm+Q2sxJYIx6liehODyeKlF1pX2NrRklEIwpVgQeDj+lbH2GH/AJ4xf98il+xx4P7qP5hg8dRQFjCiutJs5Gljhm3QAIGPOB7c/wA6t3MNgun+fJCxhcoxAY5PPHetH7FFknyYskYJ2Dmni2AGAiAZzjHGaAszAW60sL5IjnIEQO0nI2g5A69utW7O7smRLSJJQsobCkEjvnn3q+NNt1feLaEN67BmnLZRJnbDEMjBwooCzKF9LZI/kXEZYvGc49Bz+dVFuNMhltiIbgSPlYyCSQOnPPvW6bcMwZlUsAQCRzg1GdPgLBjbwlh0O0cUBYzrZ7TWSbkLMpiO3k47H0+tU0m0lm4huCUYqCW/Pv0rfiso4c+VFGmf7oxTTYQE5MEJOMcoKAsYTS6VtkP2a5UFjnZk89+AeP8A69XLq2sobYTtDIwcBeGw3I75+taP2CD/AJ4Q/wDfAp/2VCgQxoVH8JHFGoWOdebSrdWJtpgIkP8AF2Pbr71o21jY3FnHJHEwR1BALHPTHNXm06BgQ1vCQevyCpEtliBEaIgJydoxmgLFCXR7KZWWSJmVjkguetSx2EEMnmRqytx0bHTtVzym9qPKb2pahYav3h9asxf601CI2BB4qaL/AFtUhorP99vqavQ/6lPpVF/vt9TV6H/Up9KYylcamIL026wtIVQMdpA5OcDkgHof0qs2tTBLdltMmWDzdpfkHGQOnTr+FaM1okzu+9lZkCZABxg5BGR1qs+jW0hjyZP3cYiGG/hH/wBbj8TQBFPrRhhjcWrEuFb5nVQAW2jknv1ouNZeOONltsb8/wCsfoQSCOAc9KtJpsCFSASUjMabsHaOemR74+lRHRbVkgBLZhDBWwpJBOT2/lQBas7k3Vssxj2ZJ4znvU9QWlpFZWqW8IwidOAM/lU9AGJ4h12XR3sYobYTPdSMnO87dqFs4RWJ6elNg8QNJ4Vl1h7bbJGJR5IJ5ZHZAOQCMkDqOM1evtHtNRuYp7pfMMKOsaOqsqlsZbBBG4YwPqfWo4NCtYNBfSMu1u6yKzHarHeSSRtAA5Y4wABQBm6p4qfR702t1ZBz9naVDHN8zlQOikcKWO0EnOe2Oaran41fS9KubuaxiWW0eRLiJpnwCoU/K6xkEEMD822te68N2F/OZb3z7jKFSkkzbMlShcKDgNtJGRjrTB4YsPJjgdp5bdZDLJDLIXW4kOPmlzy+MDAJx044GABLfW5ZTYF4YgtzO9u2xn+VghZcbkUnO0g8dxW3WXbaHDbC1UXF1JHaSM8CSybtmVKgZIyQASBkk89TxWpQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQBnyf61/qaev3D9BTJP8AWv8AU09fuH6CgCK6vY7VlV1JL9MEDviufvfG0Nj4juNHksZC0e0LKG4ZmAIGMZ55/I1s3+qabZTLFdyIJSpZVKZOBz+HSksNR07V7driBQyKTkyxAHjqcHtz1oA5iX4ixw2Md02m7xJIyKkVyC3yjJOCo/8A1VYuPH1vb+aWsm2xkAt5oIJLAEcA8gMCfqK3Jb7SnjSeWNG+fy1L2/zbgCe4z2P5UxtS0lEkZ7cKkaq5Y24xhsbSMc88dqAG22vi40iK9+zMryXH2fyi/RtxHJx7Z/Ssqbx1HELMHTpN90iOi+YD95WIHA6/LWrda3otvDJHKytGqCVkWAsAMg5xjryD685qOPXdEmCMiLgoGUmAA4x6deh9KAKR8b2+0GOzkkP2cS4DgfPt3bBkfT5un5Vc0DxRFrwjKWjwCRZGTc4bIQr6eocfiCKQeI/D8bRspVW8syrttTkKM+g4PB4qW28QaNNElxE4XKYX9yQxTPbA6ZB/KgDaoqpY6laajbfaLaQmP1dCnbPcCnm+txdi13nzSpYAKcH8emfagCxRWZNr+mwJE8lxhZWKqQpbkYznHTrUa+JdLfO2aQ4kEf8AqW+8eR2oA16Ky5PEOlxRNK1z8icsVRjjkjsPUVC/izRUaRWu2zGQHxE3GSQO3qKANqisqHxHpdw7pDcM7oMsojbI4B549CKdHr+myqhWcjfyoaNgTzjpj1oA06Kw4fFuk3EcbxSykO/lj90QQeOo9ORz9a2RKhRW3YDDI3cH8jQA+is6TXNPhtZbh5mEUT7GPltkH6Y56daaNesjGZCZhGIlm3mM4KHocdf0oA06WL/W/wCfSsuHX9OuNTTT4pXNw8fmKDGwBXGepHpWpF/rP8+lAFZ/vt9TV6H/AFKfSqL/AH2+pq9D/qU+lAFC/wBQmtZvLjjiIC7y0jFQQOoHGM+nNVbzWprZ7ceXGnmxlyHDZBB6dscetaVxp8F3IGnDOFwVUuQFI7gDv7019MglC+YZGKjbuLnJ+tAGfJrksdrDIYVLPbPMwUg4Kjnv0BqS51W6itoWjtlaaQA7GYjAz1yAQBj3q4dLtT5OUJ8o5GT97v8AN6880jaXbMqgKy7M7SGPA54HtyeP8KAJrSc3MAkZdpyQV54/MCp6jggjtohHEuFHPUmpKAMHxNrd9o8EX2GyW6nn3JEpDnLgZA+VSOgPUjpVCXxjKlrp1wtkrJdLLMzBmVViQddzquCSQeR90E+9beraHZa3GIdQWSa2xhrcyERvzkFgOuMcZoh0S2hW3Aedvs5fyjJKWKBhtIyeoA6Z6UAYh8YXMNnBJc6WUmnu54FUS7lVY2I3MVDY6Y6Y78CjT/E+pXWlWV3JaWW6e5MDbbhgowhY4JXGQVZT2yOvBrVPhrT3tooJVmlEfmFXeVt252DM2f72RnPaoB4M0P7CbJrPzIN5ZFkcv5eeoQnlR16ep9aAJvDmszazp4luLYQTqsZcK4ZTvjV8j/vroarav4huNM1y2slt4pIpYmkJZmQgA4LZwVwCyA56bwelaEOiWsAbY0wLXAuGPmnJYAAD/dAAG3pxT7jR7O5ujdtGRd7NiTqx3xjBHyn+H7x6de+aAOeuPFeqQ6XpM402Dzr/AIKh5H2EZZhtjRiRtXg9iRmppvE88hsFtxGrXVu1wNttPcDYGAH3QCPvDqorUXw9ZRpEsbXCNDbi3idZm3RrkElT2JwMnqcCiTw5YMlqIzcQNaw+RE8Fw6Ns4+UkHn7oPNAHP3/jPULKwtM6bm9njd/KIZScbwPlPzAfKrHPRc8VJceLdQWLS5ILS0P2uaRCpm3b1UlVZDwPmOMZ7HNa8nhXSpIIY2il3RSM4m85vNJbO4GTO7B3HIzTX8I6S9vBb+VKsNuGEKLMwEQIxheflA/hx04x0FAFjw7qdxq+kR3dzBFE7HAMUm9XwBkjgEDO4Y9q1aq2GnW2mQNBaR+VCWLCME7VJxnaOw4zgdyfWrVABRRRQAUUUUAFFFFAGfJ/rX+pp6/cP0FMk/1r/U09fuH6CgDF1fUNPtNTSO6snmkkiP7wHouG4AJ69enrVbR9V0hY1gs9Nlt1mmeLZweeM5578fhXSPAk+N8SSbc43AHGfrUZs7W3Vn+zW8a5yW2Koz60AZzro9tbzICsoiJldPNLsCSR1J46n9aq3GraVCtijWch+1D5ACoKBcAZywPHHTPTPat5/LlZrd9rkqC0ZIPBzgkfgfyqo40kMsUgscx/IFcoSvPTnpzSuNRb2RgJregzxKx0uUrI3kgbVbOMDk7sDqOtOnvdCRN7aS4BbaCNqjI3Dru6fKa6F10+BNjraRouDg7ABnOPzwf1pyx2UsZkWO3dMZLBVYYHv+dFw5Xa9jmftnh9ZZnOkyNJCTGGbDFslgcZbuc9fWnLqWg20ctvDpkkaqVLJgqDu6c5PqeP8K6ZYLSVNywQsrc5EYIPfPTmmRQWJdhDDbFkbDbEXKsO3HQ9KYrENha6dPpcBgtIRbSKHWNl3AcY7/lU39nWn2r7R5WJNnl8MQuOn3c4/GpI5rYRKI5IRHj5QrADHt7UslzBFnzJo1wpc7mAwo6n6e9Fx8r2sVToumHb/oUPynK4BGD6/WkXRNORmZbblmDH52+8Oh69eTzV5XVxlWBFNWeF3dFlRmQ4YBgdpxnn04IoFYgfTLKRdr20br/dbkd+34n86rSeHdIlmkmksY3eT7+ScNznpnFXzcQjrKn3tn3v4vT68HilkniiGZJY0/3mA/nQOz2K8el2ULl4rdUcrsLKSCRjHXPoKVNMso1Cpbqqg8DJx1zjr0z2qZbmB4TMk0bRKNxcOCoHrnpinLLG0YkV1KEZDZ4x9aA5WVf7H04IqCyhCq/mKAuMNnOasPbQSSiV4ImkHR2QFh+P40ouIWfYJYy+M4DDOOef0P5U03VuG2+fHnjjeO/T88HHrigOV9it/Y2ntBLA9sJIpX3usjM2T26mpU02zSFIkt0EaKqqBngKcgD6VP50QBJlQAcElhx3ojljlXdG6up7qQRQFnuQRabZQTLNHaxrKq7Q+Pmx9atxf63/AD6UlLF/rf8APpQIrP8Afb6mr0P+pT6VRb77fU1BpguLy3uJje3CBpJYkTbHiPa5XK/Lk9O+evelcpRurmxRVA2F0bYRjVbkSBsmXy4txHpjZjH4Zp5s5zPFINQnCIAGjCR4fHUk7cjPsRRcOVd/z/yLlFUlsrhWmJ1K4YSAhAUj/d+4+XnHvmmmxujbCMarciQNky+XFuI9MbMY/DNFw5V3/P8AyL9FUzZzmeKQahOEQANGEjw+OpJ25GfYikWyuFaYnUrhvMBCApH+79x8vOPfNFw5V3/Mu0VQNhdG2EY1W5EgbJl8uLcR6Y2Yx+GaebOc3EUg1CcIgAaMJHh8dSTtyM+xFFw5V3/P/IuUVSWyuFM2dSuGEgIQFI/3fuPl5x75ppsbo2yxjVbkSBsmXy4txHpjZjH4ZouHKu/5/wCRfoqmbSczxSDUJwiABogkeHI6knbnn2IpFsrhTMTqVw3mAhAUj/d+4+Xn8c0XDlXf8y7RVA2F0bZYxqtyJAxJlEcW4j0xsxj8M082c5uIpBqE4RAA0QSPa+OpJ2559iKLhyrv+ZcoqktlcKZs6lcMJAQgKR/u/cfLz+OaabG6NssY1W5EgYky+XFuI9MbMY/DNFw5V3/P/Iv0VTNpObiKQahOEQANEEj2vjqSduefYikWyuFMxOpXDeYCEykf7v3Hy8/jmi4cq7l2iqBsLo2yxjVbkSBiTKI4txHpjZjH4Zp5s5zcRyDUJwigBogke18dSTtzz7EUXDlXf8y5RVJbK4UzZ1K4beCEykf7v3Hy8/jmmmxujbLGNVuRIGJMoji3EemNmMfhmi4cq7/n/kX6KqG0nNxHINQnCKAGiCR7Xx1JO3PPsRVYm5stStka5muY7mRlKuqARAKzZG1QewHJouNQvsyST/Wv9TT1+4foKZJ/rX+pp6/cP0FMgravqMmlaNdXsUSSyR7QqOxUElgoyQDxzXFDx3Lrek3MElmkRmjKxqY3LsDvBzG69AUx771rqvFe8+FNRWOGOZnVUEcq7lbcwHPB9euDjrivIfDOoac+1blZGhuYUMkNw0Yd2LKoUMiKwznnA+5nI5GE1dWLpy5JqXY6JpHuL5bi1WOORjiPb8s+/PQqTkjhtuedzZ6YNMvI4pNTaPz0MciT5kDLgb3U93Hv1xnHT051fDmq6xDZapaT6pDBLMpzbXJ8iS3APmEQFMxnAwq/Nkn2qS10PVdH+wtPJfXX2os3mX00sS26jc48xWOM7RgjI4APDVg8PdWuerDNuSfOo9Lb+vl5m9qLGWeaV8hhHG6o4kLYXzSGIGVC9ADjo6nPJzMYkTSoIvlcffC5D7zksyJtJIJyM8EYI6cmucubPztJtYtNv0S6jvDAEvJN4ljMpXzlVmyJASMZOPmC5LHA9dk8NaWVAkikZMBmV5WIP1GaPYat33J/tT3IQUfht17K3Y4myWLyLhCixW+0PJExEYjXd8obqcZAIAUjPygsCKW2lgjl8w20UMyp5iqHUMWKtkfJEvIwQcnAPuBXWTw+HCIg1zFCCdiKkzRgnjgDj1H51L/ZOhPahRGvkW/VQWCjnuO/NV7HVeRDzFtTTXxee2lv6vv3OImhie2aSfa0q3LRxo8CL91pGZwMdCCCcfL1qPVrT/TLXAe4AWFXMqBjjaxbJKnKk8+nHTiu7k0/Qbr7RuMJCuDPiQgbs4G78Rjn0q1e2ulzWkgufISE4jdiwX/gJP5cUnRTja46eZuFX2ij30v3dzmdIQ3HhXUrHzftMgthtU92CYAOfVlz9CK5+I+TePLhYds4cOYkGMRLgqAi5+YjgevQ9a9Giu9Iti9vFPaRlFy6ggYHv2qv/wASAXxuPOs2njQDAkDbVPoO34U3STafYzp5hKEakbfHf5XPPbi1lWUm6CyMtxLIVG6QgM3qSSNvPzYwAScFsCr7g/a0eXdlkEStJs4xucAfu3/hdMYwPrXbtpOl3s66g483B3KWc7FI7gHofeqMln4ZRhFJcwhpsPsNwcuMkjjPTOf1qVQtszonmzm05R2TW/f5HKPMLpLcSLG8JnwRJtYN8ko5ym0jjj5aaJHgbUEt0QIVTCRxLIucDnYFCkdzxwBmuwaDw6UeJ7iPEzAsGlYFiOmc84qxbaVok58y3jhmVAUwH3qM9eO1P2Ot7/1axmsyShyKGl77/wB7m7fI4uzkEV0Lq2MsU+/yirAxj5Uk3/IMLgFk7dffNZcluDfNNGTGj7HCIMFlwodvkA27cluOMq2M9vQXsvDzTLM0sbHIKgSkqMdMAcU1LDw9PIzLcLIVfc2bliARn1OOMH8ql4e6SubQzjkm5qG6S37fI5TU1a5jZLpYkup3VWd0jVUYKHK7ijE4BGPqRkgYrpPCE7XP2mRABCVjKg4LHIzztAHsMAcVem0LR4rdpJMxwgAsxnZVwORk56c1YsV0yy877PcRZfEkhaYE88Akk9K0jT5ZOVzir4xVaEaXLt1+Vu3oaVLF/rf8+lV0vbWScQJcwtKV3BFkBJHrj0qxF/rf8+lanEVm++31NS6X9p+xn7VjzPNk24x9zednT/ZxUTffb6mjRhDHp7CKfzF+0TEsRjDGRiV/A5H4UupS+FmL4j8ZnQdSW0TT/tOIxLIxn8vYhzluV+bp0BqDUvHg0+7trcWAfzrZbgu0pTYpGeQV9ePz9K1dW8MabrN4bi7eUyGPysI4A28nHT3NV9R8F6Nqh3XBl3fZxbsyOFLKOATxyccUySpe+PIrLVJbKWzxsZEDGTG5mUEAgrxyQOv+FGp+PE07WXsDp8kioVDSiQDspYgY5wHTHrz0xzqXPhjS7q4kuJGmDyFfMKzFdwVSqg47AE++TSz+GNHur+O8niZ7hFYbjK3zZxyeevyigCpdeLTb6nBZJYtMZrprYOj8AqRnOQP4cn8sEg5FQ+OsazFYf2ZJte5eDzWkxgB9obGM8kGtV/C+jS3xvJYRLN57XBLvu+Yrtxz0GO3rzTJfCmkzX32595n89Zt3md1cuB9Nx/QUAb9FJuXpuGfrRvX+8PzoAWik3rjO4Y+tG9c43DP1oAWim71/vDj3o3rjO4Y+tADqKTcucbhn60b1/vD86AFopN64zuGPrRvXONwz9aAFopu9f7w496N64zuGPrQA6ik3LnG4Z+tG9f7w/OgBaKTeuM7hj60blzjcM/WgCO4laCLzAu5V5fnkL3IqC589rywaCQCHexlGQNy7Gx9ecGp5UimADkFVOcZ4/Gqd6Ld9S0xnlIkWZ/KCjIY+W2QT24yaTLhv9/5Cyf61/qaev3D9BTJP9a/1NPX7h+gpkFPXp5rbw1qk1usTTJbuyrMCUJ2/xYIOPWvGIV3JFHPdRNbmWUTR7giyLC/7orJ8vz/LsEhX5QMccGvY/Ednb6j4Y1Kzu4zJBNFsdQWBIOOm3n8B16V5Pey2uo3Dreac9pHM7O5WHCqPM2MpTYGb94Bk9WRTngmgDrru4mXw/bz2EsRzaqyyTkSEx4yGABwcjt0GQO2KzNdt9U/sK3XT77me5ify3QSqyMjfu3TBLxlj0xn05ArGuvHFx9pk02UWc0ksavDL9lH2eIkFwrbdzAPg446bTwDSt4rmn1C2e2itJo7lZY5jDPIJJI4kxJKjx5EYDAAEjJGGGOaBSctFFepRedphbS7oBcwTYthOnzJ/BaxpMFO/cMOA4/hGSMCvdJuID53QRfP+RzXjayaJdTw61AyPfysLon7QNsREpKKV4Z5GZ4w2SAOSSMHd7O/zgbh1TkUDOPDaLciDy5bttrAKsaQ9cDqAPp71oWd3oyQyiCSZRJKqMTCwyxOVH3fwrUTSrCNdqWkKjjovp0/lSx6XYxbtlrGN3Xrz/wDX96AKz6Bp8qyh4mZZirN82DkMWznrkkmpLjRrS7sZbO5UyRSP5nIGVPGMfTArQAwMUUAYz+GNMZtwjdTjHyt6dPy6Uh8L6cxkLGcmQKCS/QAADHHsOa2qKAKEej2sWnzWSb/JlUqckMQCSeMj3PWs+LwhpkTKwM5KpsHzgDGSeQBz1Nb9FAGNL4YsZpkmkaYyIcqVKqB+AUCrlhpcOnI6QySlXYsQ5HU/QCrtFAGK/hfTpFUN52FXaMPjHGOw/GnJ4a09FIxK3XBdg2CRgkAjGf8ACtiigCnc6ZbXVr9mlDGPfvwDjmq8Og2dvcNPC00cjKFJVh0H1FalFAGZFoNlFqo1MCRrsKV3swOcjB7VqRf6z/PpSUsX+t/z6UAMNs5YnK8mmHSrKWHyrixtZU3mTDRKQWPVsEdT61eHSigabWxUOm2RnjnNjbGaMAJIY13KB0AOMjFIulWCebt0+1XzgRLiJRvB67uOfxpLvU4bOXy5Ac4z1HTDH/2XH4ioZtZiimeIQyOyqrfKVxz179gQfxpWQ+eXclOkac1utudOtDCrFhGYV2gnvjGM086bZG4juDY2xmjACSGNdygdMHGRiq0+t29vN5brIG3BQNv3sgnj8qc+sRJfC18mYsR975cew69+T+FFkHPLuSrpWnp523T7VfOBEuIlG8Hk7uOfxpDpGmtbrbnTbQwqxYRmFdoJ74xjNXqKLIOeXcqHTbIzxzmytjNGAEkMa7lA6YOMjFIulaenm7dPtV84ES4iUbx1+bjn8az7vxRa2mrrpzQTtKcjKlOvy4GC2edwxTn8S2ayyosdxII7hbfdFEzgsWCnkA4wTjnuDRZBzy7lw6RpzW625060MKsWEZhXaCepAxjNPOm2RuEuDZWxmjACSGJdygdMHGRWXJ4rtBqCWkMFxOTK0LuijCMrBSDn3P6cVMviS1+1xW8sF1CZGdQzwkruWQR4yuRyzY6/zFFkHPLuXV0rT083bp9qvnDEuIlG8dfm45/GmnSNNa3W3bTbQwqxZYzCu0E9SBjGavUUWQc8u5VOnWRuEuDZW5mjACSGNdygdMHGRTV0rT083bp9qvnDEuIlG8dfm45/GrlFFkHPLuUjpGmtbrbtp1oYVYssZhXaCepAxjNOOm2RuEuDZW5njACSGNdygdMHGRVuiiyDnl3Ka6Vp6ebt0+1XzhiXESjeOvzcc/jTTpGmtbrbtp1oYVYssZhXaCepAxjNXqKLIOeXcqnTrI3CXBsrczRgBJDGu5QOmDjIpq6Vp6CULp9qvnDEuIlG8dfm45/GrlFFkHPLuUjpGmtbrA2nWhhViyxmFdoJ6kDGM086dZG4S4NlbmdAAkhjXcoHTBxkVaoosg55dykulaeglC6faqJhiXEKjeOvzcc/jT4rC0t1QQWdvH5ZLIEjChSeCRgcZq1RRZA5SfUqG2kJJJXJpNpQMp6gVcrK1m+Gmadd3hVW8pN21mKg845IBI6+hpt2FGLk0l1IPENjPqXh2+tLeMSyyBcRs20OAwJGfcAivMJvhr4ik0uUKim5iBMRFwts7uS2GBjyq7QVHOdwXHHBHc6p4xl0REhubeyW/YkyW4unZUXsdwj6n0wKqyfEi3E8AiS2eJlUzO0kilD/ABBR5Z3AdjkZ9q2jhq0lzRg2vRkuUE7OS+9f5mEnw91y3WLzls7q5hkYxahbSNBPGvlMFVVYtGBkqm3GMDpwKbD8NtUtrBIneS8KuJYpJJ1W4g8wASqHAA4wcHoRxjJyOjh+I1rJqDxP9mS1yRHMZJNx9Ny+Xhc9+Tj3rUt/FttFbr/a8trp12S2YGl3/KGIDA4GQwGRwODQ8PWi+Vwd/RhzRtzcyt6rqcHpfw/8VaPZ6fOs8F1exX8jmNZlgSGJnySvysDuwdw9JGUdiPWX++PpWN/wmOhf9Bez/wC+jTT4u0Bjk6vafgx/wo+r1v5H9zI9rT/mRs0VRm1rTLeyivJr+3S2l/1cpfh/p61U/wCEt8P/APQXtf8Avo/4Uo0astVF/cN1ILdo2aKxv+Et8P8A/QXtf++j/hVuHWtMuLKW8hv7d7aL/WSh+E+tEqNWOri/uBVIPZovUVjf8Jb4f/6C9r/30f8ACj/hLPD/AP0F7X/vo/4U/q9b+R/cxe1p/wAyNmishPFOgySLGmrWpZjgDfjJrXqJ05w+JNFRlGWzuFFFFQUFFFFABRRRQAUsX+t/z6UlLF/rf8+lAFgdKKB0ooAz77TBfMxaZkBTZgKDUT6HEzu4lYMybM4zjhRn/wAd/WnXusLZ3HlGFmwcEg9uCT+R79/rUM2utFdGIWjFQqN98bhn1HY8gdepoAsNpETTvKJHUkhlx/C4GN3uccenWkbSEaRm858M24jC9cg+nTIH5UybWDBeLA1q4BUNuZ1HU4Hf1yOajbX0XVDaGICMOEMpfoe/GPXAx70AbNFZjasY76G2aHmUsAd4B4PocH/PGa06AMS68Oi61Br5r2VZQwZVVE8v5fu7lI+cjnBJyO2Kml0VJLhZhLhhcCZjsBJGVO0HsCUU1Tv/ABJJZ6lLbLbI6RSRIzGQgnfjoNuON3rT7jxPBDrcenLDI+VJd/LcbSGC9NvI56j0oAY3hOE3UVyt7cLNFJ5ithSNxLbjgjjh2x6E561OnhyGK682KeRUMqyMjHfnDb+pJPL4JPsBxUTeK7NrW4mhwRFN5WJNwyMkbvlViASCAcc4rQ0nU11S2MwVVwxHy78fmyrn8qAL9FFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABWD4olt4dB1CS7gM8CoC8QfZuG4d+1b1UrqJZ454mJCuu0kdR7j3pNXRUJKMk30PJ/GjLa+Op55490fyOFbo4Cgd+2RWLPqFjJFOFtUEj7Cj5A24XB4+terzaVbxoLCW+1OaSZgyyvPudAOysRwD3FV7vSbcQJD594otyy70nCySHg/Mdp3e3AxXq088pwgoyhdxSW/b5HJLLOebanv5Hl2oXljdRolnZi3cMeAwbcCOB6k1O9pPpurb7uFr1Cxb5csuDxtzjqv3SOxXFepw6bbzXCakJLqFolDeQsgEeVz1Xb7c1Np5/s208mKGTDXDO25yx3SZkYk/UmnLPIJxahpZ9X1t5eQ1l75HHm1uuna/wDmeTyzQukoTSpFZpg6HYeF9OlPnmtZLadI9IlR3J8tvL/1YyMDPU455969kvruS1gDp8zE4AOcdPaqy6rK2QsW4+WrDDHBJx/jRLPYRlZw283/AJGay2TV1L8DzbVrK6XwRoBNvMNskxb5DlQxyuR7is2O4ijEnmafLPuTCloSNp/I/wCRXr51CZYkkFux3F84J4we9SfbW+0JHggMAcn1Izjr1pQzqKjyuF9W97bu/Ycsvd73/paHj9tc2kcESS6LK7qAHfZncR1PTjjFaGk2d0/gnxCy2soDyQlF2HJCtk49cCvSrrU5IJtiqMbtp3E9OMn9aBqMzRlhEN4VWxk92xipnnkHeKjrdPdvZ37Djl0lZt/09Dx6F4o7eBW06YyoxZnMZbd7YPH+GO9CSQR+YDpcj7pSylkPyqQflx7HHPtXtEN48lyYiuBjhsnnGM8duuPwNRLfzGSJdgIfbkgngnPH6D861eeR/k383/kQsul/N+B49ebL3yYrLSpYpTJ1EZ+bIxj8/wDPWvblGFAPXFVbe+afywy7SxbIJPGKgfU5o1fNuCytjAY8Dn29v1rgxmZQrxjpZK/d72OmhhJU29btmlRWUNXky262CgKCMtjPT296dHqryTIvkhVO3cSemc/4VwrEU27XOn2M+xp0VTvL4WrQAKrCRsZ3dqrQ6rLLIyGFVGcAk9+fUj0pyrQUuV7iVKTVzVorJGryb8GBdvI3AnHSrtrdfaByoHyhuDnrn/CiFaE3ZBKnKKuyzSxf63/PpSZFLF/rf8+lamZYHSigdKKAKVzpdpdyF5Y+WG19pxvHHB7noKY+j2srs8gd2bG4luTjp/Q/UCodS1O5s7tI44VZD8xJDHIwRxjqc44GTzTbvVLqBrkJboTGo27nwGbaWJHHT8uhoAunT42JLSSksysxLfe29AeOlQtotq979rJk83eH+9xnIP8AQVHcajcwXvleQnlqqlmDE43HAzgcdDSS6heNfrbwwxKBIUZpC2DwSMcegoAs/wBmxCdJlklVkLEYbuevbvV2iigDNn0O0n3l9+6SYTSPwWYgjAyRkAYAwMdKnn021ub2O6mj3yxrtTPReQcj0OQK5bVfFGpWeuvZxPYCENtG/dkdMAt2PPp6YzUk/ifUYb4wmCLYt+bdnCPgJt3AZ7k5Hp9D1oA3E0CwilLxpImZFkZRIcHaSyrz0UMxbAwM1YsdPSwDiOaZ1Y5CyPkIMk4HHufergooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACq0n33/CrNVpPvv+FAHM6bGkL3p1S/vY7qeW4URyXL7UiMjbGQdE+UDBGDVgQaUlk1t/bV4VeTd5h1Fy4IHQPnIGO3SqNlaabJf3FreS3M98s1wflScII2dm25K7T8rYxk9OKew8PX0bXmbvZZncf9GlUruOOAUyfw6VC5bHVU9rzNq9vT7v8AgFqGHStVsozbaxfvDajaZYr6Vc55G5s/Mfc/SrUUFnc6p9riv70yqf8AUi5kWIkDH+rPB9f1qjbT6FpmkI0DXaWsz4Um3mdtyexUkY9xg+9Txz6Rp9/BEhuUlmCvGgt5CpLDAJITAJyc5PHfFP3SLVuz6/8ABJ/7MtLKOd5dR1ELcfuv3l5I+Cx/g5+U+4qYeHovsP2UX+p7PM8zf9tk8zOMY3Zzt9ulQTX+lahNNp8yzyPCWdh9nlUDaMHDbcHjPQ854qaPxNp0lnLdKbjyYSodjaygjPTClMn8AcUvdD992fT/AIA6Xw/FMkCm/wBSXyV2gpeSKW5zliD8x9zUn9jJ/aX277Ze7858r7S/k9Mf6vO3/wCvzUMnifTYrSG6dpxDMWCEWspJx1yoXI/EDNSvr9jHexWbGYTy7dgFvIQd3T5tu0fieO9P3RWrdn1/4P8AwSAaDDawXCi+1JhMu1me9kYp3ypJ+U+4rhfF2vajpmkeHm0zV7lo57Us05GGn4XDMCOpzn8a7w6/YXMlxboZy8Cu0gNvKBheDglcH8Cc9q4vxDoA1vQNAlgWSwihtQFtzC8rRhgpCnoeMY5oVr6Dnz8r577o4z/hM/En/QZuv/Hf8K0LfXvFFxaNcf2/OiLE0h3DPAOD0U4Hv6kDvTf+EKb/AJ/5P/AGT/GrsPh29gt1t01E+UucA6a/Gc55zz1PWqMCOTVfFEelpfHxHKVZVOzgHnbxnHbd+hqSbUfE8H2Xf4mcC4m8oEAEKecHOOc4pW8P3ptEtTf4iTlR/Zr8dOevsKWbQtSuFCyavMwBDD/iXyZBAIz19zQBUuda8VwypFDrd1cOVLEKFXAzjvwaks9T8X3ZYPrU8BWRI8Pg8sCR0B9P1pLnwpc3nlCfUZH8tdq/8S+T6nvyada+FruyINvqUqYcPxYSdRn396ACHVPFU8DSp4hmwHZFyv3iDgfw+x+gHPWo/wC2PFf9mref29LhiPl3L0Pvjrz0/XtVhPDl9GqAak52PvBbTnJ3c9TnnqaP+EdvjZi1/tE+SoCgDTHyMHPXr1FAEWqat4p0uFpH8Qzvhwu0AA89+lZP/CZ+JP8AoM3X/jv+FbV14dvryMxz6m7KSCR/Zzjn169aqf8ACEP/AM/0v/gBJ/jQBXsvGHiKS/to31i5KvMisDt5BYA9q9k0a5e6id5DlhK6/gCQK8ntvB5gu4JjfSERyK5AsZOcEH19q9R8OBxZlnRkLyu+1uoBJP8AWgDcHSigdKKAK02n2txIZJoVkfsWydv09D9KV7KB0ZGQlWADfMfmA6Z55rI1TU7y2u7mOF1CoiOMqDtBOGP19qjuNVvobl1/hAXIIUbMrnPOD7/hQBttZQM24pyXEh+Y8sOmfXoOKa+nWknmboEJkYMzdyfr1rJfU78zXaxFNsbBQxTO3kjnB9qLnVLlJpFR2XaXwQFI4Le3T5fXvQB0FFFFAFafT7S5uobma3jeaA5jcjlT/kmoJ9D025naaa0RpWcSF8kHcAADkHg4AGfT61k3evXcN/PbxzWJjWZITKQcQMzdG+Ybjt5PTBKjnNVf+Eqv/sv2hIrSTNtG5iUkGF5CgTcxPQ7mYjAwoBJ5oA7CiuHv/FGo+baPauscUiojB4CwLFyrHIyO3ABIxzzxWrc63eW7soa2KG3hdJHVhgvIEZmGRwM5xx060AdHRXGXOvapcRh7ZmXZbyO5gi3KWWRlVvuPgEISB+prQTWbtrkR/arJY1tRPM5Qkw/IGBb5gDn5vlHQAHPagDo6K5GfV9WxbiRjFI9oZ2WJYlwSx25EjcfLjIGec+1abapdpp2jXIELfanhSfcDn516rj39aANuiuWtPE9zd6feyiK3injVnjWWUKqg7ggY565Q7gduKitPFN1NdxRMLbG4RurfKzNiTLKQxG0GPGec8njpQB11FcndeJLyGTUESSxcwKHiI53/AH8oMuMsNnOSv8WAcDPT2032i1hmOP3iK3GccjPegCWiiigAooooAKKKKACqsn33q1VaT770AcxrtobzX7NF1J4HUD90N2Du3AHg4pkmmjTvs1tNeM7MWMR2yHaRgnBBJ4x0yP1q9JEL/wAQup0uCZICqvdC7G+Mhdygx4yD8w79CDTguo3Uc73Xh6ASxx7YVN4r+Z22k7flGOe9K5p7OXl06rqYFjBBARv12d/Ml3gtDKmOB6n0x+ZqWCwgvYGig1sYWdQSm8Es4G0EcYzyfxrQOmTrYpKnhmAXPmEGFb0KFXA+YNt74Axin/2bNaNAlr4bg8uVFM2LwKIm6EAY+bA6EY/CjmD2T8vvX+ZhalpaBbgXOq+ShmHNwspywBOB6kg54q9FpK38ssMerK0mfM2iFwUxx94nnqOtaZ0+efUJYLjR/MsyxcTyX5csQODsIyM9OtFnFqMUM839gpBOgBijXUNwlJPzZO3j1yQc0XF7N+X3rr8/+G6lKWNLU3ULarOrwp87SNIoXdgLjBx0HFVcQs1wqa8fMkjzlWlKqpA6HoT0z34Fat1b3s+n738OwPcTORLF9tVcAcht+3kn6U2XS5BcQInh6KSKSNVmkN9tKZADDGPmwAOeM0XH7J+X3r/MyLCOxt9Tt76fXRO0UasIiHydoIyMn+nbFbaWR1FhewXIYBnUBwRnls57g8gcccVTuYbSzu5v7S0uKCzSOTbO1+Wd0A5xH179jxVa18deGbOIxW0d1GhYttWDjJ6962pUKtZN04t2Mako0mlNpX8zq/JcKAJORFszj+L+9WHJ4auLmCJLm+V2Q7shWwT64zwarH4i6AOpux/2w/8Ar0n/AAsbQD/Fd/8Afj/69a/UcT/I/uM/rFL+ZE9h4SNqjpcXzXIM6yLkFSoA6dTz+lXLnRrm7WVXuUQPL5i7HfjjAH6An1rN/wCFjaB63f8A34/+vR/wsXQD0N3/AN+P/r0fUcT/ACP7g+sUv5kWJ/CryLOFvnJmbJDlsAc5AweOtNXwvcq28apI2R8yNu2sePfIHFQj4i6BnBa7HqTB0/WuqR1ljWRCGRgGUjuDyKyq0KtK3tItXLhUhP4Xc56Pw1cqWJvyC2OFZ8KABwMnocD8hTz4ZYajFdrfOAiFTESxXpjgZ4roKKyLOefw5OTAI9QkjSOJ0YB2OWbPPPPcd+1Rp4XmjSFVv/liYkLhwOcdw2fXj3rpaKAM3R9Mk022kimuDcFn3BmJOBjpya04hiT/AD6UlLF/rf8APpQBYHSq17f2+nxo9wzgO4RQkbOWYgnACgnsasjpVDUG2z2H+jrLuuQMkE+X8j/MP5fjSZUEm9RZL20MscTxTsZ1GP8ARZCMHsx24X3BxjvTftVjJNKht5S8OWYtaPjjg7SVwx+mc9qzdXub6K6uhDLIkaxI+R0Ubvmxx1P1qK6vb+G6YCUgfKCGbH8POODk9aNQvHsar6hYvZrM8Fw0SyBQps5CwYcg7Nuce+MU972z3RW7QzET4cD7LIV5OfmO3CnPJzjHesm9vNRGqBIHk8psFQqEghdp646HJz68VNcS6hHqwz5iwvMoT95ww44x/Pj/ABo1C8e39fcaa6nbtJNGEud0IJbNtIAcddp24b8M57U3+1rb7N9o2Xezfsx9kl3Zxn7u3OPfGKvUUahePb+vuM15dOE6o1o5e5UEn7G5DA/3jtwPcN070CfT3uLj/RZPNRG8xjZuNwHBAO35voM5rM1HUb+1vL2I3Ijtle3xMIc+Qj7wx7g/dHJ6ZrMj8Q6w+3zpPJcqnnJ9n/1EZEWZef8Aefg8cf7Jo1C8ex051Cy+xpKYLkwq4VV+xybgRyCE25A98Yp8l9aGWOJ4p2adBj/RZCMHsx24X3BxjvWA+r6ulkJ1YSFrGWRR5H8SyKof8Vbdj2p9vqGoXBt2S+fYDO7v9nVleFCwV8AZJYleAeQCRRqF49v6+41zLpswurdrN2VV/eq1m+1wvGBlcN7AZ9qb9q03yvtn2SXk+Vn7DJv6f3du7GOM4x2rAtdd1SSW2VpwwM2yPEQYXI80KfmAA+VDuyAPfoanl1m9gjtY5tQijuXvZYQHhCrKqSAZJJ+UBfTkkjFGoXj2/r7jauJNNnuIVuLNpZJEGxnsnYBT2LbcL7g4x3qVL2zy8CQzgWyk4+yyBQF4+X5cH2C59q5U+Ir8WxMmoRwSMYwvmQhQszBi0TE8BU2gk9cHAOSKnk17VWh1TZhJbaUMm2LcFTzCgQjAwxUBs5PDUahePb+vuN77dYC2Nx9mn2NIQR9ik3FiOSV27unfGO1ONzYJLBF9ml3SIBHi0chVbsTtwvuDjHesC7127t7i9869MEcbOpUW4LRYkVYwCeMyAk5bI4zwBUk2o6oqLNHfq8aW8LXLxxK0SGRlUshxkhV8x+Se3ajULx7f19xt/abCR7mM20pKZeXdZvhivcErhz6YyfSn/wBrW32YXGy72F9mPsku7OM/d25x74xWNb6nqDxRST3Ijieylff9nzgpIFWTHupzjFUrPXNVuLi1ikm2+YdgAiB3oWkDSBsYO0KhyAAc9ORRqF49v6+46k6lAs0URS43SgFSLaQgZ6ZO3C/jjHekXUrdpJkCXOYQS2baQA4/unbhvwzmuYTWNXjvNMUzM8N0+/8AeQqrtG0gCjAHJ2fMQMFc5OQMVLpeq6rLDbedcrMRerFNIsXySKyZwvyqV2nrkE54zRqF49v6+46A6tbC2Fxsu9m7Zj7JLuzjP3duce+MU5tSgWaKIpc7pQCpFtIQM9MnbhfxxjvXJjxJqDWRM91FaXRmAQMgKbiD+6YkDbsC5bqTkYOSBVzUb3U4Uv5bfUgkEcyxI80ajkAs4BCHjlVBIPIPfFGoXj2/r7joF1O3Z5kCXOYQS2baQA4/unb834ZzRDqdrP5QBlQyuURZYXjLELuPDAHoDzWTo+pXtzrk8NxIWiaESLFs2mDhOJPlHzHcSMEg4PpWneui6jpqtAJGaVwr5P7s+Wxz+I4/GjUaUXpYv1Wk++9JeXv2WBnjgluZAQoihALEnpnJwB7niqM1nJfNDLdySxbAGe1il+Qv1+ZgAWA9OnqDRcSj1exVs47W8vNcjtZZRN9rjFwWHyhxEnC47bcfjmrK6U4MZ88MYzk53c89PalvNF02/WQXVlFKJJBK+4H5nC7QT77QB9Kjl8PaRObcy6fC5tkCQ5z8ig5AHNJXRcnCVm2/u8vUnSwZUO6bcNxYfMcHIxSf2XmdnNy4V02bBnHTHf8ACmroumpqbaktnELxskzc7jkYPf0qKHw3o1vBcQQ6dAkVwAsqAHDgHIzz609SbQ7v7v8Ag/15F+C1MNoYdy5LbsAHGMjiq8umGSPaJRwQSxyc8knNQN4b0Z7JLNtOgNsjmRY+cBj1PWnS6BpM81vNLYQvJbKqQsc5RV+6Bz2o1Han3f3f8EmWwkR1YTrgADkE9sUk2myyxohuuhJyQcknH+FNTRNMj1CS/SyiF1Ju3yjO5s8Hv3qKLw3o0FrPaxadCkFxt81BnD4ORnntRqK0O7+7/g/15GT4ws457e3t1aaS++y3K28arkSfKu7JPOcdPWuKt5byOyitpNEvn8sD5hARyCfb3/SvUrXSNPslgFtaRRiDeYto+5u+9j61eyfU/nXbhcZ7CDg43u77+Rz4miqsouMnorfi3+p42G1BY0QaTekr1c2xycAgDv6/zo1P7ZqEKRjR7+PYPlPkEknGMfd6d/8AIr2TJ9T+dGT6n8661mtnzcmvqc31PS3MePWsl7b6SLJtHvmbBG77Mcfezzxk9cUNLevOsv8AY+oIVZCNkJH3SeCccg5x7D1xXsOT6n86Mn1P50v7UV2/Z7+Y/qeluY8XuxqV5pUViNEuQ64HmCBssQMDnb3yfzr2CxjaLT7aNxh0hRWHoQoBqxk+p/OkrmxWM+sRUeW1r/ia0aHs23e4UUUVxHQFFFFABSxf63/PpSUsX+t/z6UAWB0qnfCczWXkyhAJwZAWxvXa3Hvzg49quDpVLUbR7lYJItpmt5RLGrNtVm2suCcEgfMegpMqG5cwPSjA9KotJqv2ZCttZmfJ3qbhwoHbB2ZP5VIX1D7WgEFt9mwNz+c28cc4Xbg8+9Fw5WW8CkKqWDEDI6HHSqSSaoVm321mGA/dATsQ3P8AF8nHHpmkaTVfs6FbazM2TvU3DhQO2DsyfyFFw5GX6KqF9Q+1IBBbfZ8Dc5mbeOOcLtwefemLJqmybfbWgYD90BOxDc/xfJxx6ZouHKxlrrNreahLZRhxJHvwWAw+xtrY5zwSByB14zWjWIljeQ3T6jFZWRv5hsk3XDBQo6bSEyc98j8a0C+ofa0Agtvs2Bufzm3jjnC7cdfei4crLdFUUk1QpNvtrMMB+6CzsQ3P8XyccemaRpNV+zoUtrMzZO9TcOFA7YOzJ/IUXDkf9Mv0VUL6h9rUCC2+zcbnMzbxxzhduOvvTFk1TZNvtrMMB+6CzsQ3P8XyccemaLhysvUVQaTVvs6FLazM+TvU3DhQO2DsyfyFSF9Q+1qBBbfZsDc/nNvHHOF246+9Fw5WW6KopJqhSbfbWYYD90FnYhuf4vk449M0jSar9nQpbWZmyd6m4cKB2wdmT+QouHI/6ZfoqoXv/tagQW32bjc5mbeOOcLtx196YkmqbJt9tZhgP3QWdiG5/i+Tjj0zRcOVl6iqDSat9nQpbWZnyd6m4cKB2wdmT+QqQvqH2tVEFt9m43P5zbxxzhduOvvRcOVluiqKSaoUm321mHH+qCzsQ3P8R2ccemaRpNV+zxlLazMxJ3qbhwoHbB2ZP5Ci4cj/AKZfqneLctd2YhfbDvbzwCASuxsY/wCBY6Upe/8AtagQW32bjc/mtvHHZduOvvVcW17dX1vPeJBEts7PH5MhcvlWXnKjHBzxmhlRVtWWbHTrXToTFbRbQzbnYkszt/eZjyx9zSyfferNVpPvvTIbbd2RS3MEDoksqozglQT1x1x+dVl1excApPuBIX5UY4PTnjipZrSCeYSyNJuClQBKwGD14BxUY06yDq2zlenznHXPr68/XmgRBbeI9Ju7X7TFeKYfM8rcVYfNjOOnpUg1zTGlWMXiF2IAGG6n8PalTSNMjh8lLSER7y+3r83PP15NNXRtLWVZVtIw6kFWyeD+dAEkWr6fPMkMV0jSSHCqAeeM+npSvqtlHdpatNiV84G044JHXp1B/KkTTNPjuFuFt4xMpBDjORgYHenf2fZmUSmNS6tuBJzjrx9PmPHvQAw6xpwt1uDeRCJiQGJPJHUU59Uso5EjafDyKGQbG+YHpjjn/wDUO9NOk6YYUhNnAY42LINv3SRgkehxSPpWnSY3W6kBQoG5uABgY544oAE1rTXXct5GVzjPPXjjp7inLq1i5XbPu3YxhGOckD09SB7ZGaE0zT4/M228Y8wAPyTux070sOm2NuwaKFUK4xhj2JI4z1yTQAHVbISyRGceZGGLrtbIx14x/kc07+0bPbu+0x7dxXPbIXd/LmmDTLAMzCEbnDBjvbJDHJ5z6082Vm0JhaGMxHqh5B429PpxQBJHcxTW5nicSIBnI78Z/kRVWbVIre6FtLIizbd23DHj64qzFbwQW5giASMjGAenGOPwA/KoZLGGabzpBE8m3buKnp6feq4cn2iZc3Qg/tu23xp5i7pM7RsbnH4U5dYhd1VWXLNtGQRznHf3pw0y1DAiK3BXphDx/wCPU4afbggiO3GOnyHjofX2FaN0elyffLiMWB3AAgkHFOpiYUHLgkkknpyaduX1FYM0FopNy+oo3L6igBaWL/W/59KbuX1FOi5kzQBYHSiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAqu3+taiigBtFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABT4/viiigD/9k=';
+    const payGuideHint = document.createElement('div');
+    payGuideHint.style.cssText = 'font-size:11px;color:var(--b3-theme-on-background,#888);line-height:1.5;';
+    payGuideHint.textContent = '👆 付款方式示意图（点击图片放大查看）';
+    payGuideBox.appendChild(payGuideImg);
+    payGuideBox.appendChild(payGuideHint);
+    payBox.appendChild(payGuideBox);
+    /* 付款方式图点击放大 */
+    payGuideImg.addEventListener('click', () => {
+      try {
+        const old = document.getElementById('edb-payguide-overlay');
+        if (old) old.remove();
+        const ov = document.createElement('div');
+        ov.id = 'edb-payguide-overlay';
+        ov.style.cssText = 'position:fixed;inset:0;z-index:99999;background:rgba(0,0,0,.72);display:flex;align-items:center;justify-content:center;flex-direction:column;gap:10px;cursor:zoom-out;';
+        const big = document.createElement('img');
+        big.src = payGuideImg.src;
+        big.style.cssText = 'max-width:min(86vw,86vh);max-height:86vh;background:#fff;border-radius:8px;padding:8px;box-shadow:0 8px 40px rgba(0,0,0,.5);';
+        const tip = document.createElement('div');
+        tip.style.cssText = 'color:#fff;font-size:13px;opacity:.85;';
+        tip.textContent = '付款方式示意图 · 点击空白处关闭';
+        ov.appendChild(big);
+        ov.appendChild(tip);
+        ov.addEventListener('click', () => ov.remove());
+        const onKey = (ev) => { if (ev.key === 'Escape') { ov.remove(); document.removeEventListener('keydown', onKey); } };
+        document.addEventListener('keydown', onKey);
+        document.body.appendChild(ov);
+      } catch (e) {}
+    });
     const payQrBox = document.createElement("div");
     payQrBox.style.cssText = "display:flex;align-items:center;gap:10px;";
     const payQrImg = document.createElement("img");
@@ -15709,12 +16176,12 @@ var EdbPlugin = class extends Plugin {
         if (ci && c) ci.value = String(c);
         if (bi && b) {
           bi.value = String(b);
-          showMessage("\u5DF2\u81EA\u52A8\u586B\u5165\u6FC0\u6D3B\u7801\u548C\u7ED1\u5B9A\u7801\uFF0C\u70B9\u300C\u6FC0\u6D3B\u300D\u5373\u53EF");
+          showMessage("已自动填入并尝试激活（续费叠加有效期）");
         }
       } catch (e) {
       }
     };
-    /* 绑定码由卖家面板签发后推送到云端，通常几秒内到；还没到就轮询等待（最多 24 次 × 5 秒） */
+    /* 绑定码由卖家面板签发后推送到云端，通常几秒内到；还没到就轮询等待（最多 120 次 × 5 秒，v2.2.9-paidgate 延长至 10 分钟） */
     const startBindPoll = (url, reqId, code) => {
       let bn = 0;
       const bt = setInterval(async () => {
@@ -15729,11 +16196,23 @@ var EdbPlugin = class extends Plugin {
           if (jb && jb.ok && jb.bind) {
             clearInterval(bt);
             fillCred(code || jb.code, jb.bind);
+            /* v2.2.10 绑定码补齐后也自动激活（含续费叠加，激活逻辑内部累加到期时间） */
+            try {
+              const _c1 = String(code || jb.code || "");
+              const _b1 = String(jb.bind || "");
+              if (_c1 && _b1) {
+                const _fp1 = (typeof lic !== "undefined" && lic.deviceFingerprint) ? String(lic.deviceFingerprint() || "") : "";
+                const _bv1 = lic.verifyBindCode(_b1, this.pubPem());
+                if (_fp1 && _bv1.ok && _bv1.fp === _fp1) {
+                  this.activateLicense(_c1, _b1).catch(() => {});
+                }
+              }
+            } catch (e) {}
             return;
           }
         } catch (e) {
         }
-        if (bn >= 24) clearInterval(bt);
+        if (bn >= 120) clearInterval(bt);
       }, 5000);
     };
     /* v2.2.7 取回已发出的激活码：云端「同一微信支付单号只能用一次」（重复提交会被拒），
@@ -15749,7 +16228,7 @@ var EdbPlugin = class extends Plugin {
     const _LO = {
       last: "上次订单 ", query: "查询激活码", queryTip: "重启思源后也能用它取回已发出的激活码",
       noServer: "未配置服务器地址", fail: "查询失败",
-      wait1: "⏳ 订单 ", wait2: " 仍在等待卖家核对发码，稍后再点「查询激活码」",
+      wait1: "⏳ 订单 ", wait2: " 仍在等待卖家核对发码，稍后再点「查询激活码」", waitPaid: " 卖家已确认收款，正在发码…", waitNotPaid: " 仍在等待卖家核对发码，稍后再点「查询激活码」",
       copy: "复制", copied: "已复制激活码", copyManual: "请手动复制：", got: "✅ 已取回激活码：",
       failNet: "查询失败（网络）：",
       look: "🔎 找回我上次买的激活码", lookTip: "用本机设备指纹向云端找回最近一单，不需要记得支付单号",
@@ -15779,7 +16258,7 @@ var EdbPlugin = class extends Plugin {
         const jl = await rl.json();
         if (!jl || !jl.ok) { showMessage((jl && jl.msg) || _LO.fail); return; }
         if (jl.status !== "issued" || !jl.code) {
-          payStatus.textContent = _LO.wait1 + lo.reqId + _LO.wait2;
+          payStatus.textContent = _LO.wait1 + lo.reqId + (jl.paid ? _LO.waitPaid : _LO.waitNotPaid);
           return;
         }
         const cpl = document.createElement("button");
@@ -15792,7 +16271,17 @@ var EdbPlugin = class extends Plugin {
         });
         payStatus.innerHTML = _LO.got + "<b style='color:#7ee787'>" + jl.code + "</b>";
         payStatus.appendChild(cpl);
-        if (jl.bind) fillCred(jl.code, jl.bind);
+        if (jl.bind) {
+          fillCred(jl.code, jl.bind);
+          /* v2.2.11 「查询激活码」按钮取回后直接自动激活（含续费叠加），买家连「激活」都不用点 */
+          try {
+            const _fp2 = edbFp();
+            const _b2 = lic.verifyBindCode(String(jl.bind), this.pubPem());
+            if (_fp2 && _b2.ok && _b2.fp === _fp2) {
+              this.activateLicense(String(jl.code), String(jl.bind)).catch(() => {});
+            }
+          } catch (e) {}
+        }
         else startBindPoll(url, lo.reqId, jl.code);
       } catch (e) {
         showMessage(_LO.failNet + (e && e.message ? e.message : e));
@@ -15937,32 +16426,12 @@ var EdbPlugin = class extends Plugin {
           payStatus.textContent = "\u26A0 \u4F60\u9009\u7684\u662F\u300C" + (EDB_PRICE_TABLE_CN[selPlan] || selPlan) + "\u300D\u5E94\u4ED8 \u00A5" + (j.expect || 0) + "\uFF0C\u4F46\u5B9E\u4ED8\u586B\u7684\u662F \u00A5" + amt + "\uFF0C\u4E0D\u7B26\uFF08\u5DF2\u8F6C\u5356\u5BB6\u4EBA\u5DE5\u6838\u5BF9\uFF0C\u4E0D\u4F1A\u81EA\u52A8\u53D1\u7801\uFF09\u3002\u5355\u53F7 " + j.reqId + "\uFF1B\u5982\u679C\u53EA\u662F\u70B9\u9519\u4E86\u5957\u9910\uFF0C\u6539\u9009\u5BF9\u5E94\u5957\u9910\u540E\u91CD\u65B0\u63D0\u4EA4\u5373\u53EF\u3002";
           return;
         }
-        /* v1.6.56 库存自动发码：提交即已发码（云端从库存池直接取码返回），零等待直接显示 */
-        if (j.status === "issued" && j.code) {
-          const cp = document.createElement("button");
-          cp.textContent = "\u590D\u5236";
-          cp.className = "b3-button";
-          cp.style.cssText = "font-size:12px;padding:2px 10px;margin-left:8px;";
-          cp.addEventListener("click", () => {
-            try { navigator.clipboard.writeText(j.code); showMessage("\u5DF2\u590D\u5236\u6FC0\u6D3B\u7801"); }
-            catch (e) { showMessage("\u8BF7\u624B\u52A8\u590D\u5236\uFF1A" + j.code); }
-          });
-          payStatus.innerHTML = "\u2705 \u5DF2\u53D1\u7801\uFF1A<b style='color:#7ee787'>" + j.code + "</b>";
-          payStatus.appendChild(cp);
-          /* v2.2.2 绑定码：云端已下发就直接填入授权区；还没签发就等卖家面板推送后自动填 */
-          if (j.bind) {
-            fillCred(j.code, j.bind);
-          } else {
-            const wt = document.createElement("div");
-            wt.style.cssText = "color:#e6a23c;font-size:12px;margin-top:4px;";
-            wt.textContent = "\u23F3 \u7ED1\u5B9A\u7801\u7531\u5356\u5BB6\u9762\u677F\u81EA\u52A8\u7B7E\u53D1\u4E2D\uFF0C\u7A0D\u5019\u4F1A\u81EA\u52A8\u586B\u5165\u4E0A\u65B9\u6388\u6743\u533A\u2026";
-            payStatus.appendChild(wt);
-            startBindPoll(url, j.reqId, j.code);
-          }
-          return;
-        }
-        payStatus.textContent = "\u8BA2\u5355\u5DF2\u63D0\u4EA4\uFF1A" + j.reqId + "\uFF0C\u7B49\u5F85\u5356\u5BB6\u6838\u5BF9\u53D1\u7801\u2026";
-        let n = 0;
+        /* v2.2.9-paidgate：buyreq 永不自动发码 —— 云端只建 pending 单，确认付款权在卖家侧。
+           现在 j 里没有 code/status，状态完全靠 payquery 轮询得知；轮询窗口延长到 120×5s=10min。 */
+        payStatus.textContent = "✅ 已提交：" + j.reqId + "，等待卖家确认收款（通常 1 分钟内到账）。你可以关掉这个面板去干别的 —— 卖家一确认，密库会自动激活，不用再回来点「激活」。";
+        /* v2.2.10 提交成功立刻启动后台轮询：哪怕买家立刻关掉面板，卖家一发码就自动激活 */
+        try { this._bgPayPollStart(); } catch (e) {}
+        let n = 0, _paidSeen = false;
         const timer = setInterval(async () => {
           n++;
           try {
@@ -15972,35 +16441,48 @@ var EdbPlugin = class extends Plugin {
               body: JSON.stringify({ reqId: j.reqId })
             });
             const j2 = await r2.json();
-            if (j2.ok && j2.status === "issued") {
+            /* 已确认收款但还没发码：卖家点了确认，面板正在从库存取码（几秒钟的事） */
+            if (j2.ok && j2.paid && !j2.code) {
+              if (!_paidSeen) { _paidSeen = true; payStatus.textContent = "✅ 卖家已确认收款，正在发码…"; }
+            }
+            if (j2.ok && j2.status === "issued" && j2.code) {
               clearInterval(timer);
               const cp = document.createElement("button");
-              cp.textContent = "\u590D\u5236";
+              cp.textContent = "复制";
               cp.className = "b3-button";
               cp.style.cssText = "font-size:12px;padding:2px 10px;margin-left:8px;";
               cp.addEventListener("click", () => {
                 try {
                   navigator.clipboard.writeText(j2.code);
-                  showMessage("\u5DF2\u590D\u5236\u6FC0\u6D3B\u7801");
+                  showMessage("已复制激活码");
                 } catch (e) {
-                  showMessage("\u8BF7\u624B\u52A8\u590D\u5236\uFF1A" + j2.code);
+                  showMessage("请手动复制：" + j2.code);
                 }
               });
-              payStatus.innerHTML = "\u2705 \u5DF2\u53D1\u7801\uFF1A<b style='color:#7ee787'>" + j2.code + "</b>";
+              payStatus.innerHTML = "✅ 已发码：<b style='color:#7ee787'>" + j2.code + "</b>";
               payStatus.appendChild(cp);
               /* v2.2.2 绑定码：有就自动填入，没有就继续等（卖家面板签发后会推送到云端） */
-              if (j2.bind) fillCred(j2.code, j2.bind);
+              if (j2.bind) {
+                fillCred(j2.code, j2.bind);
+                /* v2.2.10 面板内快速路径：绑定码已就位就直接自动激活（含续费叠加） */
+                try {
+                  const _fp0 = (typeof lic !== "undefined" && lic.deviceFingerprint) ? String(lic.deviceFingerprint() || "") : "";
+                  const _b0 = lic.verifyBindCode(String(j2.bind), this.pubPem());
+                  if (_fp0 && _b0.ok && _b0.fp === _fp0) {
+                    this.activateLicense(String(j2.code), String(j2.bind)).catch(() => {});
+                  }
+                } catch (e) {}
+              }
               else startBindPoll(url, j.reqId, j2.code);
               return;
             }
-            if (n >= 24) {
+            if (n >= 120) {
               clearInterval(timer);
-              payStatus.textContent = "\u5C1A\u672A\u53D1\u7801\uFF0C\u53EF\u5237\u65B0\u9762\u677F\u91CD\u8BD5\u6216\u8054\u7CFB\u5356\u5BB6";
+              payStatus.textContent = "尚未发码，可刷新面板重试或联系卖家";
             }
           } catch (e) {
           }
-        }, 5000);
-      } catch (e) {
+        }, 5000);      } catch (e) {
         showMessage("\u63D0\u4EA4\u5931\u8D25\uFF1A\u7F51\u7EDC\u5F02\u5E38");
       }
     });
@@ -17067,12 +17549,31 @@ var EdbPlugin = class extends Plugin {
         /* v1.6.36 授权状态完整性：expAt/activatedAt 必须与 code/fp 一起通过 HMAC 指纹，防篡改到期时间永久激活。
          * 无 h = 旧版授权文件 → 一次性补签升级；h 不匹配 = 字段被改动 → 拒绝该授权（回到未授权/试用）。 */
         let authOk = false;
-        if (raw.h && raw.h === lic.authHmac(raw.code, raw.fp || "", raw.expAt != null ? raw.expAt : "", raw.activatedAt != null ? raw.activatedAt : "")) {
+        const _authKey = raw.expAt != null ? raw.expAt : "";
+        const _authAct = raw.activatedAt != null ? raw.activatedAt : "";
+        if (raw.h && safeEq(raw.h, lic.authHmac(raw.code, raw.fp || "", _authKey, _authAct))) {
           authOk = true;
         } else if (!raw.h) {
+          /* v2.2.9 安全加固：原逻辑是「无 h → 无条件放行 + 自动补签文件里的原值」，
+             这是一条降级旁路：把 expAt 改大、再删掉 h 字段，即可被插件自己补签成合法授权。
+             现在改为：无 h 时【不信任】文件里的 expAt，一律按 Ed25519 已签名的
+             t/d 与 activatedAt 重算；原值更大即判定篡改并记 authTampered。
+             （无 h 的文件必然只激活过一次 —— 续费/重新激活都会写入 h。） */
+          const DAY = 864e5;
+          let actAt = raw.activatedAt != null ? Number(raw.activatedAt) : 0;
+          const oldExp = raw.expAt != null ? Number(raw.expAt) : 0;
+          if (!isFinite(actAt) || actAt <= 0) {
+            actAt = isFinite(oldExp) && oldExp > 0 ? oldExp - r.d * DAY : Date.now();
+            this.cfg.authTampered = true;
+          }
+          const fixedExp = r.t === "F" ? 0 : Math.round(actAt + r.d * DAY);
+          if (r.t !== "F" && oldExp > fixedExp + DAY)
+            this.cfg.authTampered = true;
           authOk = true;
+          raw.expAt = fixedExp;
+          raw.activatedAt = actAt;
           try {
-            const licJson2 = JSON.stringify(Object.assign({}, raw, { h: lic.authHmac(raw.code, raw.fp || "", raw.expAt != null ? raw.expAt : "", raw.activatedAt != null ? raw.activatedAt : "") }));
+            const licJson2 = JSON.stringify(Object.assign({}, raw, { h: lic.authHmac(raw.code, raw.fp || "", fixedExp, actAt) }));
             await this.saveData("license.json", licJson2);
             await this.saveData("license.backup.json", licJson2);
           } catch (e) {
@@ -17084,6 +17585,21 @@ var EdbPlugin = class extends Plugin {
            新逻辑：当前指纹 或 任一网卡对应的旧指纹 或 稳定指纹 命中即通过。 */
         const fp = lic.deviceFingerprint();
         const fpS = (typeof lic.fpStable === "function") ? lic.fpStable() : "";
+        /* v2.2.9 安全加固（G2）：license.json 缺 fp 时，原先整段设备绑定校验被**整体跳过**，
+           只弹一句"请补填绑定码"（不拒绝）。于是"删掉 h + 删掉 fp"就能让插件自己补签出
+           一份无设备绑定的授权 —— 同一激活码可在任意机器永久使用（买一份装全公司），
+           而且**不需要**还原 AUTH_SALT、也不需要改 expAt（比第一轮那条更容易）。
+           现在：缺 fp 一律视为未绑定 → 不予授权，走"重新绑定/重新激活"提示。
+           影响面：只有 v1.6.35 之前激活、之后从未重新激活过的授权文件才会缺 fp；
+           重新输入「激活码 + 绑定码」（两个码卖家都给过）即可恢复。 */
+        if (authOk && !raw.fp) {
+          authOk = false;
+          this.cfg.needRebind = true;
+          try {
+            await this.saveConfig();
+          } catch (e) {
+          }
+        }
         let boundOk = true;
         if (authOk && raw.fp) {
           boundOk = (raw.fp === fp);
@@ -17097,11 +17613,16 @@ var EdbPlugin = class extends Plugin {
           /* 网卡全换掉时的兜底一：本机曾成功校验过同一稳定指纹 */
           if (!boundOk && fpS && this.cfg.boundFpS && String(this.cfg.boundFpS) === fpS)
             boundOk = true;
-          /* 兜底二（v2.1.9 一次性信任迁移）：老授权 + 本机从未记录过稳定指纹
-             → 网卡集合可能已彻底变化（如改开手机热点），候选指纹无法覆盖。
-             授权文件签名有效即信任本机一次，并记录稳定指纹；此后按稳定指纹严格校验。 */
-          if (!boundOk && fpS && !this.cfg.boundFpS)
-            boundOk = true;
+          /* v2.2.9 安全加固（G2）：原「兜底二」——本机尚未记录稳定指纹时，
+             只要 license.json 签名有效就直接信任本机——已删除。
+             原因：它与「一码一机」直接矛盾。license.json 可复制，而每台新机器的
+             config.json 都没有 boundFpS → 任意多台机器都能命中这条分支直接授权
+             （买一份装全公司）。它在 v2.1.9~v2.2.8 上之所以无害，仅是因为
+             lic.fpStable 未导出而恰好是死代码；v2.2.9 导出 fpStable（修复无限试用）
+             后它会活过来，故同步删除。
+             兜底一（boundFpS 命中）保留：首次校验成功后会写入 boundFpS，
+             此后换网卡不再误锁。
+             残余影响：在首次校验前就换网卡的授权需联系卖家解绑（面窄，界面与面板均已支持）。 */
           if (!boundOk) {
             this.cfg.bindMismatch = true;
             try {
@@ -17219,7 +17740,20 @@ var EdbPlugin = class extends Plugin {
   }
   /** v1.6.51 云端地址：config 显式值优先，否则用内置默认（买家无需任何配置） */
   edbOnlineUrl() {
-    return String(this.cfg.onlineUrl || EDB_DEFAULT_ONLINE || "").trim();
+    const u = String(this.cfg.onlineUrl || EDB_DEFAULT_ONLINE || "").trim();
+    /* v2.2.9 安全加固（A2）：激活、设备登记、用量上报、时间锚点全部走这个地址。
+       允许 http 意味着激活码/绑定码/设备指纹/到期时间在链路上明文，且可被中间人
+       替换成伪造的授权与时间锚点（与 A1 叠加可直接绕过到期）。
+       内置默认是 https；显式配置成非 https 时拒绝使用（本机回环开发除外）。 */
+    if (!/^https:\/\//i.test(u)) {
+      const m = /^https?:\/\/([^\/:]+)/i.exec(u);
+      const host = m ? m[1].toLowerCase() : "";
+      if (host !== "127.0.0.1" && host !== "localhost" && host !== "::1" && host !== "[::1]") {
+        console.warn("[siyuan-edb] \u4E91\u7AEF\u5730\u5740\u975E https\uFF0C\u5DF2\u5FFD\u7565\uFF08\u9632\u4E2D\u95F4\u4EBA\u7BE1\u6539\u6388\u6743\u4E0E\u65F6\u95F4\u951A\u70B9\uFF09:", u);
+        return "";
+      }
+    }
+    return u;
   }
   /** v2.1.1 拉取云端价格表（改价后即时生效，不等 check 周期） */
   async fetchPriceTable() {
@@ -17358,10 +17892,18 @@ var EdbPlugin = class extends Plugin {
       let _dirty = false;
       if (j.serverTime) {
         const srvMs = Number(j.serverTime) || 0;
-        const expect = prevSrvS && prevSaveL ? prevSrvS + (nowMs - prevSaveL) : 0;
-        if (!expect || Math.abs(srvMs - expect) > 12e4) {
-          this.cfg.srvTime = { s: srvMs, l: nowMs };
-          _dirty = true;
+        /* v2.2.9 安全加固（A1）：原先首次采纳时 expect=0 → `!expect` 为真 →
+           对 serverTime **不做任何绝对合理性检查**就写进锚点。
+           正常服务器与本机钟的偏差在实际中是分钟级；超过 1 天的锚点一律拒收
+           （既防把时间拉回过去，也防被推到未来导致合法授权集体"提前过期"）。 */
+        if (!isFinite(srvMs) || srvMs <= 0 || Math.abs(srvMs - nowMs) > 864e5) {
+          this.cfg.checkLastErr = "srv-time-implausible";
+        } else {
+          const expect = prevSrvS && prevSaveL ? prevSrvS + (nowMs - prevSaveL) : 0;
+          if (!expect || Math.abs(srvMs - expect) > 12e4) {
+            this.cfg.srvTime = { s: srvMs, l: nowMs };
+            _dirty = true;
+          }
         }
       }
       if (!this.cfg.onlineLastCheck || nowMs - Number(this.cfg.onlineLastCheck) > 6 * 36e5) {
@@ -17467,14 +18009,30 @@ var EdbPlugin = class extends Plugin {
   }
   /** v1.6.40 校准时间：在线时以服务器时间为锚点（防本地改系统时间绕过到期），离线回落本地时钟 */
   nowTs() {
+    /* v2.2.9 安全加固（A1）：原先直接返回"服务器锚点外推值"。只要云端——
+       或被劫持的链路、或 cfg.onlineUrl 指向的自建服务——返回一个**远期过去**的
+       serverTime，nowTs() 就会永久停在过去，而所有到期判定都用它：
+       过期授权不再过期、14 天试用可无限延长（连激活码都不需要）。
+       同时 clockGuard() 用的是裸 Date.now()，所以这条路径不会自我暴露。
+       改为取"本机钟"与"锚点外推值"的较大者：锚点只能把时间**往前推**（这正是
+       用户把本机钟往回调时需要的防护），不能再把时间拉回过去。 */
+    const local = Date.now();
     const st = this.cfg.srvTime;
-    if (st && st.s > 0)
-      return Date.now() - st.l + st.s;
-    return Date.now();
+    if (st && st.s > 0) {
+      const ext = local - Number(st.l) + Number(st.s);
+      if (isFinite(ext) && ext > local)
+        return ext;
+    }
+    return local;
   }
   /** v1.6.67 生效离线宽限（天）：云端下发 > 套餐映射 > 配置兜底 */
   onlineGraceDaysEff() {
-    const map = { M: 7, H: 10, Y: 15, F: 30 };
+    /* v2.2.9 修正与 typeLabel 同源的错误（H2）：H 是"三年"（¥89，
+       卖家面板 TYPE_DAYS.H=1095），Y 是"一年"（¥39，365 天）。
+       原先映射按"H=半年"的旧假设把 H(10 天) 排在 Y(15 天) **之下** ——
+       买三年的客户拿到的离线宽限比买一年的客户还短。
+       修正为随套餐时长单调递增；F 档已在 isLicensed() 里豁免，此处仅作兜底。 */
+    const map = { M: 7, Y: 15, H: 30, F: 60 };
     let d = 0;
     const plan = this.licState && this.licState.t;
     if (plan && map[plan])
@@ -17544,8 +18102,13 @@ var EdbPlugin = class extends Plugin {
       if (this.licState.expAt !== 0 && this.nowTs() >= this.licState.expAt)
         return false;
       /* v1.6.67 先放后锁：启动后首次云端校验出结果前，不因"上次成功校验过久"锁库；
-         出结果（_checkResolved=true）后才按宽限判定，只有云端明确 revoked 才立刻锁。 */
-      if (this._checkResolved && this.edbOnlineUrl() && this.cfg.onlineLastCheck
+         出结果（_checkResolved=true）后才按宽限判定，只有云端明确 revoked 才立刻锁。
+         v2.2.9（C4）：**永久档（t=F）不参与离线宽限判定**。
+         产品定义与 README 都写明"永久 = 永久可用 / 服务器下线也已激活设备永久可用"，
+         但原先 F 档和月卡一样会被宽限锁死（且 F 的宽限天数被错误地算成 30 天），
+         结果是"买断客户在长期不出网的内网里被降级成免费版"——与销售承诺直接矛盾。
+         降价档（M/Y/H）的离线宽限仍保留，这是刻意的防离线白嫖策略，改动需产品决策。 */
+      if (this.licState.t !== "F" && this._checkResolved && this.edbOnlineUrl() && this.cfg.onlineLastCheck
           && this.nowTs() - this.cfg.onlineLastCheck > this.onlineGraceMs())
         return false;
       return true;
@@ -17573,8 +18136,14 @@ var EdbPlugin = class extends Plugin {
       const st = Number(j && j.t) || 0;
       if (!st)
         return 0;
-      if (j.h && j.h !== lic.authHmac("trial", st))
+      /* v2.2.9 安全加固（C3）：原先"镜像没有 h 就采信" → 清掉 h 字段即可让
+         三锚点取 min 失效（该镜像本是最早的锚点，忽略它 = 试用被拉长）。
+         writeTrialMirror 恒写 h，因此"缺 h"只可能是伪造。fail-closed：
+         直接标记篡改，让试用整体失效（不能只 return 0 —— 取 min 反而会变宽松）。 */
+      if (!j.h || !safeEq(j.h, lic.authHmac("trial", st))) {
+        this.cfg.trialTampered = true;
         return 0;
+      }
       return st;
     } catch (e) {
       return 0;
@@ -18033,6 +18602,87 @@ var EdbPlugin = class extends Plugin {
     return this.t("licStatusOk") + " " + d.getFullYear() + "-" + pad(d.getMonth() + 1) + "-" + pad(d.getDate()) + leftTxt;
   }
   /** 激活：验证激活码 + 设备绑定码（一码一机）；续费自动叠加天数 */
+  /* ================= v2.2.10 后台等待卖家发码 + 自动激活 =================
+   * 场景：买家提交订单后关掉面板/重启思源去干别的，卖家确认收款并发码后，
+   *       插件在后台悄悄把激活流程跑完 —— 买家回来时密库已经是激活状态，
+   *       不需要再点「激活」按钮。
+   * 安全前提（全部满足才会真的激活，缺任何一条都只回显不动 license）：
+   *   ① 本机当前没有已激活的授权（!this.licState || !this.licState.bound）——
+   *      避免把别人/续费的码顶替掉现有授权；
+   *   ② 云端同时返回了激活码 code 和绑定码 bind（绑定码由卖家面板用私钥签发）；
+   *   ③ 绑定码绑定的指纹等于本机指纹 —— activateLicense 内部还会再校验一次，
+   *      错机/串号会被它拒掉。
+   * 触发入口：
+   *   · 提交订单后立即启动一次（原面板内轮询保留，作为面板开着时的快速反馈）；
+   *   · 插件启动 30 秒后，若 config 里有未完成的 lastPayOrder，恢复后台轮询。
+   */
+  _bgPayPollStart() {
+    try {
+      if (this._bgPayPollTimer) return; /* 已在跑，不重复挂 */
+      const lo = this.cfg && this.cfg.lastPayOrder;
+      if (!lo || !lo.reqId) return;
+      /* 已有激活授权也继续轮询 —— 可能是续费订单，激活逻辑内部叠加有效期 */
+      const url = String(this.edbOnlineUrl() || "").replace(/\/+$/, "").replace(/\/api\.php$/i, "");
+      if (!url) return;
+      /* 订单超过 48 小时就放弃（卖家一般几分钟内就处理；超过一天大概率是异常单） */
+      if (lo.ts && Date.now() - Number(lo.ts) > 48 * 3600 * 1000) return;
+      this._bgPayPollTimer = setInterval(() => { this._bgPayPollTick().catch(() => {}); }, 30000);
+      /* 立刻先跑一次，不等 30s */
+      this._bgPayPollTick().catch(() => {});
+    } catch (e) {}
+  }
+  _bgPayPollStop() {
+    try {
+      if (this._bgPayPollTimer) { clearInterval(this._bgPayPollTimer); this._bgPayPollTimer = null; }
+    } catch (e) {}
+  }
+  async _bgPayPollTick() {
+    try {
+      const lo = this.cfg && this.cfg.lastPayOrder;
+      if (!lo || !lo.reqId) { this._bgPayPollStop(); return; }
+      const url = String(this.edbOnlineUrl() || "").replace(/\/+$/, "").replace(/\/api\.php$/i, "");
+      if (!url) { this._bgPayPollStop(); return; }
+      if (lo.ts && Date.now() - Number(lo.ts) > 48 * 3600 * 1000) { this._bgPayPollStop(); return; }
+      const r = await fetch(url + "/api.php?action=payquery", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ reqId: lo.reqId })
+      });
+      const j = await r.json();
+      if (!j || !j.ok) return; /* 网络抖动，下次再试 */
+      /* 还没发码：继续等 */
+      if (!(j.status === "issued" && j.code)) return;
+      const code = String(j.code || "").trim();
+      const bind = String(j.bind || "").trim();
+      /* 卖家已发码但绑定码还没推上来：等下一轮（卖家面板通常几秒内就推） */
+      if (!code || !bind) return;
+      /* 绑定码必须是本机指纹才能自动激活 —— 防御性前置校验，省一次无效调用 */
+      try {
+        const fp = (typeof lic !== "undefined" && lic.deviceFingerprint) ? String(lic.deviceFingerprint() || "") : "";
+        const b = lic.verifyBindCode(bind, this.pubPem());
+        if (!fp || !b.ok || b.fp !== fp) {
+          /* 不是本机的码：别再轮询了，留在面板里给买家自己处理 */
+          this._bgPayPollStop();
+          return;
+        }
+      } catch (e) { return; }
+      /* 全部条件满足 → 自动激活。activateLicense 内部还会再做云端 register +
+         绑定码二次校验 + 写 license.json，失败会弹提示，成功会刷新面板。 */
+      this._bgPayPollStop();
+      const ok = await this.activateLicense(code, bind);
+      if (ok) {
+        /* 激活成功后清掉 lastPayOrder，避免下次启动又跑一遍 */
+        try {
+          delete this.cfg.lastPayOrder;
+          this.saveData("config.json", JSON.stringify(this.cfg)).catch(() => {});
+        } catch (e) {}
+        try { showMessage("✅ 卖家已确认收款，密库已自动激活"); } catch (e) {}
+      }
+      /* 激活失败不重启轮询：买家会看到 activateLicense 弹的错误提示，
+         手动在面板里点「查询激活码」仍然可用 */
+    } catch (e) {}
+  }
+
   async activateLicense(code, bindCode) {
     const r = lic.verifyCode(String(code || "").trim(), this.pubPem());
     if (!r.ok) {
@@ -18048,6 +18698,9 @@ var EdbPlugin = class extends Plugin {
     /* v1.6.35 防重复白嫖：同一激活码已在本设备激活过 → 重复激活不累计（续费请用新激活码，新码自动叠加） */
     if (this.licState && this.licState.bound && this.licState.n === r.n && this.licState.fp === fp && this.licState.expAt !== 0) {
       showMessage("\u8BE5\u6FC0\u6D3B\u7801\u5DF2\u5728\u6B64\u8BBE\u5907\u6FC0\u6D3B\u8FC7\uFF0C\u91CD\u590D\u6FC0\u6D3B\u4E0D\u7D2F\u8BA1\u3002\u7EED\u8D39\u8BF7\u4F7F\u7528\u65B0\u6FC0\u6D3B\u7801\u3002");
+      /* v2.2.11 修复：重复激活也要清掉 lastPayOrder，否则下次启动又轮询又弹提示 */
+      try { if (this.cfg) { delete this.cfg.lastPayOrder; this.saveData("config.json", JSON.stringify(this.cfg)).catch(() => {}); } } catch (e) {}
+      try { this._bgPayPollStop(); } catch (e) {}
       return false;
     }
     /* v1.6.35 云端登记：配置了 onlineUrl 时，激活必须联网登记成功（防一码多机 / 防改公钥自造码）。
@@ -18059,8 +18712,12 @@ var EdbPlugin = class extends Plugin {
         return false;
       }
       /* v1.6.40 激活成功即建立服务器时间锚点（防本地改时间） */
-      if (reg.serverTime)
-        this.cfg.srvTime = { s: Number(reg.serverTime), l: Date.now() };
+      if (reg.serverTime) {
+        /* v2.2.9（A1）：与 onlineCheck 一致，锚点必须通过 ±1 天绝对合理性检查 */
+        const _st = Number(reg.serverTime) || 0;
+        if (isFinite(_st) && _st > 0 && Math.abs(_st - Date.now()) <= 864e5)
+          this.cfg.srvTime = { s: _st, l: Date.now() };
+      }
       /* v1.6.52 激活成功即记为在线（离线宽限从此刻起算） */
       this.cfg.onlineLastCheck = Date.now();
     }
@@ -18091,6 +18748,9 @@ var EdbPlugin = class extends Plugin {
     } catch (e) {
     }
     showMessage(r.t === "F" ? this.t("licOkForever") : this.t("licOk") + "\uFF08" + lic.typeLabel(r.t) + (this.licState.expAt ? "\uFF0C\u5230\u671F " + this.fmtTs(this.licState.expAt) : "") + "\uFF09");
+    /* v2.2.10 手动激活成功后：停掉后台等待轮询 + 清掉 lastPayOrder，避免重复触发 */
+    try { this._bgPayPollStop(); } catch (e) {}
+    try { if (this.cfg) { delete this.cfg.lastPayOrder; } } catch (e) {}
     this.refreshPanel();
     return true;
   }

@@ -67,7 +67,7 @@
   "fileMissing": "Vault file does not exist",
   "notVaultFile": "Not a vault file",
   "restoredNote": "Restored document is created under the original notebook",
-  "licTitle": "License Activation",
+  "licTitle": "Manual Activation",
   "licContact": "For issues or ideas during use, feel free to contact us via WeChat: nglzhy",
   "licStatusNone": "Not activated · Paid license, buy an activation code via WeChat: nglzhy",
   "licStatusOk": "Activated · valid until",

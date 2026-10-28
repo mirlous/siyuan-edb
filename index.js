@@ -7105,6 +7105,8 @@ var EdbPlugin = class extends Plugin {
     const bump = () => {
       this.lastActive = Date.now();
     };
+    /* v2.2.16 会话计时启动（60 秒 tick，只做减法，无 DOM 开销） */
+    this.sessionInit();
     this._deepTimer = setInterval(() => this.maybeDeepCheck(), 30 * 60 * 1e3);
     if (this.cfg.viewerEnabled) {
       this.startViewerServer().catch((e) => console.error("[siyuan-edb] \u67E5\u770B\u5668\u542F\u52A8\u5931\u8D25", e));
@@ -7122,6 +7124,18 @@ var EdbPlugin = class extends Plugin {
     setTimeout(() => {
       this.checkOfficialUpdate().catch((e) => console.error("[siyuan-edb] \u5B98\u65B9\u66F4\u65B0\u68C0\u67E5\u5931\u8D25", e));
     }, 90e3);
+    /* v2.2.16 常驻用户也要能收到更新提醒：此前只在启动后查一次，思源一开好几天的人永远收不到。
+       改为首查 90 秒 + 之后每 30 分钟一次；弹窗去重由 cfg.edbUpdateSeen_<ver> = 当天日期 保证，
+       同一天同一版本只会打扰一次（点确定或点取消都会记账，见 checkOfficialUpdate）。 */
+    if (this._officialUpdTimer) {
+      try {
+        clearInterval(this._officialUpdTimer);
+      } catch (e) {
+      }
+    }
+    this._officialUpdTimer = setInterval(() => {
+      this.checkOfficialUpdate().catch((e) => console.error("[siyuan-edb] \u5B98\u65B9\u66F4\u65B0\u68C0\u67E5\u5931\u8D25", e));
+    }, 30 * 60e3);
     try {
       if (typeof document !== "undefined" && document.addEventListener) {
         document.addEventListener("mousemove", bump);
@@ -7230,6 +7244,23 @@ var EdbPlugin = class extends Plugin {
     });
   }
   async onunload() {
+    /* v2.2.16 会话收尾：把本次会话的最后一段使用时长补报一次（sendBeacon，不等响应），
+       否则用户一关思源，最后一次心跳到关闭之间的时长就丢了。必须放在最前面同步发起。 */
+    try {
+      this.flushSessionOnExit();
+    } catch (e) {
+    }
+    try {
+      if (this._officialUpdTimer) {
+        clearInterval(this._officialUpdTimer);
+        this._officialUpdTimer = null;
+      }
+      if (this._sessTimer) {
+        clearInterval(this._sessTimer);
+        this._sessTimer = null;
+      }
+    } catch (e) {
+    }
     /* v1.7.5 卸载时移除注入的隐藏样式与 DOM 监听，避免残留 */
     try {
       this.removeHideCss();
@@ -7418,11 +7449,130 @@ var EdbPlugin = class extends Plugin {
     return !!(this.state && this.state.db);
   }
   /** 无密码模式：库无密码时启动即自动解锁并自动同步；有密码库保持锁定 */
+  /* ============ v2.2.16 使用时长 / 使用时段统计 ============
+     口径（两个都记，互不冲突）：
+       · 活跃时长 activeMs —— 只有当「最近 5 分钟内有真实交互」的分钟才计入。
+         交互信号复用插件里早就有的 this.lastActive（mousemove/keydown/mousedown + ws-main
+         在工作区里点来点去都会 bump），不新增任何 DOM 监听。
+       · 墙钟跨度 span —— 本次会话从插件加载到现在的总时间，含挂着不动的部分。
+     上报采用「增量」：每次心跳发「自上次上报以来新增的活跃秒」与「按小时的新增秒」，
+     服务端累加即可；即使某次心跳失败，下一跳也会把累积量一起带上，不会漏。
+     隐私边界与既有 usage 上报一致：只发时长数字与小时桶，不含内容/标题/路径/库名。 */
+  sessionInit() {
+    try {
+      this._sess = { start: Date.now(), tickAt: Date.now(), activeMs: 0, hours: {}, sentMs: 0, sentHours: {}, counted: false };
+      if (this._sessTimer) {
+        try {
+          clearInterval(this._sessTimer);
+        } catch (e) {
+        }
+      }
+      /* 60 秒一跳：粒度足够算时长，开销可忽略（只做两次减法） */
+      this._sessTimer = setInterval(() => {
+        try {
+          this.sessionTick();
+        } catch (e) {
+        }
+      }, 60e3);
+    } catch (e) {
+    }
+  }
+  /** 把「上一个 tick 到现在」的活跃秒计入累计与小时桶 */
+  sessionTick() {
+    const s = this._sess;
+    if (!s)
+      return;
+    const now = Date.now();
+    /* 上限 2 分钟：系统休眠/合盖后醒来，别把整晚一次性算成使用时长 */
+    const step = Math.max(0, Math.min(now - s.tickAt, 120e3));
+    s.tickAt = now;
+    const idle = now - (Number(this.lastActive) || now);
+    if (idle > 5 * 60e3)
+      return;  /* 5 分钟无交互 → 本段不算活跃 */
+    s.activeMs += step;
+    const h = new Date().getHours();
+    s.hours[h] = (Number(s.hours[h]) || 0) + step;
+  }
+  /** 自上次上报以来的增量（秒） */
+  sessionDelta() {
+    const s = this._sess;
+    if (!s)
+      return null;
+    const dur = Math.max(0, Math.round((s.activeMs - s.sentMs) / 1000));
+    const hh = {};
+    for (const k of Object.keys(s.hours)) {
+      const d = Number(s.hours[k]) - (Number(s.sentHours[k]) || 0);
+      if (d >= 1000)
+        hh[k] = Math.round(d / 1000);
+    }
+    return {
+      dur,
+      hh,
+      span: Math.max(0, Math.round((Date.now() - s.start) / 1000)),
+      stot: Math.round(s.activeMs / 1000),
+    };
+  }
+  /** 增量已送达 → 记账，避免重复上报 */
+  sessionCommitDelta() {
+    const s = this._sess;
+    if (!s)
+      return;
+    s.sentMs = s.activeMs;
+    s.sentHours = {};
+    for (const k of Object.keys(s.hours))
+      s.sentHours[k] = s.hours[k];
+  }
+  /** 退出（关思源/卸载插件）时补报最后一段：sendBeacon 不依赖页面存活 */
+  flushSessionOnExit() {
+    const s = this._sess;
+    if (!s)
+      return;
+    this.sessionTick();
+    const d = this.sessionDelta();
+    if (!d)
+      return;
+    if (d.dur <= 0 && !Object.keys(d.hh).length)
+      return;
+    const base = String(this.edbOnlineUrl() || "").replace(/\/+$/, "").replace(/\/api\.php$/i, "");
+    if (!base)
+      return;
+    /* 复用上一次心跳的完整字段（tier/docs/v 等），避免在卸载路径里重跑 listDocs 等重活 */
+    const baseBody = this._usageBodyBase || {};
+    const body = Object.assign({}, baseBody, d, { reason: "exit", sessNew: 0 });
+    const json = JSON.stringify(body);
+    /* 先记账：即使下面发送失败，也不会在后续流程里重复计这段时长 */
+    this.sessionCommitDelta();
+    let sent = false;
+    try {
+      if (typeof navigator !== "undefined" && typeof navigator.sendBeacon === "function" && typeof Blob !== "undefined") {
+        const blob = new Blob([json], { type: "application/json" });
+        sent = navigator.sendBeacon(base + "/api.php?action=usage", blob);
+      }
+    } catch (e) {
+      sent = false;
+    }
+    if (!sent) {
+      try {
+        fetch(base + "/api.php?action=usage", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: json,
+          keepalive: true,
+        }).catch(() => {
+        });
+      } catch (e) {
+      }
+    }
+  }
   /** v2.0.9 匿名使用统计上报（可在设置里关闭）
    *  隐私边界：只发数字与设备标识；不含任何笔记内容/标题/路径/库名。
    *  服务端用途：统计免费版用户量、版本分布、文档数分布（指导定价与运营）。 */
   async reportUsage(reason) {
     try {
+      /* v2.2.16 开关：config.json 里 usageStats=false 即彻底关闭匿名统计（含使用时长/时段上报）。
+         默认开启；README「隐私声明」已如实披露统计字段，这行保证说关就能关。 */
+      if (this.cfg && this.cfg.usageStats === false)
+        return false;
       /* v2.1.2 匿名使用统计为内部机制（恒定开启，不在用户界面出现任何提示） */
       const base = String(this.edbOnlineUrl() || "").replace(/\/+$/, "").replace(/\/api\.php$/i, "");
       if (!base)
@@ -7530,6 +7680,21 @@ var EdbPlugin = class extends Plugin {
         tamper: (this.cfg.authTampered || this.cfg.trialTampered) ? 1 : 0,
         reason: String(reason || ""),
       };
+      /* v2.2.16 使用时长/时段：随心跳上报「本区间新增活跃秒」+「按小时的新增活跃秒」。
+         小时桶在客户端按真实小时就地累计，所以哪怕 6 小时才发一次，时段分布也是准的。 */
+      try {
+        const sd = this.sessionDelta();
+        if (sd) {
+          body.dur = sd.dur;
+          body.hh = sd.hh;
+          body.span = sd.span;
+          body.stot = sd.stot;
+          body.sessNew = (this._sess && this._sess.counted) ? 0 : 1;
+        }
+      } catch (e) {
+      }
+      /* 留一份基线给退出时的 sendBeacon 复用（避免卸载路径里重跑 listDocs 等重活） */
+      this._usageBodyBase = body;
       const ctrl = typeof AbortController !== "undefined" ? new AbortController() : null;
       const to = ctrl ? setTimeout(() => { try { ctrl.abort(); } catch (e) { } }, 10000) : null;
       try {
@@ -7543,6 +7708,13 @@ var EdbPlugin = class extends Plugin {
       } finally {
         if (to)
           clearTimeout(to);
+      }
+      /* 送达后才记账：发送失败则增量留在 _sess 里，下一次心跳会一起补上 */
+      try {
+        this.sessionCommitDelta();
+        if (this._sess)
+          this._sess.counted = true;
+      } catch (e) {
       }
       this.cfg.usageLastAt = Date.now();
       this.saveConfig().catch(() => {
@@ -13970,14 +14142,17 @@ var EdbPlugin = class extends Plugin {
         txt += "\n\n" + (this.t("updateNotes") || "\u66F4\u65B0\u8BF4\u660E") + "\uFF1A" + notes;
       txt += "\n\n" + (this.t("updateHowOfficial") || "\u8BF7\u524D\u5F80\uFF1A\u8BBE\u7F6E \u2192 \u5E02\u96C6 \u2192 \u5DF2\u4E0B\u8F7D \u2192 \u627E\u5230\u300C\u5BC6\u5E93\u300D\u70B9\u51FB\u66F4\u65B0\u3002");
       const ok = await this.confirmBox(txt);
-      if (ok) {
-        try {
-          if (this.cfg) {
-            this.cfg[seenKey] = today;
-            await this.saveData("config.json", JSON.stringify(this.cfg));
-          }
-        } catch (e) {
+      /* v2.2.16 去重记账必须与「用户点没点确定」解耦：
+         30 分钟定时检查后，若点「取消」不记账，用户会被每 30 分钟弹一次。
+         现在无论确定还是取消都记「今天已提醒过」，只有点确定才顺手打开集市。 */
+      try {
+        if (this.cfg) {
+          this.cfg[seenKey] = today;
+          await this.saveData("config.json", JSON.stringify(this.cfg));
         }
+      } catch (e) {
+      }
+      if (ok) {
         /* 尝试打开集市已下载页（不同思源版本入口可能不同，失败则忽略） */
         try {
           if (typeof window !== "undefined" && window.open)
@@ -13991,7 +14166,7 @@ var EdbPlugin = class extends Plugin {
   /** 当前插件版本（与 plugin.json 同步，发布时手工更新） */
   curVersion() {
     /* v1.6.63 必须与 plugin.json 的 version 保持一致（每次发版两处同步改） */
-    return "2.2.15";
+    return "2.2.16";
   }
   versionAtLeast(latest, cur) {
     const p = (s) => String(s || "").split(".").map((x) => parseInt(x, 10) || 0);

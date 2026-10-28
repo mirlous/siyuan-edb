@@ -7524,6 +7524,9 @@ var EdbPlugin = class extends Plugin {
   }
   /** 退出（关思源/卸载插件）时补报最后一段：sendBeacon 不依赖页面存活 */
   flushSessionOnExit() {
+    /* 关闭了匿名统计就连退出补报也不发（与 reportUsage 的 usageStats 开关保持一致） */
+    if (this.cfg && this.cfg.usageStats === false)
+      return;
     const s = this._sess;
     if (!s)
       return;
@@ -14166,7 +14169,7 @@ var EdbPlugin = class extends Plugin {
   /** 当前插件版本（与 plugin.json 同步，发布时手工更新） */
   curVersion() {
     /* v1.6.63 必须与 plugin.json 的 version 保持一致（每次发版两处同步改） */
-    return "2.2.16";
+    return "2.2.17";
   }
   versionAtLeast(latest, cur) {
     const p = (s) => String(s || "").split(".").map((x) => parseInt(x, 10) || 0);
